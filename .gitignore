@@ -1,0 +1,48 @@
+# Upstream source checkouts -- clone with tools/bootstrap_sources.py, never commit
+vendor/
+
+# Tournament results, and the engine scratch dirs (write dirs, archive
+# caches, demos) the harness runs matches in.
+tournaments/
+runtime/
+
+# Local editor state, projects, match output, and training snapshots.
+/data/
+/matches/
+/projects/
+/nn-snapshots/
+
+# Build output for the C++ path
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*.stackdump
+Thumbs.db
+desktop.ini
+
+# agent/session worktrees
+.claude/worktrees/
+scratch_*.log
+
+# tools/lane.py: per-session build/deploy slots, never committed
+/.barai-lane
+/.barai-lanes
+/ai/lane-*
+/ai/*/.build/
+/ai/*/.ai-manifest.json.*.tmp
+reference/within-reason/
+
+old/
+bash.exe.stackdump
+screenshots

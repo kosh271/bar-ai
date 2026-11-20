@@ -1,0 +1,1 @@
+"""Standalone BAR AI editor."""
