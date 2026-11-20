@@ -244,7 +244,8 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/client/heartbeat", "/api/client/close",
             "/api/save", "/api/clone", "/api/clone-project", "/api/sources",
             "/api/create-project", "/api/inspect", "/api/history", "/api/history/checkpoint", "/api/history/restore",
-            "/api/install", "/api/remove", "/api/settings", "/api/match/scan", "/api/catalog/start", "/api/catalog/cancel",
+            "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
+            "/api/catalog/start", "/api/catalog/cancel",
             "/api/match/start", "/api/match/cancel",
         }:
             return self._error(404, "Unknown API endpoint.")
@@ -308,6 +309,12 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/remove":
                 with self.server.write_lock:
                     return self._json(200, self._remove(payload))
+            if parsed.path == "/api/match/cache":
+                self._require_fields(payload, ("bar_root", "engine"))
+                return self._json(200, {"content": self.server.match_service.cached_content(
+                    self._string(payload["bar_root"], "bar_root"),
+                    self._string(payload["engine"], "engine"),
+                )})
             if parsed.path == "/api/match/scan":
                 self._require_fields(payload, ("bar_root", "engine"))
                 return self._json(200, self.server.match_service.scan(

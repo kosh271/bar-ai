@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from app.discovery import Installation
 from app.headless import MatchError, MatchProgress
+from app.settings import SettingsError
 from app.studio_matches import MatchService
 from app.unit_catalog import _RANDOM_SCRIPT, scan, valid_catalog
 
@@ -118,6 +119,35 @@ class MatchServiceTests(unittest.TestCase):
         json.dumps(status)
         status["progress"].clear()
         self.assertEqual(len(self.service.status()["progress"]), 2)
+
+    def test_completed_scan_is_restored_by_a_new_service(self):
+        self.assertEqual(self.scan()["state"], "completed")
+        restored = MatchService(self.root)
+        self.assertEqual(restored.cached_content(self.installation.root, "engine"), CONTENT)
+
+    def test_scan_cache_write_failure_keeps_successful_result_and_reports_warning(self):
+        with patch("app.studio_matches.settings.save_content_cache",
+                   side_effect=SettingsError("disk unavailable")):
+            status = self.scan()
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["result"]["content"], CONTENT)
+        self.assertIn("could not be saved for next run: disk unavailable", status["message"])
+
+    def test_cancelled_scan_does_not_write_content_cache(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def scan_content(*args, **kwargs):
+            entered.set()
+            release.wait(2)
+            return CONTENT
+
+        with patch("app.studio_matches.headless.scan_content", side_effect=scan_content):
+            self.service.scan("bar", "engine")
+            self.assertTrue(entered.wait(2))
+            self.service.cancel()
+            release.set()
+            self.assertEqual(self.wait()["state"], "cancelled")
+        self.assertIsNone(MatchService(self.root).cached_content(self.installation.root, "engine"))
 
     def test_match_status_checks_each_stage_process_and_reports_exit(self):
         self.scan()

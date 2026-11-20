@@ -6,7 +6,7 @@ const S = window.StudioScripts;
 const state = {
     projects: [], project: "", profile: "", files: [], page: "overview",
     layer: {}, factory: "", situation: "land", response: "", file: "",
-    settings: null, defaultBarRoot: "", catalog: null, saving: false, history: [], match: {content: null, game: "", map: "", first: "", second: "", faction1: "Armada", faction2: "Cortex", minutes: 120, skip: false, snapshot: null, statusError: ""}
+    settings: null, defaultBarRoot: "", catalog: null, saving: false, history: [], match: {content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "", first: "", second: "", faction1: "Armada", faction2: "Cortex", minutes: 120, skip: false, snapshot: null, statusError: ""}
 };
 const pages = {
     manage: ["AI install & remove", "Choose a BAR installation, then install or remove the selected AI.", "⇄"],
@@ -97,13 +97,39 @@ function confirmDiscard() { return !dirty().length || confirm("Discard unsaved c
 function setSettings(settings) {
     if (state.settings?.bar_root !== settings?.bar_root || state.settings?.engine !== settings?.engine) {
         state.catalog = null; state.match.content = null;
+        state.match.cached = false; state.match.cacheKey = ""; state.match.cacheError = "";
+        if (state.match.snapshot?.operation === "scan" &&
+            !["running", "cancelling"].includes(state.match.snapshot.state)) state.match.snapshot = null;
     }
     state.settings = settings;
+}
+function matchSettingsKey(settings) {
+    return settings ? JSON.stringify([settings.bar_root, settings.engine]) : "";
+}
+async function loadCachedMatchContent() {
+    const key = matchSettingsKey(state.settings);
+    if (!key || key === state.match.cacheKey || isScanActive(state.match.snapshot)) return;
+    state.match.cacheKey = key;
+    state.match.cacheError = "";
+    try {
+        const result = await api("/api/match/cache", state.settings);
+        if (matchSettingsKey(state.settings) !== key) return;
+        state.match.content = result.content;
+        state.match.cached = !!result.content;
+        if (result.content && !state.match.snapshot) {
+            state.match.snapshot = {
+                operation: "scan", state: "completed", message: "Using saved scan results."
+            };
+        }
+    } catch (error) {
+        if (matchSettingsKey(state.settings) === key) state.match.cacheError = errorText(error);
+    }
 }
 async function refreshState(project = state.project, profile = state.profile) {
     const data = await api("/api/state");
     state.projects = data.projects; setSettings(data.settings);
     state.defaultBarRoot = data.default_bar_root || "";
+    await loadCachedMatchContent();
     state.project = state.projects.some(p => p.key === project) ? project : state.projects[0]?.key || "";
     const projectInfo = selectedProject();
     state.profile = projectInfo?.profiles.some(p => p.key === profile) ? profile : projectInfo?.profiles[0]?.key || "";
@@ -1081,11 +1107,15 @@ function matchView(target) {
             notice("Install saved changes before scanning. A successful smoke test verifies loading and script compilation, not playing strength."));
     }
     const controls = element("div", "row");
-    controls.append(button("Scan installed content", async () => {
+    controls.append(button(m.content ? "Refresh installed content" : "Scan installed content", async () => {
         try {
             if (!state.settings) throw Error("Choose and save an installation first.");
             if (dirty().length) throw Error("Save or discard profile changes before testing.");
+            m.scanSettingsKey = matchSettingsKey(state.settings);
             m.content = null;
+            m.cached = false;
+            m.cacheError = "";
+            m.cacheKey = "";
             m.snapshot = await api("/api/match/scan", state.settings);
             m.statusError = "";
             render(); pollMatch();
@@ -1097,9 +1127,15 @@ function matchView(target) {
     panel.append(controls);
     const statusBox = element("div", "notice");
     statusBox.id = "match-status";
-    statusBox.textContent = m.statusError ? "Status unavailable: " + m.statusError + ". Retrying…"
-        : m.snapshot ? `${m.snapshot.state}: ${m.snapshot.message || ""}` : "No scan or match started.";
-    panel.append(statusBox);
+    statusBox.setAttribute("role", "status");
+    statusBox.setAttribute("aria-live", "polite");
+    statusBox.textContent = matchStatusText(m.snapshot, m.statusError, m.cacheError);
+    const scanProgress = element("progress", "scan-progress");
+    scanProgress.id = "scan-progress";
+    scanProgress.setAttribute("aria-label", "Scanning installed content");
+    scanProgress.hidden = !isScanActive(m.snapshot);
+    panel.append(statusBox, scanProgress);
+    if (m.cached) panel.append(notice("Showing saved scan results from a previous run. Refresh after changing the selected engine or installing, removing, or updating games, maps, or AIs."));
     if (m.snapshot?.error) panel.append(notice(m.snapshot.error, true));
     if (m.snapshot?.result && m.snapshot.operation === "match") {
         panel.append(element("pre", "", m.snapshot.result.summary || ""));
@@ -1176,16 +1212,28 @@ function matchActivity(snapshot, error) {
     if (engine.state !== "running") return `${stage}: engine status unavailable`;
     return `${stage}: ${snapshot.state === "cancelling" ? "stopping" : "running"} · ${elapsed}`;
 }
+function isScanActive(snapshot) {
+    return snapshot?.operation === "scan" && ["running", "cancelling"].includes(snapshot.state);
+}
+function matchStatusText(snapshot, error, cacheError = "") {
+    if (error) return "Status unavailable: " + error + ". Retrying…";
+    if (cacheError) return "Saved scan results unavailable: " + cacheError + ". Scan installed content to refresh.";
+    if (!snapshot) return "No scan or match started.";
+    const status = `${snapshot.state}: ${snapshot.message || ""}`;
+    if (!isScanActive(snapshot)) return status;
+    const seconds = Math.floor(snapshot.elapsed_seconds || 0);
+    const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+    return `${status} · elapsed ${elapsed} · estimated total ~3 min`;
+}
 function setMatchActivity(node, snapshot, error) {
     node.textContent = matchActivity(snapshot, error);
     node.classList.toggle("error", !!error || snapshot?.state === "failed" ||
         (snapshot?.engine?.state === "exited" && snapshot.engine.exit_code !== 0));
 }
 function updateMatchStatus() {
-    const m = state.match, statusBox = $("match-status"), activity = $("match-activity");
-    if (statusBox) statusBox.textContent = m.statusError
-        ? "Status unavailable: " + m.statusError + ". Retrying…"
-        : `${m.snapshot.state}: ${m.snapshot.message || ""}`;
+    const m = state.match, statusBox = $("match-status"), scanProgress = $("scan-progress"), activity = $("match-activity");
+    if (statusBox) statusBox.textContent = matchStatusText(m.snapshot, m.statusError, m.cacheError);
+    if (scanProgress) scanProgress.hidden = !isScanActive(m.snapshot);
     if (activity) setMatchActivity(activity, m.snapshot, m.statusError);
 }
 let matchPoll = null;
@@ -1209,7 +1257,18 @@ async function pollMatch() {
             state.match.snapshot = snapshot;
             updateMatchStatus();
             if (!["running", "cancelling"].includes(snapshot.state)) {
-                if (snapshot.operation === "scan" && snapshot.state === "completed") state.match.content = snapshot.result.content;
+                if (snapshot.operation === "scan") {
+                    if (snapshot.state === "completed" &&
+                        state.match.scanSettingsKey === matchSettingsKey(state.settings)) {
+                        state.match.content = snapshot.result.content;
+                        state.match.cached = false;
+                        state.match.cacheError = "";
+                        state.match.cacheKey = state.match.scanSettingsKey;
+                    } else {
+                        if (state.match.scanSettingsKey === matchSettingsKey(state.settings)) state.match.cacheKey = "";
+                        await loadCachedMatchContent();
+                    }
+                }
                 if (state.page === "match") render();
                 break;
             }
@@ -1505,7 +1564,7 @@ function manageAIs(target) {
             saveButton.disabled = true;
             const saved = await api("/api/settings", {bar_root: root.value.trim(), engine: engine.value});
             setSettings(saved);
-            state.match.content = null;
+            await loadCachedMatchContent();
             render();
         } catch (error) {
             feedback.textContent = errorText(error);

@@ -324,6 +324,16 @@ class StudioServerTests(unittest.TestCase):
         self.assertEqual(state["state"], "failed")
         self.assertIn("BAR data directory not found", state["error"])
 
+    def test_match_cache_endpoint_requires_token_and_returns_saved_content(self):
+        content = {"games": ["Game"]}
+        with patch.object(self.server.match_service, "cached_content", return_value=content) as cached:
+            body = {"bar_root": "C:\\BAR", "engine": "engine"}
+            self.assertEqual(self._request("/api/match/cache", method="POST", body=body, token=False)[0], 401)
+            status, result, _ = self._request("/api/match/cache", method="POST", body=body)
+        self.assertEqual(status, 200)
+        self.assertEqual(result, {"content": content})
+        cached.assert_called_once_with("C:\\BAR", "engine")
+
     def test_install_prompts_are_confirmed_one_at_a_time_before_changes(self):
         install_temp = tempfile.TemporaryDirectory(dir=TEST_DIR)
         self.addCleanup(install_temp.cleanup)

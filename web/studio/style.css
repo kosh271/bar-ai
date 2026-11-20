@@ -11,3 +11,4 @@
 .layer-order{padding-left:0;list-style:none}.layer-order-item{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}.layer-order-item .grow{flex:1;min-width:180px;overflow-wrap:anywhere}.preview-value{max-width:50%;margin:0;text-align:right}
 .layer-example{border:1px solid var(--line);border-radius:8px;padding:14px;margin:14px 0}.option-check{display:flex;align-items:center;gap:7px;margin-bottom:12px}
 .match-activity{color:var(--mint);font-size:12px;align-self:center}.match-activity.error{color:#f2d3ae}
+.scan-progress{display:block;width:100%;height:8px;margin:12px 0;accent-color:var(--orange)}.scan-progress[hidden]{display:none}

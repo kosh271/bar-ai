@@ -37,6 +37,9 @@ During a test, the indicator beside **Start match** shows the current stage
 and its elapsed real time. Running status is checked against the engine process;
 an exited engine or an unavailable status connection is reported instead.
 Process liveness alone does not prove that the simulation is making progress.
+Installed-content scan results are saved per BAR installation and engine and
+restored when Studio opens. They can be stale after changing the installation
+or updating games, maps or AIs; use **Refresh installed content** to rescan.
 
 Studio automatically initializes a local Git repository and baseline for each
 project when the workspace loads. **Project history** lists checkpoints and
@@ -201,7 +204,7 @@ a game that does not confirm the scheduled command within two minutes is
 stopped and reported as an error. An unconfirmed engine exit is reported as
 unknown, not a win. Engine diagnostics are reported alongside the result.
 
-Run the foundation tests from this directory:
+Run the test suite from this directory:
 
 ```powershell
 python -m unittest discover -s tests
