@@ -6,7 +6,7 @@ const S = window.StudioScripts;
 const state = {
     projects: [], project: "", profile: "", files: [], page: "overview",
     layer: {}, factory: "", situation: "land", response: "", file: "",
-    settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), saving: false, history: [], match: {content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "", first: "", second: "", faction1: "Armada", faction2: "Cortex", minutes: 120, skip: false, snapshot: null, statusError: ""}
+    settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), icons: {available: false, message: "", cache: new Map()}, saving: false, history: [], match: {content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "", first: "", second: "", faction1: "Armada", faction2: "Cortex", minutes: 120, skip: false, snapshot: null, statusError: ""}
 };
 const pages = {
     manage: ["AI install & remove", "Choose a BAR installation, then install or remove the selected AI.", "⇄"],
@@ -128,6 +128,7 @@ async function loadCachedMatchContent() {
 async function refreshState(project = state.project, profile = state.profile) {
     const data = await api("/api/state");
     state.projects = data.projects; setSettings(data.settings);
+    await loadIconStatus();
     state.defaultBarRoot = data.default_bar_root || "";
     await loadCachedMatchContent();
     state.project = state.projects.some(p => p.key === project) ? project : state.projects[0]?.key || "";
@@ -416,6 +417,7 @@ function opening(target) {
     if (!window.StudioOpenings) panel.append(notice("Opening editor could not be loaded.", true));
     else window.StudioOpenings.mount(editor, {
         text: file.text, unitName: friendlyUnitName,
+        unitIcon,
         onChange: text => { assign(file, text); message(""); }
     });
     panel.append(element("div", "source-bar", "Script source: " + file.path + " · Custom script that cannot be represented safely remains unchanged."));
@@ -427,6 +429,7 @@ function catalogControls(panel) {
     row.append(button(catalog ? "Change unit catalog" : "Load unit catalog", catalogDialog));
     if (catalog) row.append(element("p", "muted", `${catalog.game} · ${catalog.units.length} units`));
     panel.append(row);
+    if (state.icons.message) panel.append(element("p", "muted", state.icons.message));
     if (catalog) {
         panel.append(notice("Names come from the last scanned game, not necessarily the current match or installation. This illustrative parse enables optional units in a simulated empty match and samples randomized definitions deterministically. Game options, runtime randomness, scripts and parser errors can change available units or build options.", true));
         if (catalog.warnings.length) {
@@ -447,6 +450,46 @@ function friendlyUnitName(id) {
 function unitLabel(id) {
     const name = friendlyUnitName(id);
     return name ? `${name} · ${id}` : id;
+}
+async function loadIconStatus() {
+    for (const promise of state.icons.cache.values()) {
+        promise.then(url => { if (url) URL.revokeObjectURL(url); });
+    }
+    state.icons = {available: false, message: "", cache: new Map()};
+    try {
+        const result = await api("/api/unit-icons");
+        state.icons.available = result.available;
+        state.icons.message = result.message;
+    } catch (error) {
+        state.icons.message = "Could not load unit icons: " + errorText(error);
+    }
+}
+function unitIcon(id) {
+    const key = String(id).toLowerCase();
+    const image = element("img", "unit-icon");
+    image.alt = "";
+    image.hidden = true;
+    if (!state.icons.available || !/^[a-z0-9_]{1,128}$/.test(key)) return image;
+    if (!state.icons.cache.has(key)) {
+        state.icons.cache.set(key, (async () => {
+            const response = await fetch(`/api/unit-icon/${encodeURIComponent(key)}`, {
+                headers: {"X-Workshop-Token": window.WORKSHOP_TOKEN}
+            });
+            if (response.status === 404) return null;
+            if (!response.ok) {
+                const result = await response.json();
+                throw Error(result.error || `Request failed (${response.status})`);
+            }
+            return URL.createObjectURL(await response.blob());
+        })().catch(error => {
+            message(`Could not load icon for ${key}: ${errorText(error)}`, true);
+            return null;
+        }));
+    }
+    state.icons.cache.get(key).then(url => {
+        if (url) { image.src = url; image.hidden = false; }
+    });
+    return image;
 }
 async function loadUnitNames() {
     const response = await fetch("/data/units.json");
@@ -539,6 +582,7 @@ function production(target, selected) {
     const row = element("div", "row");
     row.append(dropdown("Factory", factories.children.map(e => [e.key, unitLabel(e.key)]), state.factory, value => { state.factory = value; render(); }),
         dropdown("Situation", [["land", "Land"], ["water", "Water"], ["air", "Enemy air"]], state.situation, value => { state.situation = value; render(); }));
+    row.append(unitIcon(state.factory));
     panel.append(row);
     const fac = C.at(root, ["factory", state.factory]), units = C.at(fac, ["unit"]), group = C.at(fac, [state.situation]);
     const thresholds = C.at(fac, ["income_tier"]);
@@ -569,6 +613,7 @@ function production(target, selected) {
     head.append(element("th", "", "")); table.append(head);
     units.children.forEach((unit, i) => {
         const tr = element("tr"), name = element("td", "unit-name", unit.node.value);
+        name.prepend(unitIcon(unit.node.value));
         const catalogEntry = catalogUnit(unit.node.value), factoryEntry = catalogUnit(state.factory);
         const friendlyName = friendlyUnitName(unit.node.value);
         if (friendlyName) name.append(element("div", "unit-sub", friendlyName));
@@ -712,6 +757,7 @@ function unitsView(panel, file, root) {
     if (!units.children.some(e => e.key === selected)) selected = units.children[0].key;
     state.unit = selected;
     panel.append(dropdown("Unit ID", units.children.map(e => [e.key, unitLabel(e.key)]), selected, value => { state.unit = value; render(); }));
+    panel.append(unitIcon(selected));
     const unit = C.at(units, [selected]);
     if (!unit || unit.kind !== "object") return;
     for (const key of ["role", "attribute"]) {
@@ -760,6 +806,7 @@ function defenseView(panel, file, root) {
         value => {state.chainCategory = value; state.chainUnit = ""; render();}),
         dropdown("Completed building ID", buildings.map(e => [e.key, unitLabel(e.key)]), state.chainUnit,
             value => {state.chainUnit = value; render();}));
+    controls.append(unitIcon(state.chainUnit));
     panel.append(element("h3", "", "On building completed"), controls);
     const hub = C.at(root, ["build_chain", state.chainCategory, state.chainUnit, "hub"]);
     if (!hub || hub.kind !== "array") {
@@ -971,14 +1018,17 @@ function placementView(panel, file, root) {
             v => {state.placement = v; render();}));
     const instances = C.at(root, ["building", "instance", state.placement]);
     if (instances && instances.kind === "array") {
-        const names = instances.children.map(e => {
-            const id = String(e.node.value);
-            const name = friendlyUnitName(id);
-            return name ? `${name} (${id})` : id;
-        });
-        panel.append(element("p", "muted", names.length
-            ? "This rule applies to: " + names.join(", ") + ". Names are followed by the game's internal name in parentheses; an item shown alone is an internal name."
-            : "No buildings are listed for this group."));
+        if (instances.children.length) {
+            panel.append(element("p", "muted", "This rule applies to these buildings:"));
+            const list = element("div", "unit-icon-list");
+            for (const entry of instances.children) {
+                const id = String(entry.node.value), name = friendlyUnitName(id);
+                const item = element("div", "unit-icon-item");
+                item.append(unitIcon(id), element("span", "", name ? `${name} (${id})` : id));
+                list.append(item);
+            }
+            panel.append(list);
+        } else panel.append(element("p", "muted", "No buildings are listed for this group."));
     } else {
         panel.append(element("p", "muted", "This group has no explicit building list; the group name is an internal label from the settings file."));
     }
@@ -1581,6 +1631,7 @@ function manageAIs(target) {
             saveButton.disabled = true;
             const saved = await api("/api/settings", {bar_root: root.value.trim(), engine: engine.value});
             setSettings(saved);
+            await loadIconStatus();
             await loadCachedMatchContent();
             render();
         } catch (error) {

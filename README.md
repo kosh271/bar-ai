@@ -9,7 +9,13 @@ python -m app
 
 The app opens a browser and prints its local URL. It binds only to localhost
 and stops automatically after the last open Studio tab closes; press Ctrl+C to
-stop it manually. No packages or web service are required.
+stop it manually. No web service is required. Unit icons additionally require Pillow:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+The rest of the app works without it.
 Other users or processes on the same computer may be able to access the local
 server while it is running; close it when finished.
 Git must be installed and available on PATH for project history.
@@ -71,6 +77,11 @@ The bundled English unit-name reference displays friendly names next to unit
 IDs where available. **Load unit catalog** reads unit names and factory options
 from a selected installed game using the selected engine; its names take
 precedence over the bundled reference.
+Unit icons are read on demand from the selected installation's unpacked
+`data/games/BAR.sdd/unitpics` directory and converted in memory for display.
+They are not included with the app. If that directory is absent, icons are
+unavailable; packaged games are not searched. Unit icons are by IceXuick and
+Floris for Beyond All Reason, licensed CC BY-NC-ND.
 The most recent completed catalog is restored when the workshop opens; existing
 scan files are also used if no newer saved catalog exists. A successful new
 scan replaces it. Names appear alongside IDs throughout the visual editors;

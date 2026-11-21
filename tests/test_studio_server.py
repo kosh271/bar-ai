@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from app.game_sources import GameSource
 from app.projects import create_project
+from app.settings import Settings, save_settings
 from app.studio_server import StudioServer
 from app.studio_matches import MatchService
 
@@ -155,6 +156,38 @@ class StudioServerTests(unittest.TestCase):
             status, state, _ = self._request("/api/state")
         self.assertEqual(status, 200)
         self.assertIsNone(state["default_bar_root"])
+
+    def test_unit_icons_are_authenticated_and_use_selected_installation(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Install Pillow to test unit icon conversion.")
+        root = self.settings.parent / "bar"
+        folder = root / "data" / "games" / "BAR.sdd" / "unitpics"
+        folder.mkdir(parents=True)
+        Image.new("RGB", (2, 2), "red").save(folder / "armck.dds", format="DDS")
+        save_settings(self.settings, Settings(str(root), "engine"))
+        self.assertEqual(self._request("/api/unit-icons", token=False)[0], 401)
+        self.assertTrue(self._request("/api/unit-icons")[1]["available"])
+        self.assertEqual(self._request("/api/unit-icon/armck", token=False)[0], 401)
+        self.assertEqual(self._request("/api/unit-icon/missing")[0], 404)
+        self.assertEqual(self._request("/api/unit-icon/armck.dds")[0], 400)
+        request = urllib.request.Request(
+            self.base + "/api/unit-icon/ARMCK",
+            headers={"X-Workshop-Token": self.server.session_token},
+        )
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.headers.get_content_type(), "image/png")
+            with Image.open(io.BytesIO(response.read())) as image:
+                self.assertEqual(image.getpixel((0, 0))[:3], (255, 0, 0))
+        other_root = self.settings.parent / "other-bar"
+        other_folder = other_root / "data" / "games" / "BAR.sdd" / "unitpics"
+        other_folder.mkdir(parents=True)
+        Image.new("RGB", (2, 2), "blue").save(other_folder / "armck.dds", format="DDS")
+        save_settings(self.settings, Settings(str(other_root), "engine"))
+        with urllib.request.urlopen(request) as response:
+            with Image.open(io.BytesIO(response.read())) as image:
+                self.assertEqual(image.getpixel((0, 0))[:3], (0, 0, 255))
 
     def test_latest_catalog_requires_token_and_reads_existing_scan(self):
         folder = self.server.match_service.local_data / "scans" / "catalog-test"

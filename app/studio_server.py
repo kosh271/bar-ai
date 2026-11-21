@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import discovery, game_sources, installation, project_history, projects
+from . import discovery, game_sources, installation, project_history, projects, unit_icons
 from .headless import MatchError
 from .settings import Settings, SettingsError, load_settings, save_settings
 from .studio_matches import MatchService
@@ -180,6 +180,20 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/catalog/latest" and not parsed.query:
                 try:
                     return self._json(200, {"catalog": self.server.match_service.latest_catalog()})
+                except Exception as error:
+                    return self._handle_error(error)
+            if parsed.path == "/api/unit-icons" and not parsed.query:
+                try:
+                    return self._json(200, unit_icons.icon_status(load_settings(self.server.settings_path)))
+                except Exception as error:
+                    return self._handle_error(error)
+            if parsed.path.startswith("/api/unit-icon/") and not parsed.query:
+                try:
+                    unit_id = parsed.path.removeprefix("/api/unit-icon/")
+                    image = unit_icons.read_icon(load_settings(self.server.settings_path), unit_id)
+                    if image is None:
+                        return self._error(404, "Unit icon not found.")
+                    return self._send(200, image, "image/png")
                 except Exception as error:
                     return self._handle_error(error)
             if parsed.path == "/api/profile":
