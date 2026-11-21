@@ -6,7 +6,7 @@ const S = window.StudioScripts;
 const state = {
     projects: [], project: "", profile: "", files: [], page: "overview",
     layer: {}, factory: "", situation: "land", response: "", file: "",
-    settings: null, defaultBarRoot: "", catalog: null, saving: false, history: [], match: {content: null, game: "", map: "", first: "", second: "", faction1: "Armada", faction2: "Cortex", minutes: 120, skip: false, snapshot: null, statusError: ""}
+    settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), icons: {available: false, message: "", cache: new Map()}, saving: false, history: [], match: {content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "", first: "", second: "", faction1: "Armada", faction2: "Cortex", minutes: 120, skip: false, snapshot: null, statusError: ""}
 };
 const pages = {
     manage: ["AI install & remove", "Choose a BAR installation, then install or remove the selected AI.", "⇄"],
@@ -97,13 +97,40 @@ function confirmDiscard() { return !dirty().length || confirm("Discard unsaved c
 function setSettings(settings) {
     if (state.settings?.bar_root !== settings?.bar_root || state.settings?.engine !== settings?.engine) {
         state.catalog = null; state.match.content = null;
+        state.match.cached = false; state.match.cacheKey = ""; state.match.cacheError = "";
+        if (state.match.snapshot?.operation === "scan" &&
+            !["running", "cancelling"].includes(state.match.snapshot.state)) state.match.snapshot = null;
     }
     state.settings = settings;
+}
+function matchSettingsKey(settings) {
+    return settings ? JSON.stringify([settings.bar_root, settings.engine]) : "";
+}
+async function loadCachedMatchContent() {
+    const key = matchSettingsKey(state.settings);
+    if (!key || key === state.match.cacheKey || isScanActive(state.match.snapshot)) return;
+    state.match.cacheKey = key;
+    state.match.cacheError = "";
+    try {
+        const result = await api("/api/match/cache", state.settings);
+        if (matchSettingsKey(state.settings) !== key) return;
+        state.match.content = result.content;
+        state.match.cached = !!result.content;
+        if (result.content && !state.match.snapshot) {
+            state.match.snapshot = {
+                operation: "scan", state: "completed", message: "Using saved scan results."
+            };
+        }
+    } catch (error) {
+        if (matchSettingsKey(state.settings) === key) state.match.cacheError = errorText(error);
+    }
 }
 async function refreshState(project = state.project, profile = state.profile) {
     const data = await api("/api/state");
     state.projects = data.projects; setSettings(data.settings);
+    await loadIconStatus();
     state.defaultBarRoot = data.default_bar_root || "";
+    await loadCachedMatchContent();
     state.project = state.projects.some(p => p.key === project) ? project : state.projects[0]?.key || "";
     const projectInfo = selectedProject();
     state.profile = projectInfo?.profiles.some(p => p.key === profile) ? profile : projectInfo?.profiles[0]?.key || "";
@@ -322,7 +349,7 @@ function treeNode(file, node, title, depth = 0, onChange = null, describe = null
             if (detail.open && !body.childNodes.length) {
                 if (info && info.description) body.append(element("p", "muted", info.description));
                 for (const child of node.children) {
-                    const key = String(child.key), label = catalogUnit(key)?.name ? unitLabel(key) : key.replace(/_/g, " ");
+                    const key = String(child.key), label = friendlyUnitName(key) ? unitLabel(key) : key.replace(/_/g, " ");
                     body.append(treeNode(file, child.node, label, depth + 1, onChange, describe));
                 }
             }
@@ -350,7 +377,7 @@ function treeNode(file, node, title, depth = 0, onChange = null, describe = null
         }
         if (node.kind === "string") {
             const name = element("div", "muted");
-            const updateName = () => { name.textContent = catalogUnit(input.value)?.name || ""; };
+            const updateName = () => { name.textContent = friendlyUnitName(input.value); };
             input.addEventListener("change", updateName); updateName(); label.append(name);
         }
     }
@@ -389,7 +416,8 @@ function opening(target) {
     panel.append(editor);
     if (!window.StudioOpenings) panel.append(notice("Opening editor could not be loaded.", true));
     else window.StudioOpenings.mount(editor, {
-        text: file.text, unitName: id => catalogUnit(id)?.name || "",
+        text: file.text, unitName: friendlyUnitName,
+        unitIcon,
         onChange: text => { assign(file, text); message(""); }
     });
     panel.append(element("div", "source-bar", "Script source: " + file.path + " · Custom script that cannot be represented safely remains unchanged."));
@@ -401,6 +429,7 @@ function catalogControls(panel) {
     row.append(button(catalog ? "Change unit catalog" : "Load unit catalog", catalogDialog));
     if (catalog) row.append(element("p", "muted", `${catalog.game} · ${catalog.units.length} units`));
     panel.append(row);
+    if (state.icons.message) panel.append(element("p", "muted", state.icons.message));
     if (catalog) {
         panel.append(notice("Names come from the last scanned game, not necessarily the current match or installation. This illustrative parse enables optional units in a simulated empty match and samples randomized definitions deterministically. Game options, runtime randomness, scripts and parser errors can change available units or build options.", true));
         if (catalog.warnings.length) {
@@ -414,9 +443,64 @@ function catalogControls(panel) {
 function catalogUnit(id) {
     return state.catalog?.byId.get(String(id).toLowerCase());
 }
+function friendlyUnitName(id) {
+    const key = String(id).toLowerCase();
+    return catalogUnit(key)?.name || state.unitNames.get(key) || "";
+}
 function unitLabel(id) {
-    const unit = catalogUnit(id);
-    return unit?.name ? `${unit.name} · ${id}` : id;
+    const name = friendlyUnitName(id);
+    return name ? `${name} · ${id}` : id;
+}
+async function loadIconStatus() {
+    for (const promise of state.icons.cache.values()) {
+        promise.then(url => { if (url) URL.revokeObjectURL(url); });
+    }
+    state.icons = {available: false, message: "", cache: new Map()};
+    try {
+        const result = await api("/api/unit-icons");
+        state.icons.available = result.available;
+        state.icons.message = result.message;
+    } catch (error) {
+        state.icons.message = "Could not load unit icons: " + errorText(error);
+    }
+}
+function unitIcon(id) {
+    const key = String(id).toLowerCase();
+    const image = element("img", "unit-icon");
+    image.alt = "";
+    image.hidden = true;
+    if (!state.icons.available || !/^[a-z0-9_]{1,128}$/.test(key)) return image;
+    if (!state.icons.cache.has(key)) {
+        state.icons.cache.set(key, (async () => {
+            const response = await fetch(`/api/unit-icon/${encodeURIComponent(key)}`, {
+                headers: {"X-Workshop-Token": window.WORKSHOP_TOKEN}
+            });
+            if (response.status === 404) return null;
+            if (!response.ok) {
+                const result = await response.json();
+                throw Error(result.error || `Request failed (${response.status})`);
+            }
+            return URL.createObjectURL(await response.blob());
+        })().catch(error => {
+            message(`Could not load icon for ${key}: ${errorText(error)}`, true);
+            return null;
+        }));
+    }
+    state.icons.cache.get(key).then(url => {
+        if (url) { image.src = url; image.hidden = false; }
+    });
+    return image;
+}
+async function loadUnitNames() {
+    const response = await fetch("/data/units.json");
+    if (!response.ok) throw Error(`Could not load bundled unit names (${response.status}).`);
+    const data = await response.json();
+    const names = data?.units?.names;
+    if (!names || typeof names !== "object" || Array.isArray(names) ||
+        !Object.entries(names).every(([key, name]) => key && typeof name === "string")) {
+        throw Error("Bundled unit names have an invalid format.");
+    }
+    state.unitNames = new Map(Object.entries(names).map(([key, name]) => [key.toLowerCase(), name]));
 }
 function setCatalog(catalog) {
     state.catalog = catalog ? {...catalog, byId: new Map(catalog.units.map(unit => [unit.id.toLowerCase(), unit]))} : null;
@@ -498,6 +582,7 @@ function production(target, selected) {
     const row = element("div", "row");
     row.append(dropdown("Factory", factories.children.map(e => [e.key, unitLabel(e.key)]), state.factory, value => { state.factory = value; render(); }),
         dropdown("Situation", [["land", "Land"], ["water", "Water"], ["air", "Enemy air"]], state.situation, value => { state.situation = value; render(); }));
+    row.append(unitIcon(state.factory));
     panel.append(row);
     const fac = C.at(root, ["factory", state.factory]), units = C.at(fac, ["unit"]), group = C.at(fac, [state.situation]);
     const thresholds = C.at(fac, ["income_tier"]);
@@ -528,8 +613,10 @@ function production(target, selected) {
     head.append(element("th", "", "")); table.append(head);
     units.children.forEach((unit, i) => {
         const tr = element("tr"), name = element("td", "unit-name", unit.node.value);
+        name.prepend(unitIcon(unit.node.value));
         const catalogEntry = catalogUnit(unit.node.value), factoryEntry = catalogUnit(state.factory);
-        if (catalogEntry?.name) name.append(element("div", "unit-sub", catalogEntry.name));
+        const friendlyName = friendlyUnitName(unit.node.value);
+        if (friendlyName) name.append(element("div", "unit-sub", friendlyName));
         if (state.catalog && !catalogEntry) name.append(element("div", "unit-sub", "Not found in catalog"));
         else if (factoryEntry?.builds && !factoryEntry.builds.some(id => id.toLowerCase() === String(unit.node.value).toLowerCase())) {
             name.append(element("div", "unit-sub", "Not listed in this factory's catalog options"));
@@ -670,6 +757,7 @@ function unitsView(panel, file, root) {
     if (!units.children.some(e => e.key === selected)) selected = units.children[0].key;
     state.unit = selected;
     panel.append(dropdown("Unit ID", units.children.map(e => [e.key, unitLabel(e.key)]), selected, value => { state.unit = value; render(); }));
+    panel.append(unitIcon(selected));
     const unit = C.at(units, [selected]);
     if (!unit || unit.kind !== "object") return;
     for (const key of ["role", "attribute"]) {
@@ -718,6 +806,7 @@ function defenseView(panel, file, root) {
         value => {state.chainCategory = value; state.chainUnit = ""; render();}),
         dropdown("Completed building ID", buildings.map(e => [e.key, unitLabel(e.key)]), state.chainUnit,
             value => {state.chainUnit = value; render();}));
+    controls.append(unitIcon(state.chainUnit));
     panel.append(element("h3", "", "On building completed"), controls);
     const hub = C.at(root, ["build_chain", state.chainCategory, state.chainUnit, "hub"]);
     if (!hub || hub.kind !== "array") {
@@ -929,13 +1018,17 @@ function placementView(panel, file, root) {
             v => {state.placement = v; render();}));
     const instances = C.at(root, ["building", "instance", state.placement]);
     if (instances && instances.kind === "array") {
-        const names = instances.children.map(e => {
-            const id = String(e.node.value), unit = catalogUnit(id);
-            return unit?.name ? `${unit.name} (${id})` : id;
-        });
-        panel.append(element("p", "muted", names.length
-            ? "This rule applies to: " + names.join(", ") + ". Names are followed by the game's internal name in parentheses; an item shown alone is an internal name."
-            : "No buildings are listed for this group."));
+        if (instances.children.length) {
+            panel.append(element("p", "muted", "This rule applies to these buildings:"));
+            const list = element("div", "unit-icon-list");
+            for (const entry of instances.children) {
+                const id = String(entry.node.value), name = friendlyUnitName(id);
+                const item = element("div", "unit-icon-item");
+                item.append(unitIcon(id), element("span", "", name ? `${name} (${id})` : id));
+                list.append(item);
+            }
+            panel.append(list);
+        } else panel.append(element("p", "muted", "No buildings are listed for this group."));
     } else {
         panel.append(element("p", "muted", "This group has no explicit building list; the group name is an internal label from the settings file."));
     }
@@ -1081,11 +1174,15 @@ function matchView(target) {
             notice("Install saved changes before scanning. A successful smoke test verifies loading and script compilation, not playing strength."));
     }
     const controls = element("div", "row");
-    controls.append(button("Scan installed content", async () => {
+    controls.append(button(m.content ? "Refresh installed content" : "Scan installed content", async () => {
         try {
             if (!state.settings) throw Error("Choose and save an installation first.");
             if (dirty().length) throw Error("Save or discard profile changes before testing.");
+            m.scanSettingsKey = matchSettingsKey(state.settings);
             m.content = null;
+            m.cached = false;
+            m.cacheError = "";
+            m.cacheKey = "";
             m.snapshot = await api("/api/match/scan", state.settings);
             m.statusError = "";
             render(); pollMatch();
@@ -1097,9 +1194,15 @@ function matchView(target) {
     panel.append(controls);
     const statusBox = element("div", "notice");
     statusBox.id = "match-status";
-    statusBox.textContent = m.statusError ? "Status unavailable: " + m.statusError + ". Retrying…"
-        : m.snapshot ? `${m.snapshot.state}: ${m.snapshot.message || ""}` : "No scan or match started.";
-    panel.append(statusBox);
+    statusBox.setAttribute("role", "status");
+    statusBox.setAttribute("aria-live", "polite");
+    statusBox.textContent = matchStatusText(m.snapshot, m.statusError, m.cacheError);
+    const scanProgress = element("progress", "scan-progress");
+    scanProgress.id = "scan-progress";
+    scanProgress.setAttribute("aria-label", "Scanning installed content");
+    scanProgress.hidden = !isScanActive(m.snapshot);
+    panel.append(statusBox, scanProgress);
+    if (m.cached) panel.append(notice("Showing saved scan results from a previous run. Refresh after changing the selected engine or installing, removing, or updating games, maps, or AIs."));
     if (m.snapshot?.error) panel.append(notice(m.snapshot.error, true));
     if (m.snapshot?.result && m.snapshot.operation === "match") {
         panel.append(element("pre", "", m.snapshot.result.summary || ""));
@@ -1176,16 +1279,28 @@ function matchActivity(snapshot, error) {
     if (engine.state !== "running") return `${stage}: engine status unavailable`;
     return `${stage}: ${snapshot.state === "cancelling" ? "stopping" : "running"} · ${elapsed}`;
 }
+function isScanActive(snapshot) {
+    return snapshot?.operation === "scan" && ["running", "cancelling"].includes(snapshot.state);
+}
+function matchStatusText(snapshot, error, cacheError = "") {
+    if (error) return "Status unavailable: " + error + ". Retrying…";
+    if (cacheError) return "Saved scan results unavailable: " + cacheError + ". Scan installed content to refresh.";
+    if (!snapshot) return "No scan or match started.";
+    const status = `${snapshot.state}: ${snapshot.message || ""}`;
+    if (!isScanActive(snapshot)) return status;
+    const seconds = Math.floor(snapshot.elapsed_seconds || 0);
+    const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+    return `${status} · elapsed ${elapsed} · estimated total ~3 min`;
+}
 function setMatchActivity(node, snapshot, error) {
     node.textContent = matchActivity(snapshot, error);
     node.classList.toggle("error", !!error || snapshot?.state === "failed" ||
         (snapshot?.engine?.state === "exited" && snapshot.engine.exit_code !== 0));
 }
 function updateMatchStatus() {
-    const m = state.match, statusBox = $("match-status"), activity = $("match-activity");
-    if (statusBox) statusBox.textContent = m.statusError
-        ? "Status unavailable: " + m.statusError + ". Retrying…"
-        : `${m.snapshot.state}: ${m.snapshot.message || ""}`;
+    const m = state.match, statusBox = $("match-status"), scanProgress = $("scan-progress"), activity = $("match-activity");
+    if (statusBox) statusBox.textContent = matchStatusText(m.snapshot, m.statusError, m.cacheError);
+    if (scanProgress) scanProgress.hidden = !isScanActive(m.snapshot);
     if (activity) setMatchActivity(activity, m.snapshot, m.statusError);
 }
 let matchPoll = null;
@@ -1209,7 +1324,18 @@ async function pollMatch() {
             state.match.snapshot = snapshot;
             updateMatchStatus();
             if (!["running", "cancelling"].includes(snapshot.state)) {
-                if (snapshot.operation === "scan" && snapshot.state === "completed") state.match.content = snapshot.result.content;
+                if (snapshot.operation === "scan") {
+                    if (snapshot.state === "completed" &&
+                        state.match.scanSettingsKey === matchSettingsKey(state.settings)) {
+                        state.match.content = snapshot.result.content;
+                        state.match.cached = false;
+                        state.match.cacheError = "";
+                        state.match.cacheKey = state.match.scanSettingsKey;
+                    } else {
+                        if (state.match.scanSettingsKey === matchSettingsKey(state.settings)) state.match.cacheKey = "";
+                        await loadCachedMatchContent();
+                    }
+                }
                 if (state.page === "match") render();
                 break;
             }
@@ -1505,7 +1631,8 @@ function manageAIs(target) {
             saveButton.disabled = true;
             const saved = await api("/api/settings", {bar_root: root.value.trim(), engine: engine.value});
             setSettings(saved);
-            state.match.content = null;
+            await loadIconStatus();
+            await loadCachedMatchContent();
             render();
         } catch (error) {
             feedback.textContent = errorText(error);
@@ -1677,6 +1804,8 @@ heartbeat();
 setInterval(heartbeat, 30_000);
 (async () => {
     try {
+        try { await loadUnitNames(); }
+        catch (error) { message("Could not load bundled unit names: " + errorText(error), true); }
         await refreshState();
         try { setCatalog((await api("/api/catalog/latest")).catalog); }
         catch (error) { message("Could not load saved unit catalog: " + errorText(error), true); }

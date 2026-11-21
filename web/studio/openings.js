@@ -356,6 +356,7 @@
       field(container, "Factory", select);
 
       const factory = model.factories.find(function (f) { return f.name === selected; });
+      if (factory && typeof options.unitIcon === "function") container.appendChild(options.unitIcon(factory.name));
       if (factory && factory.error) {
         notice("This factory is read-only: " + factory.error + " Its source is preserved; use the source view.");
       } else if (factory) {

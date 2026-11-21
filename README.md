@@ -9,7 +9,13 @@ python -m app
 
 The app opens a browser and prints its local URL. It binds only to localhost
 and stops automatically after the last open Studio tab closes; press Ctrl+C to
-stop it manually. No packages or web service are required.
+stop it manually. No web service is required. Unit icons additionally require Pillow:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+The rest of the app works without it.
 Other users or processes on the same computer may be able to access the local
 server while it is running; close it when finished.
 Git must be installed and available on PATH for project history.
@@ -37,6 +43,9 @@ During a test, the indicator beside **Start match** shows the current stage
 and its elapsed real time. Running status is checked against the engine process;
 an exited engine or an unavailable status connection is reported instead.
 Process liveness alone does not prove that the simulation is making progress.
+Installed-content scan results are saved per BAR installation and engine and
+restored when Studio opens. They can be stale after changing the installation
+or updating games, maps or AIs; use **Refresh installed content** to rescan.
 
 Studio automatically initializes a local Git repository and baseline for each
 project when the workspace loads. **Project history** lists checkpoints and
@@ -64,8 +73,15 @@ Named variants such as `factory_swarm.json` and `behaviour_swarm.json` are
 available in their respective configuration sections. File names do not prove
 which layers load or their order; consult the profile's startup script.
 
-**Load unit catalog** reads unit names and
-factory options from a selected installed game using the selected engine.
+The bundled English unit-name reference displays friendly names next to unit
+IDs where available. **Load unit catalog** reads unit names and factory options
+from a selected installed game using the selected engine; its names take
+precedence over the bundled reference.
+Unit icons are read on demand from the selected installation's unpacked
+`data/games/BAR.sdd/unitpics` directory and converted in memory for display.
+They are not included with the app. If that directory is absent, icons are
+unavailable; packaged games are not searched. Unit icons are by IceXuick and
+Floris for Beyond All Reason, licensed CC BY-NC-ND.
 The most recent completed catalog is restored when the workshop opens; existing
 scan files are also used if no newer saved catalog exists. A successful new
 scan replaces it. Names appear alongside IDs throughout the visual editors;
@@ -201,7 +217,7 @@ a game that does not confirm the scheduled command within two minutes is
 stopped and reported as an error. An unconfirmed engine exit is reported as
 unknown, not a win. Engine diagnostics are reported alongside the result.
 
-Run the foundation tests from this directory:
+Run the test suite from this directory:
 
 ```powershell
 python -m unittest discover -s tests

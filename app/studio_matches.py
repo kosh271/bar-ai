@@ -9,6 +9,7 @@ worker errors are reported in the status.  All snapshots are JSON-serializable.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -111,6 +112,16 @@ class MatchService:
                     with self._lock:
                         if outcome == "completed" and self._state["cancel_requested"]:
                             outcome = "cancelled"
+                        if operation == "scan" and outcome == "completed":
+                            cache_info = result.pop("_content_cache", None)
+                            if cache_info:
+                                data, engine = cache_info
+                                try:
+                                    cache_path = self._content_cache_path(data, engine)
+                                    installation._check_links(self.root, cache_path)
+                                    settings.save_content_cache(cache_path, data, engine, result["content"])
+                                except settings.SettingsError as error:
+                                    result["summary"] += f" Scan results could not be saved for next run: {error}"
                         if operation == "catalog" and outcome == "completed":
                             self._save_catalog(result["catalog"])
                         if operation == "scan" and outcome != "completed":
@@ -189,6 +200,21 @@ class MatchService:
                     installation._check_links(self.root, path)
         return cache
 
+    def _content_cache_path(self, data: Path, engine: str) -> Path:
+        identity = f"{str(data.resolve()).casefold()}\0{engine.casefold()}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return self.local_data / "content-cache" / f"{digest}.json"
+
+    def cached_content(self, bar_root: str | Path, engine: str) -> dict | None:
+        if not isinstance(bar_root, (str, Path)) or not str(bar_root).strip():
+            raise headless.MatchError("BAR root is required.")
+        if not isinstance(engine, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", engine) or engine in (".", ".."):
+            raise headless.MatchError("Invalid engine folder.")
+        data = Path(bar_root).expanduser().resolve() / "data"
+        path = self._content_cache_path(data, engine)
+        installation._check_links(self.root, path)
+        return settings.load_content_cache(path, data, engine)
+
     def _save_catalog(self, catalog: dict) -> None:
         path = self.local_data / "latest-catalog.json"
         installation._check_links(self.root, path)
@@ -248,12 +274,16 @@ class MatchService:
             content = headless.scan_content(engine_dir, selected.data, scan_dir, self._stop, archive_cache=cache)
             if not settings._content_valid(content):
                 raise headless.MatchError("The engine returned an invalid content scan result.")
+            summary = "Content scan complete."
             with self._lock:
                 if self._state["cancel_requested"]:
                     return {"summary": "Content scan cancelled."}, logs, "cancelled"
                 self._content = copy.deepcopy(content)
                 self._scan_key = (selected.root, engine)
-            return {"summary": "Content scan complete.", "content": content}, logs, "completed"
+            return {
+                "summary": summary, "content": content,
+                "_content_cache": (selected.data, engine),
+            }, logs, "completed"
 
         return self._launch("scan", work)
 

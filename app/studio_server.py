@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import discovery, game_sources, installation, project_history, projects
+from . import discovery, game_sources, installation, project_history, projects, unit_icons
 from .headless import MatchError
 from .settings import Settings, SettingsError, load_settings, save_settings
 from .studio_matches import MatchService
@@ -182,6 +182,20 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, {"catalog": self.server.match_service.latest_catalog()})
                 except Exception as error:
                     return self._handle_error(error)
+            if parsed.path == "/api/unit-icons" and not parsed.query:
+                try:
+                    return self._json(200, unit_icons.icon_status(load_settings(self.server.settings_path)))
+                except Exception as error:
+                    return self._handle_error(error)
+            if parsed.path.startswith("/api/unit-icon/") and not parsed.query:
+                try:
+                    unit_id = parsed.path.removeprefix("/api/unit-icon/")
+                    image = unit_icons.read_icon(load_settings(self.server.settings_path), unit_id)
+                    if image is None:
+                        return self._error(404, "Unit icon not found.")
+                    return self._send(200, image, "image/png")
+                except Exception as error:
+                    return self._handle_error(error)
             if parsed.path == "/api/profile":
                 try:
                     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
@@ -244,7 +258,8 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/client/heartbeat", "/api/client/close",
             "/api/save", "/api/clone", "/api/clone-project", "/api/sources",
             "/api/create-project", "/api/inspect", "/api/history", "/api/history/checkpoint", "/api/history/restore",
-            "/api/install", "/api/remove", "/api/settings", "/api/match/scan", "/api/catalog/start", "/api/catalog/cancel",
+            "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
+            "/api/catalog/start", "/api/catalog/cancel",
             "/api/match/start", "/api/match/cancel",
         }:
             return self._error(404, "Unknown API endpoint.")
@@ -308,6 +323,12 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/remove":
                 with self.server.write_lock:
                     return self._json(200, self._remove(payload))
+            if parsed.path == "/api/match/cache":
+                self._require_fields(payload, ("bar_root", "engine"))
+                return self._json(200, {"content": self.server.match_service.cached_content(
+                    self._string(payload["bar_root"], "bar_root"),
+                    self._string(payload["engine"], "engine"),
+                )})
             if parsed.path == "/api/match/scan":
                 self._require_fields(payload, ("bar_root", "engine"))
                 return self._json(200, self.server.match_service.scan(
