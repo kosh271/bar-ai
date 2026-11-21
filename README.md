@@ -67,8 +67,10 @@ Named variants such as `factory_swarm.json` and `behaviour_swarm.json` are
 available in their respective configuration sections. File names do not prove
 which layers load or their order; consult the profile's startup script.
 
-**Load unit catalog** reads unit names and
-factory options from a selected installed game using the selected engine.
+The bundled English unit-name reference displays friendly names next to unit
+IDs where available. **Load unit catalog** reads unit names and factory options
+from a selected installed game using the selected engine; its names take
+precedence over the bundled reference.
 The most recent completed catalog is restored when the workshop opens; existing
 scan files are also used if no newer saved catalog exists. A successful new
 scan replaces it. Names appear alongside IDs throughout the visual editors;

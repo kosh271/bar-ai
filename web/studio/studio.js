@@ -6,7 +6,7 @@ const S = window.StudioScripts;
 const state = {
     projects: [], project: "", profile: "", files: [], page: "overview",
     layer: {}, factory: "", situation: "land", response: "", file: "",
-    settings: null, defaultBarRoot: "", catalog: null, saving: false, history: [], match: {content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "", first: "", second: "", faction1: "Armada", faction2: "Cortex", minutes: 120, skip: false, snapshot: null, statusError: ""}
+    settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), saving: false, history: [], match: {content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "", first: "", second: "", faction1: "Armada", faction2: "Cortex", minutes: 120, skip: false, snapshot: null, statusError: ""}
 };
 const pages = {
     manage: ["AI install & remove", "Choose a BAR installation, then install or remove the selected AI.", "⇄"],
@@ -348,7 +348,7 @@ function treeNode(file, node, title, depth = 0, onChange = null, describe = null
             if (detail.open && !body.childNodes.length) {
                 if (info && info.description) body.append(element("p", "muted", info.description));
                 for (const child of node.children) {
-                    const key = String(child.key), label = catalogUnit(key)?.name ? unitLabel(key) : key.replace(/_/g, " ");
+                    const key = String(child.key), label = friendlyUnitName(key) ? unitLabel(key) : key.replace(/_/g, " ");
                     body.append(treeNode(file, child.node, label, depth + 1, onChange, describe));
                 }
             }
@@ -376,7 +376,7 @@ function treeNode(file, node, title, depth = 0, onChange = null, describe = null
         }
         if (node.kind === "string") {
             const name = element("div", "muted");
-            const updateName = () => { name.textContent = catalogUnit(input.value)?.name || ""; };
+            const updateName = () => { name.textContent = friendlyUnitName(input.value); };
             input.addEventListener("change", updateName); updateName(); label.append(name);
         }
     }
@@ -415,7 +415,7 @@ function opening(target) {
     panel.append(editor);
     if (!window.StudioOpenings) panel.append(notice("Opening editor could not be loaded.", true));
     else window.StudioOpenings.mount(editor, {
-        text: file.text, unitName: id => catalogUnit(id)?.name || "",
+        text: file.text, unitName: friendlyUnitName,
         onChange: text => { assign(file, text); message(""); }
     });
     panel.append(element("div", "source-bar", "Script source: " + file.path + " · Custom script that cannot be represented safely remains unchanged."));
@@ -440,9 +440,24 @@ function catalogControls(panel) {
 function catalogUnit(id) {
     return state.catalog?.byId.get(String(id).toLowerCase());
 }
+function friendlyUnitName(id) {
+    const key = String(id).toLowerCase();
+    return catalogUnit(key)?.name || state.unitNames.get(key) || "";
+}
 function unitLabel(id) {
-    const unit = catalogUnit(id);
-    return unit?.name ? `${unit.name} · ${id}` : id;
+    const name = friendlyUnitName(id);
+    return name ? `${name} · ${id}` : id;
+}
+async function loadUnitNames() {
+    const response = await fetch("/data/units.json");
+    if (!response.ok) throw Error(`Could not load bundled unit names (${response.status}).`);
+    const data = await response.json();
+    const names = data?.units?.names;
+    if (!names || typeof names !== "object" || Array.isArray(names) ||
+        !Object.entries(names).every(([key, name]) => key && typeof name === "string")) {
+        throw Error("Bundled unit names have an invalid format.");
+    }
+    state.unitNames = new Map(Object.entries(names).map(([key, name]) => [key.toLowerCase(), name]));
 }
 function setCatalog(catalog) {
     state.catalog = catalog ? {...catalog, byId: new Map(catalog.units.map(unit => [unit.id.toLowerCase(), unit]))} : null;
@@ -555,7 +570,8 @@ function production(target, selected) {
     units.children.forEach((unit, i) => {
         const tr = element("tr"), name = element("td", "unit-name", unit.node.value);
         const catalogEntry = catalogUnit(unit.node.value), factoryEntry = catalogUnit(state.factory);
-        if (catalogEntry?.name) name.append(element("div", "unit-sub", catalogEntry.name));
+        const friendlyName = friendlyUnitName(unit.node.value);
+        if (friendlyName) name.append(element("div", "unit-sub", friendlyName));
         if (state.catalog && !catalogEntry) name.append(element("div", "unit-sub", "Not found in catalog"));
         else if (factoryEntry?.builds && !factoryEntry.builds.some(id => id.toLowerCase() === String(unit.node.value).toLowerCase())) {
             name.append(element("div", "unit-sub", "Not listed in this factory's catalog options"));
@@ -956,8 +972,9 @@ function placementView(panel, file, root) {
     const instances = C.at(root, ["building", "instance", state.placement]);
     if (instances && instances.kind === "array") {
         const names = instances.children.map(e => {
-            const id = String(e.node.value), unit = catalogUnit(id);
-            return unit?.name ? `${unit.name} (${id})` : id;
+            const id = String(e.node.value);
+            const name = friendlyUnitName(id);
+            return name ? `${name} (${id})` : id;
         });
         panel.append(element("p", "muted", names.length
             ? "This rule applies to: " + names.join(", ") + ". Names are followed by the game's internal name in parentheses; an item shown alone is an internal name."
@@ -1736,6 +1753,8 @@ heartbeat();
 setInterval(heartbeat, 30_000);
 (async () => {
     try {
+        try { await loadUnitNames(); }
+        catch (error) { message("Could not load bundled unit names: " + errorText(error), true); }
         await refreshState();
         try { setCatalog((await api("/api/catalog/latest")).catalog); }
         catch (error) { message("Could not load saved unit catalog: " + errorText(error), true); }
