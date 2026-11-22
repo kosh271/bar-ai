@@ -102,6 +102,43 @@ class StudioServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
 
+    @unittest.skipUnless(shutil.which("git"), "Git is required for project import")
+    def test_project_mutations_and_zip_round_trip(self):
+        def manage(action, **payload):
+            return self._request("/api/project/manage", method="POST", body={
+                "project": "ExampleAI", "action": action, **payload,
+            })
+
+        self.assertEqual(manage("rename_project", name="A renamed project")[0], 200)
+        status, copied, _ = self._request("/api/clone", method="POST", body={
+            "project": "ExampleAI", "profile": "hard", "name": "New profile",
+        })
+        self.assertEqual(status, 200)
+        profile = copied["profile"]
+        self.assertEqual(manage("rename_profile", profile=profile, name="Renamed profile")[0], 200)
+        self.assertEqual(manage("delete_profile", profile="hard", confirm=True)[0], 400)
+        self.assertEqual(manage("set_default", profile=profile)[0], 200)
+        self.assertEqual(manage("delete_profile", profile="hard", confirm=True)[0], 200)
+        self.assertEqual(manage("delete_profile", profile=profile, confirm=True)[0], 400)
+        self.assertEqual(manage("delete_project")[0], 400)
+        headers = {"X-Workshop-Token": self.server.session_token}
+        request = urllib.request.Request(self.base + "/api/project/export?project=ExampleAI", headers=headers)
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.headers.get_content_type(), "application/zip")
+            archive = response.read()
+        deleted, detail, _ = manage("delete_project", confirm=True)
+        self.assertEqual(deleted, 200, detail)
+        import_request = urllib.request.Request(
+            self.base + "/api/project/import", data=archive, headers=headers, method="POST",
+        )
+        with urllib.request.urlopen(import_request) as response:
+            self.assertEqual(json.load(response), {"project": "ExampleAI", "profile": profile})
+        state = self._request("/api/state")[1]
+        self.assertEqual(state["projects"][0]["name"], "A renamed project")
+        self.assertEqual(state["projects"][0]["default_profile"], profile)
+        checkpoints = self._request("/api/history", method="POST", body={"project": "ExampleAI"})[1]
+        self.assertEqual(len(checkpoints["checkpoints"]), 1)
+
     def test_closing_one_tab_keeps_server_open_until_last_tab_closes(self):
         with (
             patch.object(self.server, "_schedule_client_expiry_locked"),

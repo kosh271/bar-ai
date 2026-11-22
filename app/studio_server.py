@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import discovery, game_sources, installation, project_history, projects, unit_icons
+from . import discovery, game_sources, installation, project_archive, project_history, projects, unit_icons
 from .headless import MatchError
 from .settings import Settings, SettingsError, load_settings, save_settings
 from .studio_matches import MatchService
@@ -207,6 +207,24 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     })})
                 except Exception as error:
                     return self._handle_error(error)
+            if parsed.path == "/api/project/export":
+                try:
+                    query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+                    if set(query) != {"project"} or len(query["project"]) != 1:
+                        raise ValueError("Supply one project to export.")
+                    with tempfile.TemporaryFile() as archive:
+                        with self.server.write_lock:
+                            project = self._project(query["project"][0])
+                            project_archive.write(project, archive)
+                        size = archive.tell()
+                        archive.seek(0)
+                        self._send_headers(200, size, "application/zip", filename=f"{project.name}.zip")
+                        shutil.copyfileobj(archive, self.wfile)
+                    return
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                except Exception as error:
+                    return self._handle_error(error)
             else:
                 return self._error(404, "Unknown API endpoint.")
         if parsed.query:
@@ -258,12 +276,15 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/client/heartbeat", "/api/client/close",
             "/api/save", "/api/clone", "/api/clone-project", "/api/sources",
             "/api/create-project", "/api/inspect", "/api/history", "/api/history/checkpoint", "/api/history/restore",
+            "/api/project/manage", "/api/project/import",
             "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
             "/api/match/start", "/api/match/cancel",
         }:
             return self._error(404, "Unknown API endpoint.")
         try:
+            if parsed.path == "/api/project/import":
+                return self._json(200, self._import_project())
             payload = self._read_json(allow_empty=parsed.path == "/api/match/cancel")
             if parsed.path in {"/api/client/heartbeat", "/api/client/close"}:
                 self._require_fields(payload, ("client_id",))
@@ -296,6 +317,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/clone-project":
                 with self.server.write_lock:
                     return self._json(200, self._clone_project(payload))
+            if parsed.path == "/api/project/manage":
+                with self.server.write_lock:
+                    return self._json(200, self._manage_project(payload))
             if parsed.path in {"/api/history", "/api/history/checkpoint", "/api/history/restore"}:
                 self._require_fields(payload, ("project",))
                 with self.server.write_lock:
@@ -375,15 +399,20 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         return
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
+        self._send_headers(status, len(body), content_type)
+        self.wfile.write(body)
+
+    def _send_headers(self, status: int, length: int, content_type: str, *, filename: str = "") -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(length))
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
-        self.wfile.write(body)
 
     def _json(self, status: int, payload: object) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -430,18 +459,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         return bool(supplied) and hmac.compare_digest(supplied, self.server.session_token)
 
     def _read_json(self, *, allow_empty: bool = False) -> dict[str, Any]:
-        if self.headers.get("Transfer-Encoding"):
-            self.close_connection = True
-            raise ValueError("Transfer-encoded requests are not supported.")
-        lengths = self.headers.get_all("Content-Length", [])
-        if allow_empty and not lengths:
-            return {}
-        if len(lengths) != 1 or not lengths[0].isdecimal():
-            raise ValueError("A valid Content-Length header is required.")
-        length = int(lengths[0])
-        if length > MAX_REQUEST_BYTES:
-            self.close_connection = True
-            raise ValueError("Request body is too large.")
+        length = self._body_length(MAX_REQUEST_BYTES, allow_empty=allow_empty)
         body = self.rfile.read(length)
         if len(body) != length:
             raise ValueError("Incomplete request body.")
@@ -454,6 +472,22 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             raise ValueError("Request body must be a JSON object.")
         return value
+
+    def _body_length(self, limit: int, *, allow_empty: bool = False) -> int:
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            raise ValueError("Transfer-encoded requests are not supported.")
+        lengths = self.headers.get_all("Content-Length", [])
+        if allow_empty and not lengths:
+            return 0
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+            self.close_connection = True
+            raise ValueError("A valid Content-Length header is required.")
+        length = int(lengths[0])
+        if length > limit:
+            self.close_connection = True
+            raise ValueError("Request body is too large.")
+        return length
 
     @staticmethod
     def _require_fields(payload: dict[str, Any], fields: tuple[str, ...]) -> None:
@@ -483,6 +517,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 result.append({
                     "key": key,
                     "name": name,
+                    "default_profile": projects.project_metadata(project)["default_profile"],
                     "history_error": self._initialize_history(project),
                     "profiles": [{"key": profile_key, "name": profile_name}
                                  for profile_key, profile_name in profiles],
@@ -557,17 +592,20 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "suggested": suggested.label if suggested is not None else None,
         }
 
-    def _create_project(self, payload: dict[str, Any]) -> dict[str, str]:
-        self._require_fields(payload, ("bar_root", "source", "name"))
+    def _stock_source(self, payload: dict[str, Any]) -> game_sources.GameSource:
         bar_root = Path(self._string(payload["bar_root"], "bar_root")).expanduser()
         source_label = self._string(payload["source"], "source")
-        name = self._string(payload["name"], "name")
         found = discovery.discover(bar_root)
         sources = game_sources.list_game_sources(found.data, found.game_directory)[0]
         matches = [source for source in sources if source.label == source_label]
         if len(matches) != 1:
             raise game_sources.GameSourceError("Selected game source is no longer available.")
-        source = matches[0]
+        return matches[0]
+
+    def _create_project(self, payload: dict[str, Any]) -> dict[str, str]:
+        self._require_fields(payload, ("bar_root", "source", "name"))
+        name = self._string(payload["name"], "name")
+        source = self._stock_source(payload)
         with game_sources.stock_directory(source, self.server.projects_root) as stock:
             created = projects.create_project(
                 self.server.projects_root,
@@ -580,6 +618,54 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         if error:
             result["history_error"] = error
         return result
+
+    def _manage_project(self, payload: dict[str, Any]) -> dict[str, str]:
+        self._require_fields(payload, ("project", "action"))
+        project = self._project(self._string(payload["project"], "project"))
+        action = self._string(payload["action"], "action")
+        self._check_project_tree(project)
+        profile = ""
+        if action in ("delete_project", "delete_profile") and payload.get("confirm") is not True:
+            raise ValueError("Confirm the deletion before proceeding.")
+        if action == "delete_project":
+            projects.delete_project(self.server.projects_root, project.name)
+            return {"project": "", "profile": ""}
+        if action == "rename_project":
+            projects.rename_project(project, self._string(payload.get("name"), "name"))
+            return {"project": project.name}
+        elif action == "create_profile":
+            self._require_fields(payload, ("bar_root", "source", "name"))
+            source = self._stock_source(payload)
+            with game_sources.stock_directory(source, self.server.projects_root) as stock:
+                profile = projects.create_profile_from_hard(
+                    project, self._string(payload["name"], "name"), stock, source_label=source.label,
+                ).name
+        elif action in ("rename_profile", "set_default", "delete_profile"):
+            profile = self._string(payload.get("profile"), "profile")
+            if action == "rename_profile":
+                projects.rename_profile(project, profile, self._string(payload.get("name"), "name"))
+            elif action == "set_default":
+                projects.set_default_profile(project, profile)
+            else:
+                projects.delete_profile(project, profile)
+                profile = ""
+        else:
+            raise ValueError("Unknown project management action.")
+        return {"project": project.name, "profile": profile}
+
+    def _import_project(self) -> dict[str, str]:
+        remaining = self._body_length(project_archive.MAX_ARCHIVE_BYTES)
+        with tempfile.TemporaryFile() as archive:
+            while remaining:
+                chunk = self.rfile.read(min(remaining, 64 * 1024))
+                if not chunk:
+                    raise ValueError("Incomplete project upload.")
+                archive.write(chunk)
+                remaining -= len(chunk)
+            archive.seek(0)
+            with self.server.write_lock:
+                project = project_archive.load(self.server.projects_root, archive)
+                return {"project": project.name, "profile": projects.project_metadata(project)["default_profile"]}
 
     @staticmethod
     def _check_project_tree(root: Path) -> None:

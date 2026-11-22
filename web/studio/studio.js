@@ -72,6 +72,7 @@ function status() {
     $("clone").disabled = state.saving || !state.profile;
     $("review").disabled = !count;
     $("project-history").disabled = state.saving || !state.project;
+    $("manage-project").disabled = state.saving;
 }
 function assign(file, text, record = true) {
     if (text === file.text) return;
@@ -133,7 +134,8 @@ async function refreshState(project = state.project, profile = state.profile) {
     await loadCachedMatchContent();
     state.project = state.projects.some(p => p.key === project) ? project : state.projects[0]?.key || "";
     const projectInfo = selectedProject();
-    state.profile = projectInfo?.profiles.some(p => p.key === profile) ? profile : projectInfo?.profiles[0]?.key || "";
+    state.profile = projectInfo?.profiles.some(p => p.key === profile) ? profile :
+        projectInfo?.profiles.find(p => p.key === projectInfo.default_profile)?.key || projectInfo?.profiles[0]?.key || "";
     selectOptions($("project"), state.projects.map(p => [p.key, p.name]), state.project);
     selectOptions($("profile"), (projectInfo?.profiles || []).map(p => [p.key, p.name]), state.profile);
     $("clone").disabled = !state.profile;
@@ -1360,7 +1362,7 @@ function render() {
         const empty = element("div", "panel");
         empty.append(element("h2", "", "Create your first AI"),
             element("p", "muted", "Start with a copy of the BARbarIAn hard profile from an installed game. The original game files stay unchanged."),
-            button("New AI from BAR", createProject, "button primary"));
+            button("New AI from BAR", () => createProject(), "button primary"));
         target.append(empty); return;
     }
     try {
@@ -1546,9 +1548,9 @@ function cloneProject() {
         }, "button primary"));
     showDialog("Create an AI", box);
 }
-function createProject() {
+function createProject(project = "") {
     if (state.saving) { message("Wait for the save to finish.", true); return; }
-    const box = element("div"), [nameLabel, name] = textInput("AI name", "");
+    const box = element("div"), [nameLabel, name] = textInput(project ? "Profile name" : "AI name");
     const [rootLabel, root] = textInput("BAR installation folder", state.settings?.bar_root || state.defaultBarRoot, "C:\\Games\\Beyond-All-Reason");
     const sourceBox = element("div"), feedback = element("p", "muted");
     let source = null;
@@ -1564,16 +1566,104 @@ function createProject() {
                 feedback.textContent = result.suggested ? "Suggested from the last game log; verify it is the version you want." :
                     result.sources.length ? "Choose the game version to copy." : "No installed game sources were found.";
             } catch (error) { source = null; sourceBox.replaceChildren(); feedback.textContent = errorText(error); }
-        }), sourceBox, feedback, button("Create AI", async () => {
+        }), sourceBox, feedback, button(project ? "Create profile" : "Create AI", async event => {
+            if (state.saving) return;
+            const submit = event.currentTarget;
+            let started = false;
             try {
                 if (!source || !source.value) throw Error("Find and choose an installed game version first.");
                 if (!confirmDiscard()) return;
-                const result = await api("/api/create-project", {bar_root: root.value, source: source.value, name: name.value});
-                $("dialog").close(); await refreshState(result.project, "hard"); await loadProfile();
-                message("AI created from the selected game version." + (result.history_error ? " Project history unavailable: " + result.history_error : ""), !!result.history_error);
+                state.saving = started = true; status(); submit.disabled = true;
+                const input = {bar_root: root.value, source: source.value, name: name.value};
+                const result = project
+                    ? await api("/api/project/manage", {...input, project, action: "create_profile"})
+                    : await api("/api/create-project", input);
+                await refreshState(result.project, result.profile || "hard"); await loadProfile(); $("dialog").close();
+                const history = result.history_error ? "\nProject history unavailable: " + result.history_error : "";
+                message(`${project ? "Profile" : "AI"} created from the selected game version.` + history, !!history);
             } catch (error) { feedback.textContent = errorText(error); }
+            finally {
+                if (started) { state.saving = false; status(); submit.disabled = false; }
+            }
         }, "button primary"));
-    showDialog("New AI from BAR", box);
+    showDialog(project ? "New profile from BAR" : "New AI from BAR", box);
+}
+async function projectArchiveRequest(url, file) {
+    const response = await fetch(url, {
+        headers: {"X-Workshop-Token": window.WORKSHOP_TOKEN},
+        ...(file ? {method: "POST", body: file} : {})
+    });
+    if (!response.ok) {
+        const detail = await response.json();
+        throw Error(detail.error || `Request failed (${response.status})`);
+    }
+    return response;
+}
+function manageProject() {
+    const project = selectedProject(), profile = project?.profiles.find(entry => entry.key === state.profile);
+    const box = element("div"), feedback = element("p", "muted"), archive = element("input");
+    archive.type = "file"; archive.accept = ".zip,application/zip";
+    const archiveLabel = element("label", "field", "Project ZIP");
+    archiveLabel.append(archive);
+
+    async function mutate(event, submit, success) {
+        const control = event.currentTarget;
+        if (state.saving || !confirmDiscard()) return;
+        state.saving = true; status(); control.disabled = true;
+        try {
+            const result = await submit();
+            await refreshState(result.project, result.profile ?? state.profile);
+            await loadProfile(); $("dialog").close(); message(success);
+        } catch (error) { feedback.textContent = errorText(error); }
+        finally { state.saving = false; status(); control.disabled = false; }
+    }
+    const change = (event, action, fields, success) => mutate(event, () => api("/api/project/manage", {
+        project: project.key, profile: profile?.key, action, ...fields
+    }), success);
+    if (project) {
+        const [projectLabel, projectName] = textInput("Project display name", project.name);
+        box.append(element("h3", "", "Project"), projectLabel,
+            button("Rename project", event => change(event, "rename_project", {name: projectName.value}, "Project renamed.")),
+            button("Export project ZIP", async event => {
+                const control = event.currentTarget;
+                control.disabled = true;
+                try {
+                    const response = await projectArchiveRequest(`/api/project/export?project=${encodeURIComponent(project.key)}`);
+                    const link = element("a");
+                    link.href = URL.createObjectURL(await response.blob()); link.download = project.key + ".zip";
+                    link.click();
+                    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+                    feedback.textContent = "Project ZIP exported.";
+                } catch (error) { feedback.textContent = errorText(error); }
+                finally { control.disabled = false; }
+            }),
+            button("Delete project", event => {
+                if (confirm(`Permanently delete ${project.name}, its profiles, and its checkpoint history?`)) {
+                    change(event, "delete_project", {confirm: true}, "Project deleted.");
+                }
+            }));
+        box.append(element("h3", "", "Profiles"), button("New profile from BAR", () => createProject(project.key)));
+        if (profile) {
+            const isDefault = project.default_profile === profile.key;
+            const [profileLabel, profileName] = textInput("Profile display name", profile.name);
+            const setDefault = button("Make default", event => change(event, "set_default", {}, "Default profile updated. Install the AI to apply its new default in BAR."));
+            const remove = button("Delete profile", event => {
+                if (confirm(`Delete the ${profile.name} profile?`)) change(event, "delete_profile", {confirm: true}, "Profile deleted.");
+            });
+            setDefault.disabled = isDefault;
+            remove.disabled = isDefault || project.profiles.length === 1;
+            box.append(profileLabel,
+                button("Rename profile", event => change(event, "rename_profile", {name: profileName.value}, "Profile renamed.")),
+                setDefault, remove);
+            if (isDefault) box.append(element("p", "muted", "This is the default profile. Select a different default before deleting it."));
+        }
+    }
+    box.append(element("h3", "", "Import a project"), archiveLabel, button("Import ZIP", event => {
+        if (!archive.files.length) { feedback.textContent = "Choose a project ZIP."; return; }
+        mutate(event, async () => (await projectArchiveRequest("/api/project/import", archive.files[0])).json(),
+            "Project imported with a fresh baseline checkpoint.");
+    }), feedback);
+    showDialog("Manage projects and profiles", box);
 }
 function manageAIs(target) {
     const setup = element("div", "panel"), [rootLabel, root] = textInput(
@@ -1748,7 +1838,8 @@ async function manageSelectedAI(remove, feedback, installButton, removeButton) {
     }
 }
 $("dialog-close").addEventListener("click", () => $("dialog").close());
-$("new-project").addEventListener("click", createProject);
+$("new-project").addEventListener("click", () => createProject());
+$("manage-project").addEventListener("click", manageProject);
 $("clone").addEventListener("click", cloneProfile);
 $("reload").addEventListener("click", async () => {
     if (!confirmDiscard()) return;

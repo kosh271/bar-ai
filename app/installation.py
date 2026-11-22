@@ -70,7 +70,8 @@ def _lua(value: str) -> str:
 def _metadata(project: Path) -> tuple[str, str, str]:
     try:
         info = _read_metadata(project / "project.json", ("name", "short_name", "default_profile"))
-        if project.is_symlink() or _key(info["name"], project=True) != info["short_name"]:
+        _key(info["name"], project=True)
+        if project.is_symlink() or _key(info["short_name"], project=True) != info["short_name"]:
             raise InstallationError("Invalid project name or short name.")
         if project.name != info["short_name"] or info["short_name"].casefold() == "barb":
             raise InstallationError("The project name conflicts with the stock BARbarIAn.")

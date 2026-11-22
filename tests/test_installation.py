@@ -11,7 +11,7 @@ from app.installation import (
     install,
     remove,
 )
-from app.projects import clone_profile, create_project
+from app.projects import clone_profile, create_project, rename_project, set_default_profile
 
 
 TEST_DIR = Path(__file__).resolve().parent
@@ -106,6 +106,17 @@ class InstallationTests(unittest.TestCase):
         self.assertIn("VFS.ZIP", self.lobby.read_text())
         remove(self.project, self.data, self.engine, lambda _message: True)
         self.assertFalse(self.lobby.exists())
+
+    def test_renamed_project_and_new_default_reuse_the_installed_identifier(self):
+        install(self.project, self.data, self.engine, lambda _message: True)
+        clone_profile(self.project, "Faster", "hard")
+        rename_project(self.project, "Renamed AI")
+        set_default_profile(self.project, "faster")
+        result = install(self.project, self.data, self.engine, lambda _message: True)
+        self.assertEqual(result.path, self.target)
+        self.assertIn("value = 'MyAI'", (self.target / "AIInfo.lua").read_text(encoding="utf-8"))
+        self.assertIn("value = 'Renamed AI'", (self.target / "AIInfo.lua").read_text(encoding="utf-8"))
+        self.assertIn("option.def = 'faster'", (self.target / "AIOptions.lua").read_text(encoding="utf-8"))
 
     def test_unmanaged_and_modified_ai_requires_confirmation(self):
         self.target.mkdir(parents=True)

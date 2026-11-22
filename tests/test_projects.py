@@ -1,6 +1,12 @@
+import io
+import stat
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
+
+from app import project_archive, projects
 
 from app.projects import (
     ProjectError,
@@ -86,6 +92,69 @@ class ProjectTests(unittest.TestCase):
             create_project(self.projects, "my ai", self.stock)
         with self.assertRaisesRegex(ProjectError, "reserved Windows"):
             create_project(self.projects, "CON", self.stock)
+
+    def test_zip_export_omits_history_and_staging(self):
+        project = create_project(self.projects, "My AI", self.stock)
+        (project / ".git").mkdir()
+        (project / ".git" / "config").touch()
+        (project / ".staging-old").mkdir()
+        (project / ".staging-old" / "private.txt").touch()
+        (project / "save.tmp").touch()
+        output = io.BytesIO()
+        project_archive.write(project, output)
+        with zipfile.ZipFile(output) as archive:
+            self.assertIn("project.json", archive.namelist())
+            self.assertTrue(all(not name.startswith((".git", ".staging-")) for name in archive.namelist()))
+            self.assertNotIn("save.tmp", archive.namelist())
+        with self.assertRaisesRegex(ProjectError, "already exists"):
+            project_archive.load(self.projects, output)
+
+    def test_zip_import_refuses_unsafe_members_and_cleans_staging(self):
+        link = zipfile.ZipInfo("profiles/current")
+        link.create_system = 3
+        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        for entries in (
+            ["../escaped.txt"], ["C:/outside.txt"], ["payload/NUL.txt"], [".git/config"],
+            ["Profiles/file", "profiles/other"], ["file", "file/child"], [link],
+        ):
+            with self.subTest(entries=entries):
+                blob = io.BytesIO()
+                with zipfile.ZipFile(blob, "w") as archive:
+                    for name in entries:
+                        archive.writestr(name, "data")
+                with self.assertRaises(ProjectError):
+                    project_archive.load(self.projects, blob)
+                self.assertEqual(list(self.projects.iterdir()), [])
+                self.assertFalse((self.projects / "escaped.txt").exists())
+        blob = io.BytesIO()
+        with zipfile.ZipFile(blob, "w") as archive:
+            archive.writestr("large", "0123456789")
+        with patch.object(projects, "MAX_WORKSPACE_FILE_BYTES", 5):
+            with self.assertRaisesRegex(ProjectError, "size limit"):
+                project_archive.load(self.projects, blob)
+        self.assertEqual(list(self.projects.iterdir()), [])
+
+    def test_zip_import_refuses_invalid_unicode_before_publication(self):
+        files = {
+            "project.json": '{"name":"My AI","short_name":"MyAI","default_profile":"hard"}',
+            "profiles/hard/profile.json": '{"name":"Hard"}',
+            "profiles/hard/config/test.json": "{}",
+            "profiles/hard/script/init.as": "// init",
+            "profiles/hard/script/main.as": "// main",
+        }
+        for path, bad in (
+            ("project.json", r'{"name":"My AI\ud800","short_name":"MyAI","default_profile":"hard"}'),
+            ("profiles/hard/profile.json", r'{"name":"Hard\ud800"}'),
+            ("profiles/hard/script/main.as", b"\xff"),
+        ):
+            with self.subTest(path=path):
+                archive = io.BytesIO()
+                with zipfile.ZipFile(archive, "w") as output:
+                    for name, content in {**files, path: bad}.items():
+                        output.writestr(name, content)
+                with self.assertRaisesRegex(ProjectError, "Unicode|UTF-8"):
+                    project_archive.load(self.projects, archive)
+                self.assertEqual(list(self.projects.iterdir()), [])
 
 
 if __name__ == "__main__":
