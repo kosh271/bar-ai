@@ -218,6 +218,19 @@ class StudioServerTests(unittest.TestCase):
         checkpoints = self._request("/api/history", method="POST", body={"project": "ExampleAI"})[1]
         self.assertEqual(len(checkpoints["checkpoints"]), 1)
 
+    def test_workspace_preferences_survive_requests_after_selection_disappears(self):
+        workspace = {"project": "UnavailableAI", "profile": "missing"}
+        payload = {"workspace": workspace}
+        self.assertEqual(self._request("/api/preferences", method="POST", body=payload, token=False)[0], 401)
+        self.assertEqual(self._request("/api/preferences", method="POST", body=payload)[0], 200)
+        from app.settings import load_studio_preferences
+        self.assertEqual(load_studio_preferences(self.settings.with_name("studio-preferences.json")), payload)
+        status, state, _ = self._request("/api/state")
+        self.assertEqual(status, 200)
+        self.assertEqual(state["preferences"], payload)
+        self.assertEqual(state["projects"][0]["key"], "ExampleAI")
+        self.assertEqual(self._request("/api/preferences", method="POST", body={"workspace": []})[0], 400)
+
     def test_closing_one_tab_keeps_server_open_until_last_tab_closes(self):
         with (
             patch.object(self.server, "_schedule_client_expiry_locked"),

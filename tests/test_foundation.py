@@ -11,10 +11,38 @@ from app.__main__ import Editor
 from app.discovery import DiscoveryError, discover, engine_readiness
 from app.headless import _diagnostics
 from app.settings import (
-    EditorState, Settings, SettingsError, load_editor_state, load_settings, save_editor_state, save_settings,
+    EditorState, Settings, SettingsError, load_editor_state, load_settings, load_studio_preferences,
+    save_editor_state, save_settings, save_studio_preferences,
 )
 
 TEST_DIR = Path(__file__).resolve().parent
+
+
+class StudioPreferenceTests(unittest.TestCase):
+    def test_preferences_merge_and_reject_invalid_replacements(self):
+        with tempfile.TemporaryDirectory(dir=TEST_DIR) as temporary:
+            path = Path(temporary) / "studio-preferences.json"
+            workspace = {"project": "ExampleAI", "profile": "my-profile"}
+            match = {
+                "game": "BAR", "map": "A map", "first": ["BARb", "stable", "hard"],
+                "second": ["OtherAI", "1", ""], "faction1": "Armada", "faction2": "Legion",
+                "minutes": 55, "skip_smoke": True,
+            }
+            self.assertEqual(load_studio_preferences(path), {})
+            save_studio_preferences(path, {"workspace": workspace})
+            save_studio_preferences(path, {"match": match})
+            self.assertEqual(load_studio_preferences(path), {"workspace": workspace, "match": match})
+            for update in (
+                {"match": {**match, "skip_smoke": 1}},
+                {"match": {**match, "minutes": True}},
+                {"match": {**match, "first": ["BARb", "stable"]}},
+                {"workspace": {**workspace, "project": "../not-a-project"}},
+            ):
+                with self.subTest(update=update), self.assertRaises(SettingsError):
+                    save_studio_preferences(path, update)
+            self.assertEqual(load_studio_preferences(path), {"workspace": workspace, "match": match})
+            path.write_text("incomplete JSON", encoding="utf-8")
+            self.assertEqual(load_studio_preferences(path), {})
 
 
 class DiscoveryTests(unittest.TestCase):

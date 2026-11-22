@@ -165,8 +165,45 @@ async function loadInstallStatus() {
     }
     status();
 }
-async function refreshState(project = state.project, profile = state.profile) {
+let preferenceWrites = Promise.resolve();
+function rememberPreference(update) {
+    preferenceWrites = preferenceWrites.then(() => api("/api/preferences", update))
+        .catch(error => message("Could not save Studio preferences. " + errorText(error), true));
+}
+function matchPreference(key, value) {
+    const m = state.match;
+    m[key] = value;
+    rememberMatchPreferences();
+}
+function rememberMatchPreferences() {
+    const m = state.match;
+    const rosters = [m.side1, m.side2].map(team => team.map(slot => ({
+        ai: JSON.parse(slot.ai), faction: slot.faction
+    })));
+    const [first, second] = rosters.map(team => team[0]);
+    rememberPreference({match: {
+        game: m.game, map: m.map, first: first.ai, second: second.ai, faction1: first.faction,
+        faction2: second.faction, minutes: m.minutes, skip_smoke: m.skip, rosters
+    }});
+}
+async function refreshState(project, profile) {
     const data = await api("/api/state");
+    if (project === undefined) {
+        project = data.preferences?.workspace?.project ?? "";
+        profile = data.preferences?.workspace?.profile ?? "";
+        const match = data.preferences?.match;
+        if (match) {
+            const teams = match.rosters?.map(team => team.map(slot => ({
+                ai: JSON.stringify(slot.ai), faction: slot.faction
+            })));
+            Object.assign(state.match, {
+                game: match.game, map: match.map, minutes: match.minutes, skip: match.skip_smoke,
+                first: JSON.stringify(match.first), second: JSON.stringify(match.second),
+                faction1: match.faction1, faction2: match.faction2,
+                side1: teams?.[0] || [], side2: teams?.[1] || []
+            });
+        }
+    }
     state.projects = data.projects; setSettings(data.settings);
     await loadIconStatus();
     state.defaultBarRoot = data.default_bar_root || "";
@@ -193,6 +230,7 @@ async function loadProfile() {
     }
     await refreshBaseline();
     if (!current()) return;
+    rememberPreference({workspace: {project, profile}});
     status(); render();
 }
 async function refreshBaseline() {
@@ -1806,8 +1844,10 @@ function matchView(target) {
             if (!m.side1.length) m.side1 = [{ai: m.first, faction: m.faction1 || "Armada"}];
             if (!m.side2.length) m.side2 = [{ai: m.second, faction: m.faction2 || "Cortex"}];
             const row = element("div", "row");
-            row.append(dropdown("Game", content.games.map(v => [v, v]), m.game, v => { m.game = v; }),
-                dropdown("Map", content.maps.map(v => [v.name, v.name]), m.map, v => { m.map = v; }));
+            row.append(dropdown("Game", content.games.map(v => [v, v]), m.game, v => matchPreference("game", v)),
+                dropdown("Primary map", content.maps.map(v => [v.name,
+                    `${v.name} (${v.width && v.height ? `${v.width / 512} × ${v.height / 512}` : "size unknown"})`
+                ]), m.map, v => matchPreference("map", v)));
             panel.append(row);
 
             const factions = ["Armada", "Cortex", "Legion"].map(v => [v, v]);
@@ -1818,6 +1858,7 @@ function matchView(target) {
                 const sideHead = element("div", "roster-side-head");
                 const add = button("＋ Add AI", () => {
                     slots.push({ai: defaultAi, faction: defaultFaction});
+                    rememberMatchPreferences();
                     render();
                 });
                 add.disabled = m.side1.length + m.side2.length >= 16;
@@ -1830,16 +1871,19 @@ function matchView(target) {
                     selectOptions(aiSelect, aiChoices, slot.ai);
                     aiSelect.addEventListener("change", () => {
                         slot.ai = aiSelect.value;
+                        rememberMatchPreferences();
                     });
                     const factionSelect = element("select");
                     factionSelect.setAttribute("aria-label", `${title} AI ${index + 1} faction`);
                     selectOptions(factionSelect, factions, slot.faction);
                     factionSelect.addEventListener("change", () => {
                         slot.faction = factionSelect.value;
+                        rememberMatchPreferences();
                     });
                     const removeBtn = button("Remove", () => {
                         if (slots.length <= 1) return;
                         slots.splice(index, 1);
+                        rememberMatchPreferences();
                         render();
                     });
                     removeBtn.disabled = slots.length <= 1;
@@ -1926,10 +1970,15 @@ function matchView(target) {
             panel.append(seriesPanel);
 
             const settings = element("div", "row"), minutes = element("input"), minuteLabel = element("label", "field", "Game-time limit (minutes)");
-            minutes.type = "number"; minutes.min = "1"; minutes.step = "1"; minutes.value = m.minutes;
-            minutes.addEventListener("change", () => { m.minutes = Number(minutes.value); }); minuteLabel.append(minutes);
+            minutes.type = "number"; minutes.min = "1"; minutes.max = String(Math.floor(2147483647 / 1800));
+            minutes.required = true; minutes.step = "1"; minutes.value = m.minutes;
+            minutes.addEventListener("change", () => {
+                if (minutes.reportValidity()) matchPreference("minutes", Number(minutes.value));
+            });
+            minuteLabel.append(minutes);
             const skipLabel = element("label", "field", "Skip smoke test"), skip = element("input");
-            skip.type = "checkbox"; skip.checked = m.skip; skip.addEventListener("change", () => {m.skip = skip.checked;}); skipLabel.append(skip);
+            skip.type = "checkbox"; skip.checked = m.skip;
+            skip.addEventListener("change", () => matchPreference("skip", skip.checked)); skipLabel.append(skip);
             const replay = element("input"), replayLabel = element("label", "field", "Record replay");
             replay.type = "checkbox"; replay.checked = m.recordDemo === true;
             replay.addEventListener("change", () => { m.recordDemo = replay.checked; });
@@ -1938,7 +1987,7 @@ function matchView(target) {
             settings.append(minuteLabel, skipLabel, replayLabel, button(startLabel, async () => {
                 try {
                     if (dirty().length) throw Error("Save and install profile changes before testing.");
-                    if (!Number.isInteger(m.minutes) || m.minutes <= 0) throw Error("Enter a positive whole-number time limit.");
+                    if (!minutes.reportValidity()) return;
                     const player = (value, faction, ally) => {
                         const [short_name, version, profile] = JSON.parse(value);
                         return {short_name, version, profile, faction, ally};

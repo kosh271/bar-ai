@@ -24,7 +24,8 @@ from typing import Any
 
 from . import discovery, game_sources, installation, project_archive, project_history, projects, unit_icons
 from .headless import MatchError
-from .settings import Settings, SettingsError, load_settings, save_settings
+from .settings import (Settings, SettingsError, load_settings, load_studio_preferences, save_settings,
+                       save_studio_preferences)
 from .studio_matches import MatchService
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -168,6 +169,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, {
                         "projects": self._state_projects(),
                         "settings": self._settings(),
+                        "preferences": load_studio_preferences(self._preferences_path()),
                         "default_bar_root": str(default_bar_root) if default_bar_root is not None else None,
                     })
                 except Exception as error:
@@ -328,6 +330,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/create-project", "/api/inspect", "/api/history", "/api/history/checkpoint", "/api/history/restore",
             "/api/history/diff",
             "/api/project/manage", "/api/project/import",
+            "/api/preferences",
             "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
             "/api/match/start", "/api/match/cancel", "/api/match/replay/copy",
@@ -371,6 +374,10 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/project/manage":
                 with self.server.write_lock:
                     return self._json(200, self._manage_project(payload))
+            if parsed.path == "/api/preferences":
+                with self.server.write_lock:
+                    save_studio_preferences(self._preferences_path(), payload)
+                return self._json(200, {"ok": True})
             if parsed.path == "/api/history/diff":
                 self._require_fields(payload, ("project",))
                 names_only = payload.get("names_only", False)
@@ -607,6 +614,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "bar_root": configured.bar_root,
             "engine": configured.engine,
         }
+
+    def _preferences_path(self) -> Path:
+        return self.server.settings_path.with_name("studio-preferences.json")
 
     def _clone_project(self, payload: dict[str, Any]) -> dict[str, str]:
         self._require_fields(payload, ("project", "name"))
