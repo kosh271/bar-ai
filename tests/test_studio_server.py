@@ -101,6 +101,40 @@ class StudioServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
 
+    def test_experiment_endpoints_require_a_token_and_pass_validated_requests(self):
+        start_path = "/api/experiment/start"
+        spec = {"bar_root": "bar", "engine": "engine", "game": "Game", "maps": ["Map"], "minutes": 1,
+                "game_limit": 2, "seconds_limit": 60, "mode": "tournament", "players": []}
+        for path, method, body in (
+            (start_path, "POST", spec),
+            ("/api/experiment/history", "GET", None),
+            ("/api/experiment/pause", "POST", {"paused": True}),
+            ("/api/experiment/promote", "POST", {"id": "e", "candidate_id": "v1", "name": "Winner"}),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self._request(path, method=method, body=body, token=False)[0], 401)
+        service = self.server.match_service
+        with patch.object(service, "start_experiment", return_value={"operation": "experiment"}) as start:
+            self.assertEqual(self._request(start_path, method="POST", body={})[0], 400)
+            self.assertEqual(self._request(start_path, method="POST", body=spec)[1]["operation"], "experiment")
+            start.assert_called_once_with("bar", "engine", "Game", ["Map"], 1, 2, 60, "tournament", [], sweep=None)
+        self.assertEqual(self._request("/api/experiment/history")[1], {"experiments": []})
+        self.assertEqual(self._request("/api/experiment/pause", method="POST", body={"id": "e", "paused": 1})[0], 400)
+        self.assertEqual(self._request("/api/experiment/pause", method="POST", body={"paused": True})[0], 400)
+        with patch.object(service, "pause_experiment", return_value={}) as pause:
+            self.assertEqual(self._request("/api/experiment/pause", method="POST", body={"id": "e", "paused": True})[0], 200)
+            pause.assert_called_once_with(True, "e")
+        with patch.object(service, "cancel", return_value={}) as cancel:
+            self.assertEqual(self._request("/api/match/cancel", method="POST", body={"id": "e"})[0], 200)
+            cancel.assert_called_once_with("e")
+        with patch.object(service, "is_busy", return_value=True):
+            for path in ("/api/install", "/api/remove"):
+                self.assertIn("experiment", self._request(path, method="POST", body={})[1]["error"])
+        with patch.object(service, "promote_experiment", return_value={"project": "AI", "profile": "winner"}) as promote:
+            self.assertEqual(self._request("/api/experiment/promote", method="POST",
+                                           body={"id": "e", "candidate_id": "v1", "name": "Winner"})[0], 200)
+            promote.assert_called_once_with("e", "v1", "Winner")
+
     def test_match_start_requires_a_boolean_replay_flag(self):
         payload = {"bar_root": "bar", "engine": "engine", "game": "Game", "map_name": "Map",
                    "players": [], "minutes": 1, "skip_smoke": True}
@@ -252,6 +286,18 @@ class StudioServerTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             schedule_shutdown.assert_called_once()
+
+    def test_browser_idle_shutdown_waits_for_unattended_work(self):
+        with (
+            patch.object(self.server.match_service, "is_busy", side_effect=[True, False]),
+            patch.object(self.server, "_schedule_shutdown_locked") as retry,
+            patch.object(self.server, "shutdown") as shutdown,
+        ):
+            self.server._shutdown_if_idle()
+            retry.assert_called_once()
+            shutdown.assert_not_called()
+            self.server._shutdown_if_idle()
+            shutdown.assert_called_once()
 
     def test_expired_page_heartbeat_schedules_server_shutdown(self):
         with (

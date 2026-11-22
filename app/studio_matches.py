@@ -19,13 +19,15 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import asdict
+from contextlib import nullcontext
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from shutil import copyfileobj
 from typing import Callable
 
-from . import discovery, headless, installation, project_history, settings
+from . import discovery, headless, installation, project_history, settings, studio_experiments
 from .unit_catalog import valid_catalog
 
 
@@ -62,6 +64,7 @@ class MatchService:
         )
         self.local_data = self.root / "data" / "studio-matches"
         self._lock = threading.Lock()
+        self._experiment_changed = threading.Condition(self._lock)
         self._history_lock = threading.Lock()
         self._stop = threading.Event()
         self._game_stop: threading.Event | None = None
@@ -77,8 +80,13 @@ class MatchService:
             "id": None, "operation": None, "state": "idle", "phase": None,
             "message": "", "progress": [], "result": None, "error": None,
             "logs": {}, "elapsed_seconds": None, "cancel_requested": False,
-            "phase_elapsed_seconds": None, "engine": None, "series": None,
+            "phase_elapsed_seconds": None, "engine": None, "series": None, "experiment": None,
         }
+
+    def is_busy(self, operation: str | None = None) -> bool:
+        with self._lock:
+            return (self._state["state"] in ("running", "cancelling")
+                    and (operation is None or self._state["operation"] == operation))
 
     def status(self) -> dict:
         """Return an independent snapshot of the current or most recent operation."""
@@ -87,10 +95,12 @@ class MatchService:
             started = snapshot.pop("_started", None)
             if started is not None:
                 snapshot["elapsed_seconds"] = max(0.0, time.monotonic() - started)
+                if snapshot["experiment"] and snapshot["experiment"]["state"] == "running":
+                    snapshot["experiment"]["elapsed_seconds"] = round(snapshot["elapsed_seconds"], 2)
             phase_started = snapshot.pop("_phase_started", None)
             if phase_started is not None:
                 snapshot["phase_elapsed_seconds"] = max(0.0, time.monotonic() - phase_started)
-            if snapshot["operation"] == "match" and snapshot["state"] in ("running", "cancelling"):
+            if snapshot["operation"] in ("match", "experiment") and snapshot["state"] in ("running", "cancelling"):
                 if snapshot["phase"] in ("smoke", "match"):
                     if self._process is None:
                         snapshot["engine"] = {"state": "starting", "exit_code": None}
@@ -106,6 +116,9 @@ class MatchService:
         with self._lock:
             if self._state["state"] not in ("running", "cancelling"):
                 raise headless.MatchError("No scan or match is running.")
+            experiment = self._state["experiment"]
+            if experiment is not None and experiment["state"] != "running":
+                raise headless.MatchError("The experiment has already finished.")
             if expected_id is not None and self._state["id"] != expected_id:
                 raise headless.MatchError("The requested operation is no longer running.")
             self._state["state"] = "cancelling"
@@ -114,6 +127,7 @@ class MatchService:
             self._stop.set()
             if self._game_stop is not None:
                 self._game_stop.set()
+            self._experiment_changed.notify_all()
         return self.status()
 
     def _launch(self, operation: str, work: Callable[[], tuple[dict, dict, str]]) -> dict:
@@ -758,6 +772,13 @@ class MatchService:
                 state = "failed"
             else:
                 state = "completed"
+        if payload.get("experiment_id") and isinstance(outcome, str):
+            if outcome == "cancelled":
+                state = "cancelled"
+            elif outcome == "failed" or (outcome == "timeout" and not payload.get("simulated_limit")):
+                state = "failed"
+            elif outcome in {"side1", "side2", "draw", "timeout"}:
+                state = "completed"
         return {
             "id": directory.name,
             "kind": "match",
@@ -775,6 +796,7 @@ class MatchService:
             "run_dir": directory.name,
             "players": players,
             "projects": projects,
+            "sweep_source": payload.get("sweep_source"),
             "series": None,
         }
 
@@ -813,6 +835,8 @@ class MatchService:
         for entry in entries:
             entry_players = [p for p in entry.get("players", []) if isinstance(p, dict)]
             entry_projects = [p for p in entry.get("projects", []) if isinstance(p, dict)]
+            source = entry.get("sweep_source")
+            source = source if isinstance(source, dict) else {}
             entry_maps = [m for m in entry.get("maps", []) if isinstance(m, str) and m]
             if not entry_maps and isinstance(entry.get("map"), str) and entry["map"]:
                 entry_maps = [entry["map"]]
@@ -821,11 +845,13 @@ class MatchService:
                 if not (
                     any(str(p.get("short_name", "")).casefold() == target for p in entry_players)
                     or any(str(p.get("project", "")).casefold() == target for p in entry_projects)
+                    or str(source.get("project", "")).casefold() == target
                 ):
                     continue
             if profile:
                 target = profile.casefold()
-                if not any(str(p.get("profile", "")).casefold() == target for p in entry_players):
+                if (str(source.get("profile", "")).casefold() != target
+                        and not any(str(p.get("profile", "")).casefold() == target for p in entry_players)):
                     continue
             if map_name:
                 target = map_name.casefold()
@@ -938,6 +964,321 @@ class MatchService:
             cancelled = self._state["cancel_requested"]
             events = list(self._state["progress"])
         return summary, path, timed_out.is_set(), cancelled, events
+
+    def _experiment_workspace(self, experiment_id: str) -> Path:
+        if not isinstance(experiment_id, str) or not re.fullmatch(r"[0-9a-f]{32}", experiment_id):
+            raise headless.MatchError("Invalid experiment ID.")
+        workspace = self.local_data / "experiments" / experiment_id
+        installation._check_links(self.root, workspace)
+        return workspace
+
+    def _save_experiment(self, workspace: Path, experiment: dict, promotion: dict | None) -> None:
+        with self._history_lock:
+            path = workspace / "experiment.json"
+            installation._check_links(self.root, path)
+            descriptor, filename = tempfile.mkstemp(prefix=".experiment-", dir=workspace)
+            temporary = Path(filename)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump({"experiment": experiment, "promotion": promotion}, stream, ensure_ascii=False)
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def _read_experiment(self, experiment_id: str) -> dict | None:
+        self._experiment_workspace(experiment_id)
+        try:
+            with headless.open_artifact(
+                self.root, "data", "studio-matches", "experiments", experiment_id, "experiment.json",
+            ) as stream:
+                raw = stream.read(_RESULT_METADATA_BYTES + 1)
+            saved = json.loads(raw) if len(raw) <= _RESULT_METADATA_BYTES else None
+        except (OSError, ValueError, RecursionError, headless.MatchError):
+            return None
+        if (isinstance(saved, dict) and isinstance(saved.get("experiment"), dict)
+                and saved["experiment"].get("id") == experiment_id):
+            return saved
+        return None
+
+    def experiment_history(self) -> list[dict]:
+        directory = self.local_data / "experiments"
+        installation._check_links(self.root, directory)
+        if not directory.is_dir():
+            return []
+        with self._lock:
+            active = self._state["id"] if self._state["state"] in ("running", "cancelling") else None
+        entries = []
+        with self._history_lock:
+            for workspace in directory.iterdir():
+                if not re.fullmatch(r"[0-9a-f]{32}", workspace.name) or installation._link(workspace):
+                    continue
+                saved = self._read_experiment(workspace.name)
+                if saved is None:
+                    continue
+                entry = saved["experiment"]
+                if entry.get("state") == "running" and workspace.name != active:
+                    entry.update(state="interrupted", stop_reason="interrupted", paused=False, pause_requested=False,
+                                 promotable=False, best_candidate_id=None)
+                entries.append(entry)
+        return sorted(entries, key=lambda entry: str(entry.get("started_at", "")), reverse=True)[:100]
+
+    def pause_experiment(self, paused: bool, expected_id: str | None = None) -> dict:
+        if type(paused) is not bool:
+            raise headless.MatchError("paused must be a boolean.")
+        with self._experiment_changed:
+            experiment = self._state["experiment"]
+            if self._state["state"] != "running" or experiment is None or experiment["state"] != "running":
+                raise headless.MatchError("No experiment is running.")
+            if expected_id is not None and self._state["id"] != expected_id:
+                raise headless.MatchError("The requested experiment is no longer running.")
+            experiment["pause_requested"] = paused
+            self._experiment_changed.notify_all()
+        return self.status()
+
+    def _await_experiment_slot(self, deadline: float) -> str | None:
+        with self._experiment_changed:
+            experiment = self._state["experiment"]
+            while not self._stop.is_set() and experiment["pause_requested"]:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                experiment["paused"] = True
+                self._change_phase("paused")
+                self._state["message"] = "Experiment paused."
+                self._experiment_changed.wait(remaining)
+            experiment["paused"] = False
+            if self._stop.is_set():
+                return "cancelled"
+            return "time_limit" if time.monotonic() >= deadline else None
+
+    def start_experiment(
+        self, bar_root: str | Path, engine: str, game: str, maps: list[str], minutes: int,
+        game_limit: int, seconds_limit: int, mode: str, players: list[dict], sweep: dict | None = None,
+    ) -> dict:
+        if mode not in ("tournament", "sweep"):
+            raise headless.MatchError("Choose tournament or sweep mode.")
+        if type(game_limit) is not int or not 1 <= game_limit <= 100:
+            raise headless.MatchError("The game count budget must be an integer from 1 to 100.")
+        if type(seconds_limit) is not int or not 1 <= seconds_limit <= _MAX_MATCH_SECONDS:
+            raise headless.MatchError(f"The real-time budget must be an integer from 1 to {_MAX_MATCH_SECONDS} seconds.")
+        if type(minutes) is not int or not 0 < minutes <= 2147483647 // 1800:
+            raise headless.MatchError("Choose a valid positive game-time limit.")
+        if (not isinstance(maps, list) or not 1 <= len(maps) <= 32
+                or any(not isinstance(name, str) or not name for name in maps) or len(set(maps)) != len(maps)):
+            raise headless.MatchError("Choose 1 to 32 distinct maps.")
+        if not isinstance(players, list) or not 2 <= len(players) <= 16:
+            raise headless.MatchError("Choose 2 to 16 AI variants.")
+        if mode == "sweep" and (len(players) != 2 or not isinstance(sweep, dict)):
+            raise headless.MatchError("Provide a source profile and opponent for the sweep.")
+        maps, players, sweep = list(maps), copy.deepcopy(players), copy.deepcopy(sweep)
+
+        def work() -> tuple[dict, dict, str]:
+            with self._lock:
+                experiment_id = self._state["id"]
+                started = self._state["_started"]
+            deadline = started + seconds_limit
+            stamp = lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            experiment = {
+                "id": experiment_id, "mode": mode, "state": "running", "started_at": stamp(), "completed_at": None,
+                "maps": maps, "minutes": minutes, "game": game, "engine": engine,
+                "game_limit": game_limit, "seconds_limit": seconds_limit, "scheduled_games": 0,
+                "completed_games": 0, "elapsed_seconds": 0.0, "paused": False, "pause_requested": False,
+                "stop_reason": None, "rankings": [], "games": [], "promotable": False, "best_candidate_id": None,
+            }
+            with self._lock:
+                self._state["experiment"] = copy.deepcopy(experiment)
+            workspace = self._experiment_workspace(experiment_id)
+            workspace.mkdir(parents=True)
+            promotion = None
+            self._save_experiment(workspace, experiment, promotion)
+            last_logs: dict = {}
+            reason = None
+            error_message = ""
+            try:
+                selected, engine_dir = self._selected(bar_root, engine)
+                missing = discovery.engine_readiness(selected, engine)
+                if missing:
+                    raise headless.MatchError("Engine is not ready: " + "; ".join(missing))
+                with self._lock:
+                    content = self._content if self._scan_key == (selected.root, engine) else None
+                if content is None:
+                    content = self.cached_content(selected.root, engine)
+                if content is None:
+                    raise headless.MatchError("Scan installed content for the selected engine first.")
+                if not isinstance(game, str) or game not in content["games"]:
+                    raise headless.MatchError("Select an installed game.")
+                if not set(maps) <= {item["name"] for item in content["maps"]}:
+                    raise headless.MatchError("Choose maps from the installed content scan.")
+                if mode == "sweep":
+                    source = players[0]
+                    project, profile = sweep.get("project"), sweep.get("profile")
+                    if (not isinstance(source, dict)
+                            or not all(isinstance(key, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", key)
+                                       for key in (project, profile))
+                            or (source.get("short_name"), source.get("profile")) != (project, profile)
+                            or source.get("faction") not in _VALID_FACTIONS
+                            or type(source.get("ally")) is not int or source["ally"] not in (0, 1)):
+                        raise headless.MatchError("Choose the saved AI project, profile, and faction to sweep.")
+                    opponent = self._validate_players(players[1:], content, require_both_sides=False)[0]
+                    selected_players = [headless.Player(project, installation.VERSION, profile,
+                                                       source["faction"], source["ally"], project), opponent]
+                else:
+                    selected_players = self._validate_players(players, content, require_both_sides=False)
+                    if len({(p.short_name, p.version, p.profile, p.faction)
+                            for p in selected_players}) != len(selected_players):
+                        raise headless.MatchError("Each tournament AI profile and faction combination must be distinct.")
+                self._prepare_storage(engine_dir, selected.data)
+                snapshots = self._capture_project_snapshots(selected_players, selected.data, engine)
+                experiment["projects"] = snapshots
+                preparation = nullcontext()
+                if mode == "sweep":
+                    from . import studio_sweeps
+                    preparation = studio_sweeps.prepare(
+                        self.projects_root, workspace / "sweep", sweep, selected_players[0], engine_dir,
+                        should_stop=lambda: self._stop.is_set() or time.monotonic() >= deadline,
+                    )
+                with preparation as prepared:
+                    if prepared:
+                        engine_dir = prepared.engine_dir
+                        promotion = prepared.promotion
+                        experiment["sweep"] = {
+                            **{key: sweep[key] for key in ("project", "profile", "path", "line", "column", "values")},
+                            "source_digest": promotion["source_digest"], "ai_sha256": promotion["ai_sha256"],
+                        }
+                        candidates = [studio_experiments.Candidate(item.id, item.label, item.player, True)
+                                      for item in prepared.variants]
+                        opponent = selected_players[1]
+                        label = f"{opponent.name} · {opponent.profile or 'Default'} · {opponent.faction}"
+                        candidates.append(studio_experiments.Candidate("baseline", label, opponent))
+                    else:
+                        candidates = [
+                            studio_experiments.Candidate(
+                                f"v{index}", f"{player.name} · {player.profile or 'Default'} · {player.faction}", player,
+                            )
+                            for index, player in enumerate(selected_players, 1)
+                        ]
+                    total_games = (len(candidates) * (len(candidates) - 1) if mode == "tournament"
+                                   else 2 * (len(candidates) - 1)) * len(maps)
+                    experiment["scheduled_games"] = min(total_games, game_limit)
+                    experiment["rankings"] = studio_experiments.rankings(candidates, [])
+                    with self._lock:
+                        for key in ("scheduled_games", "rankings"):
+                            self._state["experiment"][key] = copy.deepcopy(experiment[key])
+                    self._save_experiment(workspace, experiment, promotion)
+                    schedule = studio_experiments.matrix(candidates, maps, mode)
+                    for index, (map_name, first, second) in enumerate(islice(schedule, game_limit), 1):
+                        reason = self._await_experiment_slot(deadline)
+                        if reason:
+                            break
+                        game_started = time.monotonic()
+                        if game_started >= deadline:
+                            reason = "time_limit"
+                            break
+                        match_players = [replace(first.player, ally=0), replace(second.player, ally=1)]
+                        with self._lock:
+                            self._state["progress"] = []
+                            self._state["logs"] = {}
+                        summary = ""
+                        run = None
+                        try:
+                            summary, run, timed_out, cancelled, events = self._run_game(
+                                engine_dir, selected.data, map_name, game, match_players, minutes,
+                                skip_smoke=False, real_time_deadline=deadline,
+                                label=f"[Game {index}/{experiment['scheduled_games']} · {map_name}] ",
+                            )
+                            outcome, _ = self._classify_game_outcome(summary, run, timed_out, cancelled, False, events)
+                        except (headless.MatchError, OSError) as error:
+                            summary = str(error)
+                            outcome = ("cancelled" if self._stop.is_set() else "timeout"
+                                       if "real-time deadline" in summary else "failed")
+                        if outcome == "completed":
+                            outcome = "failed"
+                        simulated_limit = outcome == "timeout" and "Time limit reached (" in summary
+                        run_id = None
+                        metadata = {}
+                        if run is not None:
+                            last_logs, _ = self._run_artifacts(run, events)
+                            run_id = last_logs.get("run_id")
+                            if run_id:
+                                metadata = self._artifact_metadata(run_id)
+                            history = {
+                                "experiment_id": experiment_id, "experiment_game_index": index,
+                                "game": game, "map": map_name, "engine": engine,
+                                "players": [asdict(player) for player in match_players], "projects": snapshots,
+                                "outcome": outcome, "simulated_limit": simulated_limit,
+                                "elapsed_seconds": round(time.monotonic() - game_started, 2),
+                            }
+                            if prepared:
+                                history["sweep_source"] = {"project": sweep["project"], "profile": sweep["profile"]}
+                            self._enrich_result_json(run, history)
+                        metrics = studio_experiments.telemetry_metrics(metadata)
+                        if outcome == "failed" and "smoke_passed" not in metadata:
+                            metrics["engine_error"] = True
+                        experiment["games"].append({
+                            "index": index, "map": map_name, "side1": first.id, "side2": second.id,
+                            "outcome": outcome, "run_id": run_id, "summary": summary[:4000],
+                            "simulated_limit": simulated_limit,
+                            "elapsed_seconds": round(time.monotonic() - game_started, 2), **metrics,
+                        })
+                        experiment["completed_games"] += int(outcome != "cancelled")
+                        experiment["rankings"] = studio_experiments.rankings(candidates, experiment["games"])
+                        experiment["elapsed_seconds"] = round(time.monotonic() - started, 2)
+                        self._save_experiment(workspace, experiment, promotion)
+                        with self._lock:
+                            for key in ("scheduled_games", "games", "rankings", "completed_games", "elapsed_seconds"):
+                                self._state["experiment"][key] = copy.deepcopy(experiment[key])
+                        if outcome == "cancelled":
+                            reason = "cancelled"
+                            break
+                    if reason is None:
+                        reason = ("time_limit" if time.monotonic() >= deadline else
+                                  "game_limit" if game_limit < total_games else "completed")
+                    if all(item["outcome"] == "failed" for item in experiment["games"]) and experiment["games"]:
+                        reason = "failed"
+                        error_message = experiment["games"][-1]["summary"].splitlines()[0]
+            except (headless.MatchError, ValueError, OSError, discovery.DiscoveryError,
+                    installation.InstallationError, settings.SettingsError) as error:
+                reason = ("cancelled" if self._stop.is_set() else "time_limit" if time.monotonic() >= deadline else "failed")
+                error_message = str(error)
+            with self._lock:
+                if self._stop.is_set():
+                    reason = "cancelled"
+                outcome = reason if reason in ("cancelled", "failed") else "completed"
+                if outcome != "completed":
+                    for row in experiment["rankings"]:
+                        row["promotable"] = False
+                winner = max((row for row in experiment["rankings"] if row["promotable"]),
+                             key=lambda row: row["paired_win_rate"], default=None)
+                best = winner["id"] if winner else None
+                experiment.update(state=outcome, stop_reason=reason, completed_at=stamp(),
+                                  elapsed_seconds=round(time.monotonic() - started, 2), paused=False,
+                                  pause_requested=False, best_candidate_id=best, promotable=best is not None)
+                self._save_experiment(workspace, experiment, promotion)
+                self._state["experiment"] = copy.deepcopy(experiment)
+            summary = {
+                "failed": error_message or "Experiment failed.", "cancelled": "Experiment cancelled.",
+                "time_limit": "Experiment reached its real-time budget.",
+                "game_limit": "Experiment reached its game-count budget.", "completed": "Experiment complete.",
+            }[reason]
+            return {"summary": summary, "experiment": experiment}, last_logs, outcome
+
+        return self._launch("experiment", work)
+
+    def promote_experiment(self, experiment_id: str, candidate_id: str, name: str) -> dict:
+        from . import studio_sweeps
+        workspace = self._experiment_workspace(experiment_id)
+        with self._history_lock:
+            saved = self._read_experiment(experiment_id)
+            if saved is None or not isinstance(saved.get("promotion"), dict):
+                raise headless.MatchError("The experiment has no saved variant to promote.")
+            experiment = saved["experiment"]
+            if experiment.get("state") != "completed" or not any(
+                row.get("id") == candidate_id and row.get("promotable") is True
+                for row in experiment.get("rankings", [])
+            ):
+                raise headless.MatchError("Choose an evaluated variant from a completed experiment.")
+            profile = studio_sweeps.promote(self.projects_root, workspace / "sweep", saved["promotion"], candidate_id, name)
+            return {"project": profile.parent.parent.name, "profile": profile.name}
 
     def start(
         self, bar_root: str | Path, engine: str, game: str, map_name: str,

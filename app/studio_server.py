@@ -103,6 +103,9 @@ class StudioServer(ThreadingHTTPServer):
             if self._clients:
                 self._schedule_client_expiry_locked()
                 return
+            if self.match_service.is_busy():
+                self._schedule_shutdown_locked()
+                return
         self.shutdown()
 
     def _expire_stale_clients_locked(self, now: float) -> None:
@@ -191,6 +194,11 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                         raise ValueError("Invalid log byte offset.")
                     result = self.server.match_service.read_log(query["run_id"][0], query["file"][0], int(offset))
                     return self._json(200, result)
+                except Exception as error:
+                    return self._handle_error(error)
+            if parsed.path == "/api/experiment/history" and not parsed.query:
+                try:
+                    return self._json(200, {"experiments": self.server.match_service.experiment_history()})
                 except Exception as error:
                     return self._handle_error(error)
             if parsed.path == "/api/match/history":
@@ -334,6 +342,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
             "/api/match/start", "/api/match/cancel", "/api/match/replay/copy",
+            "/api/experiment/start", "/api/experiment/pause", "/api/experiment/promote",
         }:
             return self._error(404, "Unknown API endpoint.")
         try:
@@ -412,12 +421,12 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, self._create_project(payload))
             if parsed.path == "/api/inspect":
                 return self._json(200, self._inspect(payload))
-            if parsed.path == "/api/install":
+            if parsed.path in {"/api/install", "/api/remove"}:
                 with self.server.write_lock:
-                    return self._json(200, self._install(payload))
-            if parsed.path == "/api/remove":
-                with self.server.write_lock:
-                    return self._json(200, self._remove(payload))
+                    if self.server.match_service.is_busy("experiment"):
+                        raise MatchError("Wait for the experiment to finish before changing installed AIs.")
+                    change = self._install if parsed.path == "/api/install" else self._remove
+                    return self._json(200, change(payload))
             if parsed.path == "/api/match/cache":
                 self._require_fields(payload, ("bar_root", "engine"))
                 return self._json(200, {"content": self.server.match_service.cached_content(
@@ -466,8 +475,28 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     self._string(payload["run_id"], "run_id"), self._string(payload["path"], "path"),
                     selected.bar_root, selected.engine,
                 ))
+            if parsed.path == "/api/experiment/start":
+                fields = ("bar_root", "engine", "game", "maps", "minutes", "game_limit", "seconds_limit", "mode", "players")
+                self._require_fields(payload, fields)
+                with self.server.write_lock:
+                    return self._json(200, self.server.match_service.start_experiment(
+                        *(payload[field] for field in fields), sweep=payload.get("sweep"),
+                    ))
+            if parsed.path == "/api/experiment/pause":
+                self._require_fields(payload, ("id", "paused"))
+                return self._json(200, self.server.match_service.pause_experiment(
+                    payload["paused"], self._string(payload["id"], "id"),
+                ))
+            if parsed.path == "/api/experiment/promote":
+                self._require_fields(payload, ("id", "candidate_id", "name"))
+                with self.server.write_lock:
+                    return self._json(200, self.server.match_service.promote_experiment(
+                        self._string(payload["id"], "id"), self._string(payload["candidate_id"], "candidate_id"),
+                        self._string(payload["name"], "name"),
+                    ))
             if parsed.path == "/api/match/cancel":
-                return self._json(200, self.server.match_service.cancel())
+                expected = self._string(payload["id"], "id") if "id" in payload else None
+                return self._json(200, self.server.match_service.cancel(expected))
             with self.server.write_lock:
                 return self._json(200, self._save_settings(payload))
         except Exception as error:

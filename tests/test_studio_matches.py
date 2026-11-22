@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from app.discovery import Installation
 from app.headless import MatchError, MatchProgress, Player
 from app.settings import SettingsError
+from app.studio_experiments import Candidate, rankings
 from app.studio_matches import MatchService, _operation_lock
 from app.unit_catalog import _RANDOM_SCRIPT, scan, valid_catalog
 
@@ -737,6 +738,228 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertTrue(dirty_entry["projects"][0]["uncheckpointed_changes"])
         self.assertTrue(dirty_entry["projects"][0]["install_drift"])
         self.assertFalse(dirty_entry["projects"][0]["clean"])
+
+    def test_experiment_round_robin_budget_and_persisted_rankings(self):
+        self.scan()
+        opponents = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Legion", "ally": 1},
+        ]
+        calls = []
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            calls.append((map_name, players[0].faction, players[1].faction))
+            if len(calls) == 2:
+                raise MatchError("Engine crashed")
+            path = local / "matches" / f"match-experiment-{len(calls)}"
+            path.mkdir(parents=True)
+            (path / "result.json").write_text(json.dumps({
+                "winning_sides": [0], "engine_exit": 0,
+                "telemetry": {"end_frame": 3600, "ai_script_errors": 1,
+                              "teams": [{"side": 1, "ai_script_errors": 0}, {"side": 2, "ai_script_errors": 1}]},
+            }), encoding="utf-8")
+            return "Winner: side 1.", path
+
+        with patch("app.studio_matches.headless.run_match", side_effect=run):
+            self.service.start_experiment(
+                self.bar_root, self.engine, "Game", ["Map", "Map2"], 30, 4, 60, "tournament", opponents,
+            )
+            status = self.wait()
+        self.assertEqual(status["state"], "completed")
+        entry = status["result"]["experiment"]
+        self.assertEqual(entry["stop_reason"], "game_limit")
+        self.assertEqual(entry["completed_games"], 4)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(len({frozenset(call[1:]) for call in calls[:3]}), 3)
+        self.assertEqual({call[0] for call in calls}, {"Map", "Map2"})
+        self.assertEqual(entry["games"][1]["outcome"], "failed")
+        first = entry["rankings"][0]
+        self.assertGreater(first["wins"], 0)
+        self.assertEqual(first["average_duration_seconds"], 120.0)
+        self.assertEqual(first["error_free_games"], first["wins"])
+        restarted = MatchService(self.root, projects_root=self.projects)
+        self.assertEqual(restarted.experiment_history()[0], entry)
+
+    def test_experiment_pauses_after_active_game_and_cancels_while_paused(self):
+        self.scan()
+        players = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+        ]
+        entered, finish = threading.Event(), threading.Event()
+
+        def run(*args, **kwargs):
+            entered.set()
+            self.assertTrue(finish.wait(2))
+            return "Draw.", self.root / "match"
+
+        with patch("app.studio_matches.headless.run_match", side_effect=run) as launch:
+            job = self.service.start_experiment(
+                self.bar_root, self.engine, "Game", ["Map"], 30, 2, 60, "tournament", players,
+            )
+            self.assertTrue(entered.wait(2))
+            self.service.pause_experiment(True)
+            finish.set()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not self.service.status()["experiment"]["paused"]:
+                time.sleep(0.01)
+            self.assertTrue(self.service.status()["experiment"]["paused"])
+            self.service.cancel(job["id"])
+            status = self.wait()
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(status["state"], "cancelled")
+        self.assertEqual(status["result"]["experiment"]["stop_reason"], "cancelled")
+
+    def test_experiment_deadline_stops_active_game_without_launching_another(self):
+        self.scan()
+        players = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+        ]
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            if stop.wait(2):
+                raise MatchError("Stopped by experiment")
+            self.fail("The cumulative real-time deadline did not stop the active game")
+
+        with patch("app.studio_matches.headless.run_match", side_effect=run) as launch:
+            self.service.start_experiment(
+                self.bar_root, self.engine, "Game", ["Map"], 30, 2, 1, "tournament", players,
+            )
+            status = self.wait()
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(status["result"]["experiment"]["stop_reason"], "time_limit")
+        self.assertEqual(status["result"]["experiment"]["games"][0]["outcome"], "timeout")
+        self.assertFalse(status["result"]["experiment"]["games"][0]["simulated_limit"])
+        self.assertEqual(status["result"]["experiment"]["rankings"][0]["error_free_games"], 0)
+
+    def test_experiment_simulated_time_limit_counts_as_error_free_without_a_winner(self):
+        self.scan()
+        players = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+        ]
+        run = self.service.local_data / "matches" / "match-capped"
+        run.mkdir(parents=True)
+        (run / "result.json").write_text('{"engine_exit":0,"telemetry":{"end_frame":1800}}', encoding="utf-8")
+        with patch("app.studio_matches.headless.run_match", return_value=("Time limit reached (1 game minutes).", run)):
+            self.service.start_experiment(
+                self.bar_root, self.engine, "Game", ["Map"], 1, 1, 60, "tournament", players,
+            )
+            experiment = self.wait()["experiment"]
+        self.assertTrue(experiment["games"][0]["simulated_limit"])
+        for rank in experiment["rankings"]:
+            self.assertEqual(rank["error_free_games"], 1)
+            self.assertEqual(rank["average_duration_seconds"], 60)
+            self.assertIsNone(rank["win_rate"])
+
+    def test_experiment_cancel_sets_active_game_stop_signal(self):
+        self.scan()
+        players = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+        ]
+        entered, stopped = threading.Event(), threading.Event()
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            entered.set()
+            self.assertTrue(stop.wait(2))
+            stopped.set()
+            return "Stopped by user.", self.root / "match"
+
+        with patch("app.studio_matches.headless.run_match", side_effect=run) as launch:
+            job = self.service.start_experiment(
+                self.bar_root, self.engine, "Game", ["Map"], 30, 2, 60, "tournament", players,
+            )
+            self.assertTrue(entered.wait(2))
+            self.service.cancel(job["id"])
+            self.assertEqual(self.wait()["state"], "cancelled")
+        self.assertTrue(stopped.is_set())
+        self.assertEqual(launch.call_count, 1)
+
+    def test_experiment_sweep_uses_an_isolated_runtime_and_promotes_saved_candidate(self):
+        self.scan()
+        profile = self.projects / "UninstalledAI" / "profiles" / "custom"
+        (profile / "config").mkdir(parents=True)
+        (profile / "script").mkdir()
+        (profile / "profile.json").write_text('{"name":"Hard"}', encoding="utf-8")
+        for name in ("init.as", "main.as"):
+            (profile / "script" / name).write_text("void Entry() {}", encoding="utf-8")
+        config = profile / "config" / "settings.json"
+        config.write_text('{"weight": 1}', encoding="utf-8")
+        live_engine = self.data / "engine" / self.engine
+        (live_engine / "spring-headless.exe").write_bytes(b"engine")
+        players = [
+            {"short_name": "UninstalledAI", "version": "1", "profile": "custom", "faction": "Armada", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+        ]
+        sweep = {"project": "UninstalledAI", "profile": "custom", "path": "config/settings.json",
+                 "line": 1, "column": 12, "values": [2, 3]}
+        choices = []
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            self.assertNotEqual(engine, live_engine)
+            self.assertEqual(data, self.data)
+            self.assertEqual(map_name, "Map")
+            candidate = next(player for player in players if player.short_name.startswith("StudioSweep"))
+            path = (engine / "AI" / "Skirmish" / candidate.short_name / candidate.version
+                    / "config" / candidate.profile / "settings.json")
+            value = json.loads(path.read_text(encoding="utf-8"))["weight"]
+            choices.append(value)
+            self.assertFalse((live_engine / "AI" / "Skirmish" / candidate.short_name).exists())
+            self.assertEqual(config.read_text(encoding="utf-8"), '{"weight": 1}')
+            winner = candidate.ally if value == 3 else 1 - candidate.ally
+            summary = f"Winner: side {winner + 1}."
+            run_dir = local / "matches" / f"match-sweep-{len(choices)}"
+            run_dir.mkdir(parents=True)
+            (run_dir / "result.json").write_text(json.dumps({
+                "winning_sides": [winner], "result": summary, "engine_exit": 0,
+            }), encoding="utf-8")
+            return summary, run_dir
+
+        with patch("app.studio_matches.headless.run_match", side_effect=run):
+            job = self.service.start_experiment(
+                self.bar_root, self.engine, "Game", ["Map", "Map2"], 30, 4, 60, "sweep", players, sweep,
+            )
+            status = self.wait()
+        self.assertEqual(status["state"], "completed", status)
+        self.assertEqual(choices, [2, 2, 3, 3])
+        self.assertEqual(status["experiment"]["best_candidate_id"], "v2")
+        config.write_text('{"weight": 99}', encoding="utf-8")
+        restarted = MatchService(self.root, projects_root=self.projects)
+        self.assertEqual(len(restarted.history(project="UninstalledAI", profile="custom")), 4)
+        won = restarted.promote_experiment(job["id"], "v2", "Winner")
+        self.assertEqual(won, {"project": "UninstalledAI", "profile": "winner"})
+        promoted = profile.parent / won["profile"] / "config" / "settings.json"
+        self.assertEqual(json.loads(promoted.read_text(encoding="utf-8")), {"weight": 3})
+        self.assertEqual(json.loads(config.read_text(encoding="utf-8")), {"weight": 99})
+        with self.assertRaises(MatchError):
+            restarted.promote_experiment(job["id"], "baseline", "Ignore")
+        with self.assertRaises(MatchError):
+            restarted.promote_experiment(job["id"], "v1", "Losing variant")
+
+    def test_sweep_promotion_requires_a_win_on_a_fully_paired_map(self):
+        player = Player("AI", "1", "hard", "Armada", 0, "AI")
+        candidates = [Candidate("variant", "Variant", player, True), Candidate("base", "Base", player)]
+
+        def game(map_name, first, second, outcome):
+            return {"map": map_name, "side1": first, "side2": second, "outcome": outcome,
+                    "simulated_seconds": 60, "script_errors_by_side": {"side1": 0, "side2": 0},
+                    "unassigned_script_errors": 0, "engine_error": False, "simulated_limit": False}
+
+        played = [
+            game("Map", "variant", "base", "side2"),
+            game("Map", "base", "variant", "side1"),
+            game("Map2", "variant", "base", "side1"),
+        ]
+        before = next(row for row in rankings(candidates, played) if row["id"] == "variant")
+        self.assertEqual(before["wins"], 1)
+        self.assertFalse(before["promotable"])
+        played.append(game("Map2", "base", "variant", "side2"))
+        after = next(row for row in rankings(candidates, played) if row["id"] == "variant")
+        self.assertTrue(after["promotable"])
+        self.assertEqual(after["paired_win_rate"], 0.5)
 
     def test_sync_installed_ai_updates_cached_profiles_without_rescan(self):
         self.scan()

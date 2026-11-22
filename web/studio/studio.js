@@ -7,6 +7,7 @@ const state = {
     projects: [], project: "", profile: "", files: [], page: "overview",
     layer: {}, factory: "", situation: "land", response: "", file: "",
     settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), icons: {available: false, message: "", cache: new Map()}, saving: false, history: [], installStatus: null,
+    experiments: {history: [], selected: "", error: ""},
     match: {
         content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "",
         first: "", second: "", faction1: "Armada", faction2: "Cortex",
@@ -26,7 +27,8 @@ const pages = {
     units: ["Unit behavior", "Explore roles, attributes, and individual unit settings.", "⬡"],
     placement: ["Building placement", "Choose how much room the AI leaves around buildings.", "▧"],
     advanced: ["All files", "Inspect every profile file, including custom scripts.", "⚙"],
-    match: ["Test match", "Run a smoke test and a headless match with installed AIs.", "▶"]
+    match: ["Test match", "Run a smoke test and a headless match with installed AIs.", "▶"],
+    experiments: ["Tournaments & sweeps", "Compare installed AIs or test a range of values in an isolated copy of a profile.", "▥"]
 };
 const groups = {
     production: ["factory.json", "factory_leg.json"],
@@ -1716,6 +1718,9 @@ function renderMatchHistory(container) {
             logs.append(matchLogButton(entry.run_dir));
         }
         const matchup = element("td", "", `${side1} vs ${side2}`);
+        if (entry.sweep_source?.project && entry.sweep_source?.profile) {
+            matchup.append(element("div", "muted", `Sweep source ${entry.sweep_source.project} / ${entry.sweep_source.profile}`));
+        }
         tr.append(
             element("td", "", when),
             element("td", "", kindLabel),
@@ -2100,6 +2105,7 @@ function updateMatchStatus() {
     if (activity) setMatchActivity(activity, m.snapshot, m.statusError);
     setMatchLogActions($("match-log-actions"), m.snapshot);
     renderSeriesScoreboard($("series-scoreboard"), m.snapshot?.series || m.snapshot?.result?.series);
+    updateExperimentStatus();
 }
 let matchPoll = null;
 async function pollMatch() {
@@ -2135,8 +2141,11 @@ async function pollMatch() {
                     }
                 } else if (snapshot.operation === "match") {
                     await loadMatchHistory();
+                } else if (snapshot.operation === "experiment") {
+                    await loadExperimentHistory();
                 }
                 if (state.page === "match") render();
+                if (state.page === "experiments") render();
                 break;
             }
             await new Promise(resolve => setTimeout(resolve, 1500));
@@ -2147,6 +2156,7 @@ function navigate(page) {
     state.page = page;
     render();
     if (page === "match") loadMatchHistory();
+    if (page === "experiments") loadExperimentHistory(true);
 }
 function render() {
     $("breadcrumb").textContent = pages[state.page][0];
@@ -2160,7 +2170,11 @@ function render() {
         manageAIs(target);
         return;
     }
-    if (!state.profile) {
+    if (state.page === "experiments") {
+        experimentView(target);
+        return;
+    }
+    if (!state.profile && state.page !== "match") {
         const empty = element("div", "panel");
         empty.append(element("h2", "", "Create your first AI"),
             element("p", "muted", "Start with a copy of the BARbarIAn hard profile from an installed game. The original game files stay unchanged."),
