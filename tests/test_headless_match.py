@@ -1,9 +1,11 @@
+import json
 import threading
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app import headless
 from app.headless import MatchError, Player, archive_cache_path, run_match
 
 
@@ -22,6 +24,23 @@ class HeadlessMatchTests(unittest.TestCase):
     def run_match(self, **kwargs):
         return run_match(self.engine, self.data, self.local_data, "Map", "Game", self.players, 30,
                          self.stop, self.events.append, **kwargs)
+
+    def test_replay_discovery_skips_linked_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            (outside / "test").mkdir(parents=True)
+            (outside / "mock.sdfz").write_bytes(b"demo")
+            run = root / "match-test"
+            (run / "demos").mkdir(parents=True)
+            (run / "demos" / "empty.sdfz").touch()
+            try:
+                (run / "demos" / "linked.sdfz").symlink_to(outside / "mock.sdfz")
+                (outside / "test" / "demos").symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"Cannot create symlinks: {error}")
+            self.assertEqual(headless.replay_files(run), [])
+            self.assertEqual(headless.replay_files(outside / "test"), [])
 
     @patch("app.headless._run_match")
     @patch("app.headless._run_smoke")

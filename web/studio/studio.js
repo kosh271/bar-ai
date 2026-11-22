@@ -1227,7 +1227,29 @@ function matchView(target) {
     if (m.snapshot?.error) panel.append(notice(m.snapshot.error, true));
     if (m.snapshot?.result && m.snapshot.operation === "match") {
         panel.append(element("pre", "", m.snapshot.result.summary || ""));
-        if (m.snapshot.logs?.directory) panel.append(element("p", "path", "Logs: " + m.snapshot.logs.directory));
+    }
+    if (m.snapshot?.operation === "match") {
+        const logs = m.snapshot.logs || {};
+        if (logs.directory) panel.append(element("p", "path", "Logs: " + logs.directory));
+        for (const replay of logs.replays || []) {
+            const separator = logs.directory.includes("\\") ? "\\" : "/";
+            const path = [logs.directory, ...replay.path.split("/")].join(separator);
+            const replayActions = element("div", "row");
+            replayActions.append(button("Copy replay path", async () => {
+                try { await navigator.clipboard.writeText(path); message("Replay path copied."); }
+                catch (error) { message(errorText(error), true); }
+            }));
+            if (info) replayActions.append(button("Copy to BAR demos", async event => {
+                const action = event.currentTarget;
+                action.disabled = true;
+                try {
+                    const result = await api("/api/match/replay/copy", {run_id: logs.run_id, path: replay.path});
+                    message("Replay copied to " + result.path);
+                } catch (error) { message(errorText(error), true); }
+                finally { action.disabled = false; }
+            }));
+            panel.append(element("p", "path", path), replayActions);
+        }
     }
     if (m.content) {
         const content = m.content;
@@ -1257,7 +1279,11 @@ function matchView(target) {
             minutes.addEventListener("change", () => { m.minutes = Number(minutes.value); }); minuteLabel.append(minutes);
             const skipLabel = element("label", "field", "Skip smoke test"), skip = element("input");
             skip.type = "checkbox"; skip.checked = m.skip; skip.addEventListener("change", () => {m.skip = skip.checked;}); skipLabel.append(skip);
-            settings.append(minuteLabel, skipLabel, button("Start match", async () => {
+            const replay = element("input"), replayLabel = element("label", "field", "Record replay");
+            replay.type = "checkbox"; replay.checked = m.recordDemo === true;
+            replay.addEventListener("change", () => { m.recordDemo = replay.checked; });
+            replayLabel.append(replay);
+            settings.append(minuteLabel, skipLabel, replayLabel, button("Start match", async () => {
                 try {
                     if (dirty().length) throw Error("Save and install profile changes before testing.");
                     if (!Number.isInteger(m.minutes) || m.minutes <= 0) throw Error("Enter a positive whole-number time limit.");
@@ -1267,7 +1293,7 @@ function matchView(target) {
                     };
                     m.snapshot = await api("/api/match/start", {...state.settings, game: m.game, map_name: m.map,
                         players: [player(m.first, m.faction1, 0), player(m.second, m.faction2, 1)],
-                        minutes: m.minutes, skip_smoke: m.skip});
+                        minutes: m.minutes, skip_smoke: m.skip, record_demo: m.recordDemo === true});
                     m.statusError = "";
                     render(); pollMatch();
                 } catch (error) { message(errorText(error), true); }

@@ -102,6 +102,20 @@ class StudioServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
 
+    def test_match_start_requires_a_boolean_replay_flag(self):
+        payload = {"bar_root": "bar", "engine": "engine", "game": "Game", "map_name": "Map",
+                   "players": [], "minutes": 1, "skip_smoke": True}
+        with patch.object(self.server.match_service, "start", return_value={}) as start:
+            self.assertEqual(self._request("/api/match/start", method="POST", body=payload)[0], 200)
+            self.assertIs(start.call_args.kwargs["record_demo"], False)
+            self.assertEqual(self._request("/api/match/start", method="POST",
+                                           body={**payload, "record_demo": True})[0], 200)
+            self.assertIs(start.call_args.kwargs["record_demo"], True)
+            for invalid in (None, "false", 1, []):
+                self.assertEqual(self._request("/api/match/start", method="POST",
+                                               body={**payload, "record_demo": invalid})[0], 400)
+            self.assertEqual(start.call_count, 2)
+
     @unittest.skipUnless(shutil.which("git"), "Git is required for project history")
     def test_checkpoint_diff_endpoint_auth_and_revision_validation(self):
         endpoint = "/api/history/diff"

@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
+from shutil import copyfileobj
 from typing import Callable
 
 from . import discovery, headless, installation, settings
@@ -28,6 +29,10 @@ from .unit_catalog import valid_catalog
 
 _operation_lock = threading.Lock()
 _MAX_MATCH_SECONDS = 6 * 60 * 60
+# The raw-byte and row limits keep even a fully JSON-escaped page below 256 KiB.
+_RESULT_METADATA_BYTES = 8 * 1024 * 1024
+_RUN_ID = re.compile(r"(?:match|smoke)-[a-zA-Z0-9_-]{1,64}")
+_REPLAY_PATH = re.compile(r"demos/([^/\\:\x00-\x1f]+\.sdfz)", re.IGNORECASE)
 
 
 class MatchService:
@@ -219,6 +224,79 @@ class MatchService:
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         return self.local_data / "content-cache" / f"{digest}.json"
 
+    @staticmethod
+    def _run_id(run_id: str) -> str:
+        if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
+            raise headless.MatchError("Invalid match or smoke run ID.")
+        return run_id
+
+    def _artifact_metadata(self, run_id: str) -> dict:
+        try:
+            with headless.open_artifact(self.root, "data", "studio-matches", "matches", run_id, "result.json") as stream:
+                raw = stream.read(_RESULT_METADATA_BYTES + 1)
+            metadata = json.loads(raw) if len(raw) <= _RESULT_METADATA_BYTES else None
+        except (OSError, ValueError, RecursionError, headless.MatchError):
+            return {}
+        return metadata if isinstance(metadata, dict) else {}
+
+    def _run_artifacts(self, path: Path, events: list[dict]) -> tuple[dict, dict | None]:
+        logs = {
+            "directory": str(path), "output": str(path / "stdout.txt"),
+            "infolog": str(path / "infolog.txt"), "result": str(path / "result.json"),
+        }
+        for event in events:
+            if event["phase"] == "smoke":
+                if event.get("run_id") and _RUN_ID.fullmatch(event["run_id"]):
+                    logs["smoke_run_id"] = event["run_id"]
+                for line in event["message"].splitlines():
+                    if line.startswith("Smoke logs: "):
+                        logs["smoke_directory"] = line[len("Smoke logs: "):]
+        run_id = self._relative_run_dir(path)
+        if not run_id or not _RUN_ID.fullmatch(run_id):
+            return logs, None
+        logs["run_id"] = run_id
+        metadata = self._artifact_metadata(run_id)
+        if isinstance(metadata.get("replays"), list):
+            logs["replays"] = metadata["replays"]
+        telemetry = metadata.get("telemetry")
+        return logs, telemetry if isinstance(telemetry, dict) else None
+
+    def copy_replay(self, run_id: str, replay: str, bar_root: str | Path, engine: str) -> dict:
+        run_id = self._run_id(run_id)
+        match = _REPLAY_PATH.fullmatch(replay) if isinstance(replay, str) else None
+        if not run_id.startswith("match-") or match is None:
+            raise headless.MatchError("Invalid match replay path.")
+        replays = self._artifact_metadata(run_id).get("replays")
+        if not isinstance(replays, list) or not any(
+            isinstance(item, dict) and item.get("path") == replay for item in replays
+        ):
+            raise headless.MatchError("The replay is absent from the saved match result.")
+        selected, _ = self._selected(bar_root, engine)
+        directory = selected.data / "demos"
+        name = match[1]
+        target = directory / name
+        with headless.open_artifact(self.root, "data", "studio-matches", "matches", run_id, "demos", name) as source:
+            headless.artifact_stat(selected.root, "data", directory=True)
+            directory.mkdir(exist_ok=True)
+            headless.artifact_stat(selected.root, "data", "demos", directory=True)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(prefix=".studio-demo-", dir=directory, delete=False) as destination:
+                    temporary = Path(destination.name)
+                    copyfileobj(source, destination)
+                headless.artifact_stat(selected.root, "data", "demos", directory=True)
+                # Windows rename and POSIX hard-link publication both refuse an existing target.
+                if os.name == "nt":
+                    temporary.rename(target)
+                else:
+                    os.link(temporary, target)
+            except FileExistsError as error:
+                raise headless.MatchError(f"A demo named {name} already exists in BAR's demos folder.") from error
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        return {"path": str(target)}
+
     def cached_content(self, bar_root: str | Path, engine: str) -> dict | None:
         if not isinstance(bar_root, (str, Path)) or not str(bar_root).strip():
             raise headless.MatchError("BAR root is required.")
@@ -324,15 +402,39 @@ class MatchService:
 
         return self._launch("catalog", work)
 
+    def _matches_dir(self) -> Path:
+        matches_dir = self.local_data / "matches"
+        installation._check_links(self.root, self.local_data)
+        installation._check_links(self.root, matches_dir)
+        return matches_dir
+
+    def _relative_run_dir(self, path: Path | None) -> str | None:
+        if path is None:
+            return None
+        matches_dir = (self.local_data / "matches").resolve()
+        try:
+            candidate = path.resolve()
+            if installation._link(candidate) or not candidate.is_relative_to(matches_dir):
+                return None
+            relative = candidate.relative_to(matches_dir)
+            if not relative.parts:
+                return None
+            installation._check_links(matches_dir, candidate)
+            return relative.as_posix()
+        except (OSError, ValueError, installation.InstallationError):
+            return None
+
     def start(
         self, bar_root: str | Path, engine: str, game: str, map_name: str,
-        players: list[dict], minutes: int, skip_smoke: bool = False,
+        players: list[dict], minutes: int, skip_smoke: bool = False, *, record_demo: bool = False,
     ) -> dict:
         """Start a match from the latest in-memory or saved scan for the selected engine.
 
         Each player is an object with short_name, version, profile, faction and
         ally (0 or 1). The AI display name is taken from the scan, not the client.
         """
+        if type(record_demo) is not bool:
+            raise headless.MatchError("record_demo must be a boolean.")
         players = copy.deepcopy(players)
 
         def work() -> tuple[dict, dict, str]:
@@ -405,6 +507,7 @@ class MatchService:
                 summary, path = headless.run_match(
                     engine_dir, selected.data, self.local_data, map_name, game, match_players,
                     minutes, stop, progress, skip_smoke=skip_smoke, process_started=process_started,
+                    record_demo=record_demo,
                 )
             except Exception as error:
                 if timed_out.is_set():
@@ -412,19 +515,13 @@ class MatchService:
                 raise
             finally:
                 timer.cancel()
-            logs = {
-                "directory": str(path), "output": str(path / "stdout.txt"),
-                "infolog": str(path / "infolog.txt"), "result": str(path / "result.json"),
-            }
             result = {"summary": summary, "path": str(path)}
             with self._lock:
                 cancelled = self._state["cancel_requested"]
                 events = list(self._state["progress"])
-            for event in events:
-                if event["phase"] == "smoke":
-                    for line in event["message"].splitlines():
-                        if line.startswith("Smoke logs: "):
-                            logs["smoke_directory"] = line[len("Smoke logs: "):]
+            logs, telemetry = self._run_artifacts(path, events)
+            if telemetry is not None:
+                result["telemetry"] = telemetry
             if timed_out.is_set():
                 result["summary"] += "\nMatch exceeded its real-time deadline."
                 return result, logs, "failed"

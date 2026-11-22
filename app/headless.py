@@ -8,12 +8,14 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
@@ -47,6 +49,55 @@ class MatchProgress:
     summary: str
     seconds: float | None = None
     message: str = ""
+
+
+def artifact_stat(base: Path, *parts: str, directory: bool = False) -> os.stat_result:
+    """Stat a regular artifact beneath a trusted base without accepting links."""
+    path = base
+    for index, part in enumerate(("", *parts)):
+        if index:
+            if not part or part in {".", ".."} or Path(part).name != part:
+                raise MatchError("Invalid artifact path component.")
+            path /= part
+        metadata = path.lstat()
+        if (stat.S_ISLNK(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise MatchError(f"Linked run or BAR artifact paths are not supported: {path.name}")
+        is_directory = index < len(parts) or directory
+        expected_type = stat.S_ISDIR if is_directory else stat.S_ISREG
+        if not expected_type(metadata.st_mode):
+            raise MatchError(f"Unexpected artifact type: {path.name}")
+    return metadata
+
+
+@contextmanager
+def open_artifact(base: Path, *parts: str):
+    artifact_stat(base, *parts)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(base.joinpath(*parts), flags), "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if not os.path.samestat(opened, artifact_stat(base, *parts)) or opened.st_nlink > 1:
+            raise MatchError("The artifact changed or is linked.")
+        yield stream
+
+
+def replay_files(run: Path) -> list[dict]:
+    replays = []
+    try:
+        artifact_stat(run, "demos", directory=True)
+        for item in sorted((run / "demos").iterdir()):
+            if item.suffix.casefold() != ".sdfz":
+                continue
+            try:
+                with open_artifact(run, "demos", item.name) as source:
+                    size = os.fstat(source.fileno()).st_size
+                if size:
+                    replays.append({"path": f"demos/{item.name}", "size_bytes": size})
+            except (OSError, MatchError):
+                continue
+    except (OSError, MatchError):
+        pass
+    return replays
 
 
 def archive_cache_path(local_data: Path, engine: Path, data: Path) -> Path:
@@ -147,14 +198,16 @@ def _section(name: str, values: dict[str, str | int | dict]) -> str:
     return "\n".join([*lines, "}"])
 
 
-def build_script(map_name: str, game: str, players: list[Player], minutes: int) -> str:
+def build_script(map_name: str, game: str, players: list[Player], minutes: int, record_demo: bool = False) -> str:
+    if type(record_demo) is not bool:
+        raise MatchError("record_demo must be a boolean.")
     if not 0 < minutes <= 2147483647 // 1800 or not players or {p.ally for p in players} != {0, 1}:
         raise MatchError("Enter a positive time limit and at least one AI on each side.")
     lines = [
         "[GAME]", "{", f"MapName={_value(map_name)};", f"GameType={_value(game)};",
         "StartPosType=0;", "GameStartDelay=0;", "IsHost=1;", "OnlyLocal=1;", "HostIP=127.0.0.1;",
         "HostPort=0;", "NumPlayers=1;", "NumUsers=1;", "NoHelperAIs=0;",
-        "MyPlayerName=EditorHost;", "RecordDemo=0;",
+        "MyPlayerName=EditorHost;", f"RecordDemo={int(record_demo)};",
         _section("PLAYER0", {"Name": "EditorHost", "Spectator": 1}),
     ]
     for number, player in enumerate(players):
@@ -383,9 +436,9 @@ def _run_smoke(
 def _run_match(
     engine: Path, data: Path, local_data: Path, map_name: str, game: str,
     players: list[Player], minutes: int, stop: threading.Event, *, archive_cache: Path,
-    process_started: Callable[[subprocess.Popen], None] | None = None,
+    process_started: Callable[[subprocess.Popen], None] | None = None, record_demo: bool = False,
 ) -> tuple[str, Path]:
-    script = build_script(map_name, game, players, minutes)
+    script = build_script(map_name, game, players, minutes, record_demo)
     if not (engine / "spring-headless.exe").is_file():
         raise MatchError(f"Headless engine not found: {engine}")
     runs = local_data / "matches"
@@ -506,6 +559,7 @@ def _run_match(
         result += "\nThe engine did not shut down gracefully and was terminated."
     (run / "result.json").write_text(json.dumps({
         "result": result, "engine_exit": code, "winning_sides": winner, "errors": errors,
+        "replays": replay_files(run) if record_demo else [],
     }, indent=2) + "\n", encoding="utf-8")
     return result, run
 
@@ -514,9 +568,9 @@ def run_match(
     engine: Path, data: Path, local_data: Path, map_name: str, game: str,
     players: list[Player], minutes: int, stop: threading.Event,
     progress: Callable[[MatchProgress], None] | None = None, *, skip_smoke: bool = False,
-    process_started: Callable[[subprocess.Popen], None] | None = None,
+    process_started: Callable[[subprocess.Popen], None] | None = None, record_demo: bool = False,
 ) -> tuple[str, Path]:
-    build_script(map_name, game, players, minutes)
+    build_script(map_name, game, players, minutes, record_demo)
     if stop.is_set():
         raise MatchError("Stopped before the match started.")
     if skip_smoke:
@@ -553,7 +607,7 @@ def run_match(
     started = time.monotonic()
     try:
         result, match_path = _run_match(engine, data, local_data, map_name, game, players, minutes, stop,
-                                        archive_cache=cache, process_started=process_started)
+                                        archive_cache=cache, process_started=process_started, record_demo=record_demo)
     except (MatchError, OSError, ValueError) as error:
         if progress is not None:
             progress(MatchProgress("match", "Stopped" if stop.is_set() else "Failed",

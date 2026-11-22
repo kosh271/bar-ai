@@ -280,7 +280,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/project/manage", "/api/project/import",
             "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
-            "/api/match/start", "/api/match/cancel",
+            "/api/match/start", "/api/match/cancel", "/api/match/replay/copy",
         }:
             return self._error(404, "Unknown API endpoint.")
         try:
@@ -387,6 +387,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 self._require_fields(payload, (
                     "bar_root", "engine", "game", "map_name", "players", "minutes", "skip_smoke",
                 ))
+                record_demo = payload.get("record_demo", False)
+                if type(record_demo) is not bool:
+                    raise ValueError("record_demo must be a boolean.")
                 return self._json(200, self.server.match_service.start(
                     payload["bar_root"],
                     payload["engine"],
@@ -395,6 +398,16 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     payload["players"],
                     payload["minutes"],
                     payload["skip_smoke"],
+                    record_demo=record_demo,
+                ))
+            if parsed.path == "/api/match/replay/copy":
+                self._require_fields(payload, ("run_id", "path"))
+                selected = load_settings(self.server.settings_path)
+                if selected is None:
+                    raise ValueError("Choose and save a BAR installation before copying a replay.")
+                return self._json(200, self.server.match_service.copy_replay(
+                    self._string(payload["run_id"], "run_id"), self._string(payload["path"], "path"),
+                    selected.bar_root, selected.engine,
                 ))
             if parsed.path == "/api/match/cancel":
                 return self._json(200, self.server.match_service.cancel())
