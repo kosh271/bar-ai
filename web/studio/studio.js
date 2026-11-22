@@ -1144,6 +1144,170 @@ function constructionRulesView(panel) {
     rules.forEach((rule, index) => section.append(ruleRow(rule, index)));
     section.append(ruleRow());
 }
+function defenseSlots(factions) {
+    const slots = new Map();
+    for (const [faction, units] of factions) {
+        for (const {key: slot, node: unit} of units.children) {
+            if (unit.kind !== "string") continue;
+            if (!slots.has(slot)) slots.set(slot, new Map());
+            slots.get(slot).set(faction, unitLabel(unit.value));
+        }
+    }
+    return new Map([...slots].sort(([a], [b]) => a - b));
+}
+function defenseSlotPicker(label, slots, selected, change, {id, placeholder, unknown = "Unmapped slot"} = {}) {
+    const columns = new Map([["armada", "ARM"], ["cortex", "COR"], ["legion", "LEG"]]);
+    for (const units of slots.values()) {
+        for (const faction of units.keys()) {
+            if (!columns.has(faction)) columns.set(faction, faction.toUpperCase());
+        }
+    }
+    const choices = selected !== null && !slots.has(selected) ? new Map([[selected, null], ...slots]) : slots;
+    const picker = element("div", "defense-slot-picker");
+    picker.style.setProperty("--faction-columns", columns.size);
+    if (placeholder) picker.append(element("span", "defense-slot-label", label));
+    const trigger = element("button", "defense-slot-trigger");
+    trigger.type = "button";
+    if (id) trigger.id = id;
+    trigger.setAttribute("aria-haspopup", "listbox");
+    const popup = element("div", "defense-slot-popup");
+    popup.popover = "auto";
+    trigger.popoverTargetElement = popup;
+    picker.append(trigger, popup);
+
+    function cells(row, slot, units, showFactions) {
+        row.append(element("span", "defense-slot-number", String(slot)));
+        for (const [faction, short] of columns) {
+            const cell = element("span", "defense-slot-unit");
+            cell.dataset.faction = faction;
+            if (showFactions) cell.append(element("strong", "", short), " ");
+            const unit = units.get(faction);
+            if (unit) cell.title = unit;
+            cell.append(unit ?? "—");
+            row.append(cell);
+        }
+    }
+    function describeSlot(slot, units) {
+        return [`Slot ${slot}`, ...[...columns].filter(([faction]) => units.has(faction))
+            .map(([faction, short]) => `${short} ${units.get(faction)}`)].join(", ");
+    }
+    function showSelection(slot) {
+        const units = choices.get(slot);
+        const summary = element("span", units ? "defense-slot-grid" : "");
+        const fallback = slot === null ? placeholder : `${unknown} ${slot}`;
+        if (units) cells(summary, slot, units, true);
+        else summary.textContent = fallback;
+        const description = units ? describeSlot(slot, units) : fallback;
+        const indicator = element("span", "defense-slot-indicator", "▾");
+        indicator.setAttribute("aria-hidden", "true");
+        trigger.setAttribute("aria-label", `${label}: ${description}`);
+        trigger.title = description;
+        trigger.replaceChildren(summary, indicator);
+    }
+    showSelection(selected);
+
+    function positionPopup() {
+        const anchor = trigger.getBoundingClientRect();
+        const {clientWidth: width, clientHeight: height} = document.documentElement;
+        const popupWidth = Math.min(width - 16, Math.max(anchor.width, columns.size * 185 + 44));
+        const below = height - anchor.bottom - 12, above = anchor.top - 12;
+        const openAbove = below < 300 && above > below;
+        popup.style.width = `${popupWidth}px`;
+        popup.style.left = `${Math.max(8, Math.min(anchor.left, width - popupWidth - 8))}px`;
+        popup.style.maxHeight = `${Math.min(420, openAbove ? above : below)}px`;
+        popup.style.top = openAbove ? "auto" : `${anchor.bottom + 4}px`;
+        popup.style.bottom = openAbove ? `${height - anchor.top + 4}px` : "auto";
+    }
+    let options, positionEvents;
+    popup.addEventListener("beforetoggle", event => {
+        if (event.newState !== "open") {
+            positionEvents?.abort();
+            return;
+        }
+        if (!options) {
+            const header = element("div", "defense-slot-grid defense-slot-header");
+            header.setAttribute("aria-hidden", "true");
+            header.append(element("span", "", "Slot"));
+            for (const [faction, short] of columns) {
+                const cell = element("span", "", short);
+                cell.dataset.faction = faction;
+                header.append(cell);
+            }
+            const list = element("div", "defense-slot-options");
+            list.setAttribute("role", "listbox");
+            list.setAttribute("aria-label", label);
+            options = [...choices].map(([slot, units]) => {
+                const option = button("", () => {
+                    popup.hidePopover();
+                    trigger.focus();
+                    if (slot === selected) return;
+                    selected = slot;
+                    showSelection(slot);
+                    change(slot);
+                }, "defense-slot-option");
+                option.setAttribute("role", "option");
+                option.tabIndex = -1;
+                if (units) {
+                    option.classList.add("defense-slot-grid");
+                    cells(option, slot, units, false);
+                    option.setAttribute("aria-label", describeSlot(slot, units));
+                } else option.textContent = `${unknown} ${slot}`;
+                return {slot, option};
+            });
+            list.append(...options.map(({option}) => option));
+            popup.append(header, list);
+        }
+        const current = options.find(({slot}) => slot === selected) || options[0];
+        for (const {slot, option} of options) {
+            option.setAttribute("aria-selected", String(slot === selected));
+            option.toggleAttribute("autofocus", option === current.option);
+        }
+        positionPopup();
+        positionEvents = new AbortController();
+        function reposition(event) {
+            if (event.target === popup) return;
+            if (!popup.matches(":popover-open")) {
+                positionEvents.abort();
+                return;
+            }
+            const anchor = trigger.getBoundingClientRect();
+            if (anchor.bottom <= 0 || anchor.top >= document.documentElement.clientHeight) popup.hidePopover();
+            else positionPopup();
+        }
+        window.addEventListener("scroll", reposition, {capture: true, signal: positionEvents.signal});
+        window.addEventListener("resize", reposition, {signal: positionEvents.signal});
+    });
+    popup.addEventListener("toggle", event => {
+        if (event.newState === "open") {
+            popup.querySelector("[autofocus]")?.scrollIntoView({block: "nearest"});
+        }
+    });
+    trigger.addEventListener("keydown", event => {
+        if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+        event.preventDefault();
+        popup.showPopover({source: trigger});
+    });
+    popup.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            event.target.click();
+            return;
+        }
+        if (event.key === "Escape" || event.key === "Tab") {
+            popup.hidePopover();
+            trigger.focus();
+            if (event.key === "Escape") event.preventDefault();
+            return;
+        }
+        const index = options.findIndex(({option}) => option === event.target);
+        const last = options.length - 1;
+        const next = {ArrowUp: Math.max(0, index - 1), ArrowDown: Math.min(last, index + 1), Home: 0, End: last}[event.key];
+        if (next === undefined) return;
+        event.preventDefault();
+        options[next].option.focus();
+    });
+    return picker;
+}
 function clusterDefenseView(panel, file, root) {
     const porcupine = C.at(root, ["porcupine"]);
     if (porcupine?.kind !== "object") return;
@@ -1172,17 +1336,7 @@ function clusterDefenseView(panel, file, root) {
     if (path === "config/build_chain.json") addReferenceLayer(find("config/build_chain_leg.json"));
     addUnitLists(C.at(porcupine, ["unit"]));
 
-    const labelsBySlot = new Map();
-    for (const [faction, units] of factions) {
-        const factionName = faction.charAt(0).toUpperCase() + faction.slice(1);
-        for (const {key: slot, node: unit} of units.children) {
-            if (unit.kind !== "string") continue;
-            if (!labelsBySlot.has(slot)) labelsBySlot.set(slot, []);
-            labelsBySlot.get(slot).push(`${factionName} ${unitLabel(unit.value)}`);
-        }
-    }
-    const choices = [...labelsBySlot].sort(([a], [b]) => a - b)
-        .map(([slot, names]) => [String(slot), `${slot} · ${names.join(" / ")}`]);
+    const choices = defenseSlots(factions);
     const terrain = terrains.some(([key]) => key === state.clusterDefenseTerrain) ? state.clusterDefenseTerrain : terrains[0][0];
     const sequence = C.at(porcupine, [terrain]);
     const prevent = C.at(porcupine, ["prevent"]);
@@ -1240,14 +1394,9 @@ function clusterDefenseView(panel, file, root) {
     for (const {key: index, node} of sequence.children) {
         const row = element("tr"), order = element("td", "", String(index + 1));
         const slot = element("td"), actions = element("td"), buttons = element("div", "row");
-        const options = labelsBySlot.has(node.value) ? choices : [[String(node.value), `Unmapped slot ${node.value}`], ...choices];
         const pickerId = `cluster-defense-slot-${index}`;
-        const select = element("select");
-        select.id = pickerId;
-        select.setAttribute("aria-label", `Defense slot at position ${index + 1}`);
-        selectOptions(select, options, String(node.value));
-        select.addEventListener("change", () => edit(index, Number(select.value), pickerId));
-        slot.append(select);
+        slot.append(defenseSlotPicker(`Defense slot at position ${index + 1}`, choices, node.value,
+            value => edit(index, value, pickerId), {id: pickerId}));
         for (const [label, action, next] of [["Move up", "up", index - 1], ["Move down", "down", index + 1], ["Remove", null, index]]) {
             const control = button(label, () => edit(index, action,
                 next < sequence.children.length - (action === null ? 1 : 0) ? `cluster-defense-slot-${next}` : "cluster-defense-add"));
@@ -1261,10 +1410,13 @@ function clusterDefenseView(panel, file, root) {
     }
     if (sequence.children.length) panel.append(wrap);
     else panel.append(element("p", "muted", "This order is empty."));
-    if (choices.length) {
-        let slot = "";
-        const picker = dropdown("Defense to add", [["", "Choose a defense slot"], ...choices], slot, value => {slot = value; add.disabled = !slot;});
-        const add = button("Add to order", () => edit(null, Number(slot), `cluster-defense-slot-${sequence.children.length}`));
+    if (choices.size) {
+        let slot = null;
+        const picker = defenseSlotPicker("Defense to add", choices, slot, value => {
+            slot = value;
+            add.disabled = false;
+        }, {placeholder: "Choose a defense slot"});
+        const add = button("Add to order", () => edit(null, slot, `cluster-defense-slot-${sequence.children.length}`));
         add.id = "cluster-defense-add";
         add.disabled = true;
         const row = element("div", "row");
@@ -1278,17 +1430,9 @@ function baseDefenseView(panel, file, root) {
     const schedule = C.at(porcupine, ["base"]);
     if (factions?.kind !== "object" || (schedule && schedule.kind !== "array")) return;
 
-    const labelsBySlot = new Map();
-    for (const {key: faction, node: units} of factions.children) {
-        if (units.kind !== "array") continue;
-        for (const {key: slot, node: unit} of units.children) {
-            if (unit.kind !== "string") continue;
-            if (!labelsBySlot.has(slot)) labelsBySlot.set(slot, []);
-            const factionName = faction.charAt(0).toUpperCase() + faction.slice(1);
-            labelsBySlot.get(slot).push(`${factionName} · ${unitLabel(unit.value)}`);
-        }
-    }
-    if (!labelsBySlot.size) return;
+    const choices = defenseSlots(factions.children.filter(({node}) => node.kind === "array")
+        .map(({key, node}) => [key, node]));
+    if (!choices.size) return;
     // The stock Legion layer contributes its unit list and can inherit the shared schedule.
     if (file.path === "config/build_chain.json") {
         const legion = find("config/build_chain_leg.json");
@@ -1298,14 +1442,15 @@ function baseDefenseView(panel, file, root) {
                 const units = C.at(layer, ["unit", "legion"]);
                 if (!C.at(layer, ["base"]) && units?.kind === "array") {
                     for (const {key: slot, node: unit} of units.children) {
-                        if (unit.kind === "string") labelsBySlot.get(slot)?.push(`Legion · ${unitLabel(unit.value)}`);
+                        const buildings = choices.get(slot);
+                        if (unit.kind === "string" && buildings && !buildings.has("legion")) {
+                            buildings.set("legion", unitLabel(unit.value));
+                        }
                     }
                 }
             } catch { /* The selected schedule remains usable when another layer cannot be parsed. */ }
         }
     }
-    const choices = [...labelsBySlot].sort(([a], [b]) => a - b)
-        .map(([slot, labels]) => [String(slot), labels.join(" / ")]);
     panel.append(element("h3", "", "Scheduled base defenses"),
         element("p", "muted", "Choose a building and when the AI should attempt it. The AI needs a constructor that can build it at that time. A schedule in a later configuration layer can replace this one."));
     if (!schedule) {
@@ -1323,18 +1468,14 @@ function baseDefenseView(panel, file, root) {
         } catch (error) { message(errorText(error), true); }
     }
     function buildRow(index, initialSlot, initialTime) {
-        let slot = initialSlot === undefined ? "" : String(initialSlot);
+        let slot = initialSlot ?? null;
         const row = element("div", "row");
-        const options = labelsBySlot.has(initialSlot) ? choices : [
-            ["", "Choose a building"],
-            ...(slot ? [[slot, `Unknown unit slot ${slot}`]] : []),
-            ...choices
-        ];
-        const picker = dropdown("Defense building", options, slot, value => {slot = value;});
+        const picker = defenseSlotPicker("Defense building", choices, slot, value => {slot = value;},
+            {placeholder: "Choose a building", unknown: "Unknown unit slot"});
         const [timeLabel, time] = textInput("Game time (seconds)", initialTime ?? "");
         time.type = "number"; time.min = "0"; time.step = "1";
         row.append(picker, timeLabel, button(index === null ? "Add scheduled build" : "Update scheduled build",
-            () => edit(index, [slot === "" ? NaN : Number(slot), time.valueAsNumber])));
+            () => edit(index, [slot ?? NaN, time.valueAsNumber])));
         if (index !== null) row.append(button("Remove scheduled build", () => edit(index, null)));
         return row;
     }

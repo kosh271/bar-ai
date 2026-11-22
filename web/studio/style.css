@@ -80,3 +80,83 @@
 .experiment-choices .series-checks { margin-top: 8px; }
 .experiment-line { overflow: auto; max-height: 6rem; }
 #experiment-status:empty { display: none; }
+
+.defense-slot-picker {
+    --armada: #a4ccf5;
+    --cortex: #efa8a5;
+    --legion: #b2e77e;
+    min-width: 0;
+    width: 100%;
+}
+.row > .defense-slot-picker { flex: 1 1 430px; }
+.defense-slot-label { display: block; margin-bottom: 5px; color: #c3d0db; font-size: 12px; }
+.panel button.defense-slot-trigger {
+    display: flex;
+    width: 100%;
+    min-height: 36px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 10px;
+    background: #101821;
+    text-align: left;
+    font-size: 12px;
+}
+.defense-slot-grid {
+    display: grid;
+    grid-template-columns: 22px repeat(var(--faction-columns), minmax(0, 1fr));
+    align-items: center;
+    gap: 8px;
+}
+.defense-slot-trigger > .defense-slot-grid { flex: 1; min-width: 0; }
+.defense-slot-unit { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.defense-slot-unit strong { margin-right: 2px; font-size: 10px; }
+.defense-slot-number, .defense-slot-indicator { color: var(--muted); }
+.defense-slot-number { font-variant-numeric: tabular-nums; }
+.defense-slot-picker [data-faction="armada"] { color: var(--armada); }
+.defense-slot-picker [data-faction="cortex"] { color: var(--cortex); }
+.defense-slot-picker [data-faction="legion"] { color: var(--legion); }
+.defense-slot-popup {
+    position: fixed;
+    inset: auto;
+    margin: 0;
+    padding: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+    border: 1px solid #40505e;
+    border-radius: 7px;
+    background: #101821;
+    color: var(--text);
+    box-shadow: 0 10px 28px #0008;
+}
+.defense-slot-header {
+    position: sticky;
+    z-index: 1;
+    top: 0;
+    padding: 6px 10px;
+    border-bottom: 1px solid #40505e;
+    background: var(--panel2);
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 700;
+}
+.panel button.defense-slot-option {
+    width: 100%;
+    min-height: 27px;
+    padding: 4px 10px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    text-align: left;
+    font-size: 12px;
+    scroll-margin-top: 30px;
+}
+.panel button.defense-slot-option:hover,
+.panel button.defense-slot-option:focus-visible { background: #273a4a; filter: none; }
+.defense-slot-option:focus-visible { outline-offset: -2px; }
+.defense-slot-option[aria-selected="true"] { box-shadow: inset 3px 0 var(--mint); }
+
+@media (max-width: 640px) {
+    .defense-slot-option .defense-slot-unit { white-space: normal; overflow-wrap: anywhere; }
+}
