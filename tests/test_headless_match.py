@@ -273,5 +273,29 @@ class HeadlessMatchTests(unittest.TestCase):
         match.assert_not_called()
 
 
+class MultiAIRosterScriptTests(unittest.TestCase):
+    def test_build_script_supports_2v2_and_asymmetric_rosters(self):
+        players_2v2 = [
+            Player("MyAI", "1", "hard", "Armada", 0, "My AI"),
+            Player("BARb", "stable", "medium", "Cortex", 0, "BARbarIAn"),
+            Player("MyAI", "1", "fast", "Legion", 1, "My AI"),
+            Player("BARb", "stable", "hard", "Armada", 1, "BARbarIAn"),
+        ]
+        script_2v2 = headless.build_script("Map", "Game", players_2v2, 30)
+        for index in range(4):
+            self.assertIn(f"[AI{index}]", script_2v2)
+            self.assertIn(f"[TEAM{index}]", script_2v2)
+        self.assertIn("profile=fast;", script_2v2)
+        self.assertEqual(script_2v2.count("AllyTeam=0;"), 2)
+        self.assertEqual(script_2v2.count("AllyTeam=1;"), 2)
+
+        asymmetric = players_2v2[:3]
+        script_2v1 = headless.build_script("Map", "Game", asymmetric, 20)
+        self.assertIn("[AI2]", script_2v1)
+        self.assertNotIn("[AI3]", script_2v1)
+        self.assertEqual(script_2v1.count("AllyTeam=0;"), 2)
+        self.assertEqual(script_2v1.count("AllyTeam=1;"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

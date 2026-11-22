@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.discovery import Installation
-from app.headless import MatchError, MatchProgress
+from app.headless import MatchError, MatchProgress, Player
 from app.settings import SettingsError
 from app.studio_matches import MatchService, _operation_lock
 from app.unit_catalog import _RANDOM_SCRIPT, scan, valid_catalog
@@ -491,5 +491,182 @@ class MatchServiceTests(unittest.TestCase):
         self.assertIn("Invalid engine folder", status["error"])
 
 
+SERIES_CONTENT = {
+    "maps": [
+        {"name": "Map", "width": 512, "height": 512},
+        {"name": "Map2", "width": 1024, "height": 1024},
+    ],
+    "games": ["Game"],
+    "ais": [
+        {
+            "short_name": "AI",
+            "version": "1",
+            "name": "My AI",
+            "profiles": [
+                {"key": "hard", "name": "Hard"},
+                {"key": "fast", "name": "Fast"},
+            ],
+        },
+        {
+            "short_name": "BARb",
+            "version": "stable",
+            "name": "BARbarIAn",
+            "profiles": [{"key": "hard", "name": "Hard"}],
+        },
+    ],
+    "warnings": [],
+}
+
+
+class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
+    def setUp(self):
+        import shutil as _shutil
+
+        self._shutil = _shutil
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.projects = self.root / "projects"
+        self.projects.mkdir()
+        (self.root / "scan").mkdir()
+        self.bar_root = self.root / "bar"
+        self.data = self.bar_root / "data"
+        self.engine = "engine"
+        stock = self.data / "engine" / self.engine / "AI" / "Skirmish" / "BARb" / "stable"
+        stock.mkdir(parents=True)
+        (stock / "AIInfo.lua").write_text(
+            "local infos = {\n"
+            "{ key = 'shortName', value = 'BARb' },\n"
+            "{ key = 'version', value = 'stable' },\n"
+            "{ key = 'name', value = 'BARbarIAn' },\n"
+            "}\nreturn infos\n",
+            encoding="utf-8",
+        )
+        (stock / "AIOptions.lua").write_text(
+            "local options = {\n{key='profile', def='hard'},\n{key='game_config', def=true},\n}\nreturn options\n",
+            encoding="utf-8",
+        )
+        (stock / "SkirmishAI.dll").write_bytes(b"dll")
+        self.installation = Installation(self.bar_root, self.data, (self.engine,), self.engine, "", None)
+        self.service = MatchService(self.root, projects_root=self.projects)
+        for mock in (
+            patch.object(self.service, "_selected", return_value=(self.installation, self.data / "engine" / self.engine)),
+            patch("app.studio_matches.discovery.engine_readiness", return_value=()),
+        ):
+            mock.start()
+            self.addCleanup(mock.stop)
+
+    def wait(self):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status = self.service.status()
+            if status["state"] not in ("running", "cancelling"):
+                return status
+            time.sleep(0.01)
+        self.fail("worker did not finish")
+
+    def scan(self):
+        with patch("app.studio_matches.tempfile.mkdtemp", return_value=str(self.root / "scan")), \
+                patch("app.studio_matches.headless.scan_content", return_value=SERIES_CONTENT):
+            self.service.scan(self.bar_root, self.engine)
+            return self.wait()
+
+    def test_multi_ai_team_rosters_2v2_and_asymmetric(self):
+        self.scan()
+        recorded = []
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            recorded.append([(p.short_name, p.profile, p.faction, p.ally, p.name) for p in players])
+            progress(MatchProgress("match", "Winner: side 1.", 1, "Done"))
+            return "Winner: side 1.", self.root / "match"
+
+        roster_2v2 = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+            {"short_name": "AI", "version": "1", "profile": "fast", "faction": "Cortex", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Armada", "ally": 1},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Legion", "ally": 1},
+        ]
+        with patch("app.studio_matches.headless.run_match", side_effect=run):
+            self.service.start(self.bar_root, self.engine, "Game", "Map", roster_2v2, 20, True)
+            self.assertEqual(self.wait()["state"], "completed")
+            self.service.start(self.bar_root, self.engine, "Game", "Map", roster_2v2[:3], 20, True)
+            self.assertEqual(self.wait()["state"], "completed")
+
+        self.assertEqual(len(recorded[0]), 4)
+        self.assertEqual(recorded[0][1], ("AI", "fast", "Cortex", 0, "My AI"))
+        self.assertEqual(len(recorded[1]), 3)
+
+    def test_sequential_benchmark_series_maps_factions_swapping_and_tallies(self):
+        self.scan()
+        calls = []
+        outcomes = [
+            "Smoke test passed.\nWinner: side 1.",
+            "Smoke test passed.\nWinner: side 2.",
+            "Smoke test passed.\nDraw.",
+            MatchError("Engine crashed"),
+        ]
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            idx = len(calls)
+            calls.append((map_name, [(p.short_name, p.faction, p.ally) for p in players]))
+            item = outcomes[idx]
+            if isinstance(item, Exception):
+                raise item
+            progress(MatchProgress("match", "Done", 2))
+            return item, self.root / f"match-{idx}"
+
+        players = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+        ]
+        series = {
+            "games": 4,
+            "swap_sides": True,
+            "maps": ["Map", "Map2"],
+            "faction_pairs": [["Armada", "Cortex"], ["Legion", "Armada"]],
+        }
+        with patch("app.studio_matches.headless.run_match", side_effect=run):
+            self.service.start(self.bar_root, self.engine, "Game", "Map", players, 30, True, series=series)
+            status = self.wait()
+
+        self.assertEqual(status["state"], "completed")
+        tally = status["result"]["series"]
+        self.assertEqual((tally["side1_wins"], tally["side2_wins"], tally["draws"], tally["failures"]), (2, 0, 1, 1))
+        self.assertEqual(tally["completed_games"], 4)
+        self.assertEqual(calls[0], ("Map", [("AI", "Armada", 0), ("BARb", "Cortex", 1)]))
+        self.assertEqual(calls[1], ("Map2", [("AI", "Legion", 1), ("BARb", "Armada", 0)]))
+        self.assertEqual(calls[2][0], "Map")
+        self.assertEqual(calls[3][0], "Map2")
+
+    def test_mid_series_cancellation_stops_active_game_and_prevents_next(self):
+        self.scan()
+        entered = threading.Event()
+        calls = []
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            calls.append(map_name)
+            if len(calls) == 2:
+                entered.set()
+                stop.wait(2)
+                raise MatchError("Stopped by user.")
+            return "Winner: side 1.", self.root / "match-1"
+
+        players = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+        ]
+        with patch("app.studio_matches.headless.run_match", side_effect=run):
+            self.service.start(
+                self.bar_root, self.engine, "Game", "Map", players, 30, True,
+                series={"games": 5, "swap_sides": False, "maps": ["Map", "Map2"]},
+            )
+            self.assertTrue(entered.wait(2))
+            self.service.cancel()
+            status = self.wait()
+
+        self.assertEqual(status["state"], "cancelled")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(status["series"]["side1_wins"], 1)
+        self.assertEqual(status["series"]["cancelled"], 1)
 if __name__ == "__main__":
     unittest.main()

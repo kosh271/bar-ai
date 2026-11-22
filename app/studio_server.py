@@ -56,7 +56,7 @@ class StudioServer(ThreadingHTTPServer):
         self.projects_root = projects_root
         self.settings_path = settings_path
         self.studio_root = studio_root
-        self.match_service = MatchService(APP_ROOT)
+        self.match_service = MatchService(APP_ROOT, projects_root=projects_root)
         self.write_lock = threading.RLock()
         self.session_token = secrets.token_urlsafe(32)
         self._client_lock = threading.Lock()
@@ -412,7 +412,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     payload["players"],
                     payload["minutes"],
                     payload["skip_smoke"],
-                    record_demo=record_demo,
+                    series=payload.get("series"), record_demo=record_demo,
                 ))
             if parsed.path == "/api/match/replay/copy":
                 self._require_fields(payload, ("run_id", "path"))

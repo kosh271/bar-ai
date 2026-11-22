@@ -6,7 +6,13 @@ const S = window.StudioScripts;
 const state = {
     projects: [], project: "", profile: "", files: [], page: "overview",
     layer: {}, factory: "", situation: "land", response: "", file: "",
-    settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), icons: {available: false, message: "", cache: new Map()}, saving: false, history: [], match: {content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "", first: "", second: "", faction1: "Armada", faction2: "Cortex", minutes: 120, skip: false, snapshot: null, statusError: ""}
+    settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), icons: {available: false, message: "", cache: new Map()}, saving: false, history: [],
+    match: {
+        content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "",
+        first: "", second: "", faction1: "Armada", faction2: "Cortex",
+        side1: [], side2: [], seriesGames: 1, swapSides: false, seriesMaps: [], factionPairs: [],
+        minutes: 120, skip: false, snapshot: null, statusError: ""
+    }
 };
 const pages = {
     manage: ["AI install & remove", "Choose a BAR installation, then install or remove the selected AI.", "⇄"],
@@ -1327,6 +1333,60 @@ function matchLogButton(runId, label = "View logs") {
     return element("span", "muted", "—");
 }
 
+function renderSeriesScoreboard(container, series) {
+    if (!container) return;
+    if (!series) {
+        container.replaceChildren();
+        container.hidden = true;
+        return;
+    }
+    container.hidden = false;
+    const total = series.total_games || 0;
+    const completed = series.completed_games || 0;
+    const s1 = series.side1_wins || 0;
+    const s2 = series.side2_wins || 0;
+    const pct = wins => (completed > 0 ? `${Math.round((wins / completed) * 100)}%` : "0%");
+    const heading = series.current_game && completed < total && !series.cancelled
+        ? `Benchmark series · Game ${series.current_game} of ${total}${series.current_map ? ` (${series.current_map})` : ""}${series.swapped ? " · sides swapped" : ""}`
+        : `Benchmark series · ${completed}/${total} games finished`;
+    const grid = element("div", "scoreboard");
+    for (const [label, value] of [
+        ["Side 1 wins", `${s1} (${pct(s1)})`],
+        ["Side 2 wins", `${s2} (${pct(s2)})`],
+        ["Draws", String(series.draws || 0)],
+        ["Timeouts", String(series.timeouts || 0)],
+        ["Failures", String(series.failures || 0)],
+        ["Cancelled", String(series.cancelled || 0)],
+    ]) {
+        const card = element("div", "score-card");
+        card.append(element("small", "", label), element("div", "score-value", value));
+        grid.append(card);
+    }
+    const nodes = [element("h3", "", heading), grid];
+    if (Array.isArray(series.games) && series.games.length) {
+        const wrap = element("div", "table-wrap"), table = element("table"), head = element("tr");
+        for (const col of ["#", "Map", "Sides", "Factions", "Outcome", "Elapsed", "Logs"]) head.append(element("th", "", col));
+        table.append(head);
+        for (const game of series.games) {
+            const tr = element("tr");
+            const logs = element("td");
+            logs.append(matchLogButton(game.run_dir));
+            tr.append(
+                element("td", "", String(game.game_index)),
+                element("td", "", game.map || ""),
+                element("td", "", game.swapped ? "Swapped" : "Standard"),
+                element("td", "", Array.isArray(game.factions) ? game.factions.join(" vs ") : "Roster"),
+                element("td", "", game.outcome || ""),
+                element("td", "", typeof game.elapsed_seconds === "number" ? `${game.elapsed_seconds.toFixed(1)}s` : "—"),
+                logs
+            );
+            table.append(tr);
+        }
+        wrap.append(table);
+        nodes.push(wrap);
+    }
+    container.replaceChildren(...nodes);
+}
 function matchView(target) {
     const m = state.match, panel = element("div", "panel");
     const info = state.settings;
@@ -1373,6 +1433,10 @@ function matchView(target) {
         panel.append(element("pre", "", m.snapshot.result.summary || ""));
         if (m.snapshot.result.telemetry) panel.append(matchTelemetryView(m.snapshot.result.telemetry, m.snapshot.result.series));
     }
+    const scoreboard = element("div");
+    scoreboard.id = "series-scoreboard";
+    renderSeriesScoreboard(scoreboard, m.snapshot?.series || m.snapshot?.result?.series);
+    panel.append(scoreboard);
     const logActions = element("div", "row");
     logActions.id = "match-log-actions";
     setMatchLogActions(logActions, m.snapshot);
@@ -1413,16 +1477,130 @@ function matchView(target) {
                 m.first = choices.find(c => JSON.parse(c.value)[0] === state.project)?.value || choices[0].value;
             }
             if (!choices.some(c => c.value === m.second)) m.second = choices[0].value;
+            m.side1 = (Array.isArray(m.side1) ? m.side1 : []).filter(slot => choices.some(c => c.value === slot.ai));
+            m.side2 = (Array.isArray(m.side2) ? m.side2 : []).filter(slot => choices.some(c => c.value === slot.ai));
+            if (!m.side1.length) m.side1 = [{ai: m.first, faction: m.faction1 || "Armada"}];
+            if (!m.side2.length) m.side2 = [{ai: m.second, faction: m.faction2 || "Cortex"}];
             const row = element("div", "row");
             row.append(dropdown("Game", content.games.map(v => [v, v]), m.game, v => { m.game = v; }),
                 dropdown("Map", content.maps.map(v => [v.name, v.name]), m.map, v => { m.map = v; }));
             panel.append(row);
-            const sides = element("div", "row");
-            sides.append(dropdown("Your AI · side 1", choices.map(c => [c.value, c.label]), m.first, v => {m.first = v;}),
-                dropdown("Faction", ["Armada", "Cortex", "Legion"].map(v => [v, v]), m.faction1, v => {m.faction1 = v;}),
-                dropdown("Opponent · side 2", choices.map(c => [c.value, c.label]), m.second, v => {m.second = v;}),
-                dropdown("Opponent faction", ["Armada", "Cortex", "Legion"].map(v => [v, v]), m.faction2, v => {m.faction2 = v;}));
-            panel.append(sides);
+
+            const factions = ["Armada", "Cortex", "Legion"].map(v => [v, v]);
+            const aiChoices = choices.map(c => [c.value, c.label]);
+            const rosterGrid = element("div", "roster-grid");
+            const renderRosterSide = (title, slots, defaultAi, defaultFaction) => {
+                const sideBox = element("div", "roster-side");
+                const sideHead = element("div", "roster-side-head");
+                const add = button("＋ Add AI", () => {
+                    slots.push({ai: defaultAi, faction: defaultFaction});
+                    render();
+                });
+                add.disabled = m.side1.length + m.side2.length >= 16;
+                sideHead.append(element("h3", "", `${title} (${slots.length})`), add);
+                sideBox.append(sideHead);
+                slots.forEach((slot, index) => {
+                    const slotRow = element("div", "roster-slot");
+                    const aiSelect = element("select");
+                    aiSelect.setAttribute("aria-label", `${title} AI ${index + 1}`);
+                    selectOptions(aiSelect, aiChoices, slot.ai);
+                    aiSelect.addEventListener("change", () => {
+                        slot.ai = aiSelect.value;
+                    });
+                    const factionSelect = element("select");
+                    factionSelect.setAttribute("aria-label", `${title} AI ${index + 1} faction`);
+                    selectOptions(factionSelect, factions, slot.faction);
+                    factionSelect.addEventListener("change", () => {
+                        slot.faction = factionSelect.value;
+                    });
+                    const removeBtn = button("Remove", () => {
+                        if (slots.length <= 1) return;
+                        slots.splice(index, 1);
+                        render();
+                    });
+                    removeBtn.disabled = slots.length <= 1;
+                    slotRow.append(aiSelect, factionSelect, removeBtn);
+                    sideBox.append(slotRow);
+                });
+                return sideBox;
+            };
+            rosterGrid.append(
+                renderRosterSide("Side 1 · Your team", m.side1, m.side1[0].ai, m.side1[0].faction),
+                renderRosterSide("Side 2 · Opponents", m.side2, m.side2[0].ai, m.side2[0].faction)
+            );
+            panel.append(rosterGrid);
+
+            const seriesPanel = element("div", "series-panel");
+            const seriesHead = element("div", "row");
+            const gamesInput = element("input");
+            gamesInput.type = "number"; gamesInput.min = "1"; gamesInput.max = "100"; gamesInput.step = "1";
+            gamesInput.value = m.seriesGames || 1;
+            gamesInput.addEventListener("change", () => {
+                const value = Number(gamesInput.value);
+                m.seriesGames = Number.isInteger(value) && value >= 1 && value <= 100 ? value : 1;
+                render();
+            });
+            const gamesLabel = element("label", "field", "Benchmark series games (1 = single match)");
+            gamesLabel.append(gamesInput);
+            seriesHead.append(gamesLabel);
+            if ((m.seriesGames || 1) > 1) {
+                const swapInput = element("input");
+                swapInput.type = "checkbox"; swapInput.checked = !!m.swapSides;
+                swapInput.addEventListener("change", () => { m.swapSides = swapInput.checked; });
+                const swapLabel = element("label", "field", "Swap sides across games");
+                swapLabel.append(swapInput);
+                seriesHead.append(swapLabel);
+            }
+            seriesPanel.append(seriesHead);
+            if ((m.seriesGames || 1) > 1) {
+                const validMapNames = new Set(content.maps.map(item => item.name));
+                m.seriesMaps = (Array.isArray(m.seriesMaps) ? m.seriesMaps : []).filter(name => validMapNames.has(name));
+                if (!m.seriesMaps.length) m.seriesMaps = [m.map];
+                seriesPanel.append(element("small", "muted", "Map pool rotation"));
+                const mapChecks = element("div", "series-checks");
+                for (const item of content.maps) {
+                    const cb = element("input");
+                    cb.type = "checkbox";
+                    cb.checked = m.seriesMaps.includes(item.name);
+                    cb.addEventListener("change", () => {
+                        if (cb.checked) {
+                            if (!m.seriesMaps.includes(item.name)) m.seriesMaps.push(item.name);
+                        } else {
+                            m.seriesMaps = m.seriesMaps.filter(name => name !== item.name);
+                        }
+                    });
+                    const lbl = element("label");
+                    lbl.append(cb, document.createTextNode(item.name));
+                    mapChecks.append(lbl);
+                }
+                seriesPanel.append(mapChecks, element("small", "muted", "Optional faction matchup rotation (leave unchecked to use roster factions)"));
+                const pairChoices = [
+                    ["Armada", "Cortex"], ["Cortex", "Armada"],
+                    ["Armada", "Legion"], ["Legion", "Armada"],
+                    ["Cortex", "Legion"], ["Legion", "Cortex"],
+                ];
+                if (!Array.isArray(m.factionPairs)) m.factionPairs = [];
+                const pairChecks = element("div", "series-checks");
+                for (const pair of pairChoices) {
+                    const key = JSON.stringify(pair);
+                    const cb = element("input");
+                    cb.type = "checkbox";
+                    cb.checked = m.factionPairs.some(p => JSON.stringify(p) === key);
+                    cb.addEventListener("change", () => {
+                        if (cb.checked) {
+                            if (!m.factionPairs.some(p => JSON.stringify(p) === key)) m.factionPairs.push(pair);
+                        } else {
+                            m.factionPairs = m.factionPairs.filter(p => JSON.stringify(p) !== key);
+                        }
+                    });
+                    const lbl = element("label");
+                    lbl.append(cb, document.createTextNode(`${pair[0]} vs ${pair[1]}`));
+                    pairChecks.append(lbl);
+                }
+                seriesPanel.append(pairChecks);
+            }
+            panel.append(seriesPanel);
+
             const settings = element("div", "row"), minutes = element("input"), minuteLabel = element("label", "field", "Game-time limit (minutes)");
             minutes.type = "number"; minutes.min = "1"; minutes.step = "1"; minutes.value = m.minutes;
             minutes.addEventListener("change", () => { m.minutes = Number(minutes.value); }); minuteLabel.append(minutes);
@@ -1432,7 +1610,8 @@ function matchView(target) {
             replay.type = "checkbox"; replay.checked = m.recordDemo === true;
             replay.addEventListener("change", () => { m.recordDemo = replay.checked; });
             replayLabel.append(replay);
-            settings.append(minuteLabel, skipLabel, replayLabel, button("Start match", async () => {
+            const startLabel = (m.seriesGames || 1) > 1 ? `Start ${m.seriesGames}-game series` : "Start match";
+            settings.append(minuteLabel, skipLabel, replayLabel, button(startLabel, async () => {
                 try {
                     if (dirty().length) throw Error("Save and install profile changes before testing.");
                     if (!Number.isInteger(m.minutes) || m.minutes <= 0) throw Error("Enter a positive whole-number time limit.");
@@ -1440,9 +1619,29 @@ function matchView(target) {
                         const [short_name, version, profile] = JSON.parse(value);
                         return {short_name, version, profile, faction, ally};
                     };
-                    m.snapshot = await api("/api/match/start", {...state.settings, game: m.game, map_name: m.map,
-                        players: [player(m.first, m.faction1, 0), player(m.second, m.faction2, 1)],
-                        minutes: m.minutes, skip_smoke: m.skip, record_demo: m.recordDemo === true});
+                    const players = [
+                        ...m.side1.map(slot => player(slot.ai, slot.faction, 0)),
+                        ...m.side2.map(slot => player(slot.ai, slot.faction, 1)),
+                    ];
+                    const body = {
+                        ...state.settings,
+                        game: m.game,
+                        map_name: m.map,
+                        players,
+                        minutes: m.minutes,
+                        skip_smoke: m.skip,
+                        record_demo: m.recordDemo === true,
+                    };
+                    if ((m.seriesGames || 1) > 1) {
+                        const selectedMaps = m.seriesMaps.length ? m.seriesMaps : [m.map];
+                        body.series = {
+                            games: m.seriesGames,
+                            swap_sides: !!m.swapSides,
+                            maps: selectedMaps,
+                            faction_pairs: m.factionPairs || [],
+                        };
+                    }
+                    m.snapshot = await api("/api/match/start", body);
                     m.statusError = "";
                     render(); pollMatch();
                 } catch (error) { message(errorText(error), true); }
@@ -1499,6 +1698,7 @@ function updateMatchStatus() {
     if (scanProgress) scanProgress.hidden = !isScanActive(m.snapshot);
     if (activity) setMatchActivity(activity, m.snapshot, m.statusError);
     setMatchLogActions($("match-log-actions"), m.snapshot);
+    renderSeriesScoreboard($("series-scoreboard"), m.snapshot?.series || m.snapshot?.result?.series);
 }
 let matchPoll = null;
 async function pollMatch() {

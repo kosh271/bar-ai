@@ -37,18 +37,32 @@ _RESULT_METADATA_BYTES = 8 * 1024 * 1024
 _LOG_FILES = {"infolog.txt", "stdout.txt", "result.json"}
 _RUN_ID = re.compile(r"(?:match|smoke)-[a-zA-Z0-9_-]{1,64}")
 _REPLAY_PATH = re.compile(r"demos/([^/\\:\x00-\x1f]+\.sdfz)", re.IGNORECASE)
+_VALID_FACTIONS = ("Armada", "Cortex", "Legion")
+_FAILURE_MARKERS = (
+    "Engine failed (exit",
+    "Stopped: the game did not confirm",
+    "Invalid winning sides reported:",
+    "Smoke test failed",
+    "Match ended without a confirmed result",
+)
 
 
 class MatchService:
     """Run at most one scan or match at a time across service instances."""
 
-    def __init__(self, repository_root: str | Path) -> None:
+    def __init__(self, repository_root: str | Path, *, projects_root: Path | None = None) -> None:
         self.root = Path(repository_root).expanduser().resolve()
         if not self.root.is_dir():
             raise headless.MatchError(f"Repository root not found: {self.root}")
+        self.projects_root = (
+            Path(projects_root).expanduser().resolve()
+            if projects_root is not None
+            else (self.root / "projects")
+        )
         self.local_data = self.root / "data" / "studio-matches"
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._game_stop: threading.Event | None = None
         self._state: dict = self._empty_state()
         self._process: subprocess.Popen | None = None
         self._content: dict | None = None
@@ -61,7 +75,7 @@ class MatchService:
             "id": None, "operation": None, "state": "idle", "phase": None,
             "message": "", "progress": [], "result": None, "error": None,
             "logs": {}, "elapsed_seconds": None, "cancel_requested": False,
-            "phase_elapsed_seconds": None, "engine": None,
+            "phase_elapsed_seconds": None, "engine": None, "series": None,
         }
 
     def status(self) -> dict:
@@ -96,6 +110,8 @@ class MatchService:
             self._state["cancel_requested"] = True
             self._state["message"] = "Cancelling..."
             self._stop.set()
+            if self._game_stop is not None:
+                self._game_stop.set()
         return self.status()
 
     def _launch(self, operation: str, work: Callable[[], tuple[dict, dict, str]]) -> dict:
@@ -105,6 +121,7 @@ class MatchService:
             if not _operation_lock.acquire(blocking=False):
                 raise headless.MatchError("Another workshop scan or match is already running.")
             self._stop = threading.Event()
+            self._game_stop = None
             self._state = self._empty_state()
             self._process = None
             self._state.update(
@@ -149,6 +166,7 @@ class MatchService:
                                     message="Operation worker stopped unexpectedly.",
                                 )
                             self._process = None
+                            self._game_stop = None
                             _operation_lock.release()
 
             try:
@@ -436,6 +454,68 @@ class MatchService:
 
         return self._launch("catalog", work)
 
+    def _validate_players(self, players: object, content: dict, *, require_both_sides: bool = True) -> list[headless.Player]:
+        minimum = 2 if require_both_sides else 1
+        if not isinstance(players, list) or not minimum <= len(players) <= 16:
+            raise headless.MatchError(f"Players must be a list of {minimum} to 16 entries.")
+        match_players = []
+        for player in players:
+            if not isinstance(player, dict):
+                raise headless.MatchError("Each player must be an object.")
+            short_name, version = player.get("short_name"), player.get("version")
+            profile, faction, ally = player.get("profile"), player.get("faction"), player.get("ally")
+            if (not isinstance(short_name, str) or not isinstance(version, str)
+                    or not isinstance(profile, str) or not isinstance(faction, str)
+                    or type(ally) is not int or ally not in (0, 1)
+                    or faction not in _VALID_FACTIONS):
+                raise headless.MatchError("Invalid player fields or faction.")
+            ais = [ai for ai in content["ais"] if ai["short_name"] == short_name and ai["version"] == version]
+            if len(ais) != 1:
+                raise headless.MatchError(f"AI {short_name}:{version} is not uniquely installed.")
+            profiles = ais[0]["profiles"]
+            if profile not in [item["key"] for item in profiles] and (profile or profiles):
+                raise headless.MatchError(f"Profile {profile!r} is not installed for {short_name}:{version}.")
+            match_players.append(headless.Player(short_name, version, profile, faction, ally, ais[0]["name"]))
+        if require_both_sides and {player.ally for player in match_players} != {0, 1}:
+            raise headless.MatchError("At least one AI is required on each side.")
+        return match_players
+
+    @staticmethod
+    def _validate_series(series: object, default_map: str, content: dict) -> dict | None:
+        if series is None:
+            return None
+        if not isinstance(series, dict):
+            raise headless.MatchError("Series settings must be an object.")
+        games = series.get("games", 1)
+        if type(games) is not int or not 1 <= games <= 100:
+            raise headless.MatchError("Series game count must be an integer between 1 and 100.")
+        swap_sides = series.get("swap_sides", False)
+        if type(swap_sides) is not bool:
+            raise headless.MatchError("swap_sides must be a boolean.")
+        raw_maps = series.get("maps")
+        if raw_maps is None:
+            maps = [default_map]
+        else:
+            if not isinstance(raw_maps, list) or not raw_maps:
+                raise headless.MatchError("Series map pool must be a non-empty list.")
+            installed_maps = {item["name"] for item in content["maps"]}
+            if any(not isinstance(item, str) or item not in installed_maps for item in raw_maps):
+                raise headless.MatchError("Select installed maps for the benchmark series.")
+            maps = list(raw_maps)
+        raw_pairs = series.get("faction_pairs")
+        if raw_pairs is None:
+            faction_pairs: list[list[str]] = []
+        else:
+            if not isinstance(raw_pairs, list):
+                raise headless.MatchError("faction_pairs must be a list.")
+            faction_pairs = []
+            for pair in raw_pairs:
+                if (not isinstance(pair, (list, tuple)) or len(pair) != 2
+                        or any(not isinstance(item, str) or item not in _VALID_FACTIONS for item in pair)):
+                    raise headless.MatchError("Each faction pair must list two valid factions.")
+                faction_pairs.append([pair[0], pair[1]])
+        return {"games": games, "swap_sides": swap_sides, "maps": maps, "faction_pairs": faction_pairs}
+
     def _matches_dir(self) -> Path:
         matches_dir = self.local_data / "matches"
         installation._check_links(self.root, self.local_data)
@@ -458,11 +538,111 @@ class MatchService:
         except (OSError, ValueError, installation.InstallationError):
             return None
 
+    def _classify_game_outcome(
+        self, summary: str, path: Path | None, timed_out: bool,
+        cancelled: bool, swapped: bool, events: list[dict],
+    ) -> tuple[str, bool]:
+        if cancelled:
+            return "cancelled", False
+        if timed_out:
+            return "timeout", True
+        failed = any(event.get("summary") == "Failed" for event in events) or any(
+            marker in summary for marker in _FAILURE_MARKERS
+        )
+        if failed:
+            return "failed", True
+        relative_run = self._relative_run_dir(path)
+        if relative_run and _RUN_ID.fullmatch(relative_run):
+            data = self._artifact_metadata(relative_run)
+            if data.get("smoke_passed") is False:
+                return "failed", True
+            winning = data.get("winning_sides")
+            if isinstance(winning, list) and all(type(side) is int and side in (0, 1) for side in winning):
+                if len(winning) == 1:
+                    return ("side2" if ((winning[0] == 0) == swapped) else "side1"), False
+                if not winning or len(winning) == 2 and winning[0] != winning[1]:
+                    return "draw", False
+        winner_match = re.search(r"Winner: side ([12])\.", summary)
+        if winner_match:
+            winner = int(winner_match.group(1)) - 1
+            return ("side2" if ((winner == 0) == swapped) else "side1"), False
+        lines = [line.strip() for line in summary.splitlines()]
+        if "Draw." in lines:
+            return "draw", False
+        if "Time limit reached" in summary:
+            return "timeout", False
+        if "Stopped by user" in summary or "match not started" in summary:
+            return "cancelled", False
+        return "completed", False
+
+    def _run_game(
+        self, engine_dir: Path, data: Path, map_name: str, game: str, players: list[headless.Player],
+        minutes: int, *, skip_smoke: bool, record_demo: bool = False, label: str = "",
+        real_time_deadline: float | None = None,
+    ) -> tuple[str, Path, bool, bool, list[dict]]:
+        game_stop = threading.Event()
+        with self._lock:
+            if self._stop.is_set() or self._state["cancel_requested"]:
+                raise headless.MatchError("Stopped before the match started.")
+            if real_time_deadline is not None and real_time_deadline <= time.monotonic():
+                raise headless.MatchError("Match exceeded its real-time deadline.")
+            self._game_stop = game_stop
+        self._set_phase("smoke" if not skip_smoke else "match", f"{label}Starting headless match...")
+        timed_out = threading.Event()
+
+        def timeout() -> None:
+            timed_out.set()
+            game_stop.set()
+
+        budget = min(_MAX_MATCH_SECONDS, 600 + minutes * 60)
+        if real_time_deadline is not None:
+            budget = min(budget, max(0, real_time_deadline - time.monotonic()))
+            if budget == 0:
+                timeout()
+        timer = threading.Timer(budget, timeout)
+        timer.daemon = True
+        timer.start()
+
+        def progress(event: headless.MatchProgress) -> None:
+            with self._lock:
+                if event.summary != "Skipped":
+                    self._change_phase(event.phase)
+                self._state["progress"].append(asdict(event))
+                self._state["progress"] = self._state["progress"][-64:]
+                if event.run_id and _RUN_ID.fullmatch(event.run_id):
+                    key = "smoke_run_id" if event.phase == "smoke" else "run_id"
+                    self._state["logs"][key] = event.run_id
+                if event.message and not self._state["cancel_requested"]:
+                    self._state["message"] = f"{label}{event.message}"
+
+        def process_started(process: subprocess.Popen) -> None:
+            with self._lock:
+                self._process = process
+
+        try:
+            summary, path = headless.run_match(
+                engine_dir, data, self.local_data, map_name, game, players, minutes, game_stop,
+                progress, skip_smoke=skip_smoke, process_started=process_started, record_demo=record_demo,
+            )
+        except Exception as error:
+            if timed_out.is_set():
+                raise headless.MatchError("Match exceeded its real-time deadline.") from error
+            raise
+        finally:
+            timer.cancel()
+            with self._lock:
+                self._game_stop = None
+        with self._lock:
+            cancelled = self._state["cancel_requested"]
+            events = list(self._state["progress"])
+        return summary, path, timed_out.is_set(), cancelled, events
+
     def start(
         self, bar_root: str | Path, engine: str, game: str, map_name: str,
-        players: list[dict], minutes: int, skip_smoke: bool = False, *, record_demo: bool = False,
+        players: list[dict], minutes: int, skip_smoke: bool = False,
+        series: dict | None = None, *, record_demo: bool = False,
     ) -> dict:
-        """Start a match from the latest in-memory or saved scan for the selected engine.
+        """Start a match or benchmark series from the last successful scan.
 
         Each player is an object with short_name, version, profile, faction and
         ally (0 or 1). The AI display name is taken from the scan, not the client.
@@ -470,6 +650,7 @@ class MatchService:
         if type(record_demo) is not bool:
             raise headless.MatchError("record_demo must be a boolean.")
         players = copy.deepcopy(players)
+        series = copy.deepcopy(series)
 
         def work() -> tuple[dict, dict, str]:
             selected, engine_dir = self._selected(bar_root, engine)
@@ -488,89 +669,186 @@ class MatchService:
                 raise headless.MatchError("Select an installed map.")
             if type(minutes) is not int or type(skip_smoke) is not bool:
                 raise headless.MatchError("Minutes must be an integer and skip_smoke must be a boolean.")
-            if not isinstance(players, list):
-                raise headless.MatchError("Players must be a list.")
-            match_players = []
-            for player in players:
-                if not isinstance(player, dict):
-                    raise headless.MatchError("Each player must be an object.")
-                short_name, version = player.get("short_name"), player.get("version")
-                profile, faction, ally = player.get("profile"), player.get("faction"), player.get("ally")
-                if (not isinstance(short_name, str) or not isinstance(version, str)
-                        or not isinstance(profile, str) or not isinstance(faction, str)
-                        or type(ally) is not int or ally not in (0, 1)
-                        or faction not in ("Armada", "Cortex", "Legion")):
-                    raise headless.MatchError("Invalid player fields or faction.")
-                ais = [ai for ai in content["ais"] if ai["short_name"] == short_name and ai["version"] == version]
-                if len(ais) != 1:
-                    raise headless.MatchError(f"AI {short_name}:{version} is not uniquely installed.")
-                profiles = ais[0]["profiles"]
-                if profile not in [item["key"] for item in profiles] and (profile or profiles):
-                    raise headless.MatchError(f"Profile {profile!r} is not installed for {short_name}:{version}.")
-                match_players.append(headless.Player(short_name, version, profile, faction, ally, ais[0]["name"]))
+            match_players = self._validate_players(players, content)
+            series_cfg = self._validate_series(series, map_name, content)
             headless.build_script(map_name, game, match_players, minutes)
             self._prepare_storage(engine_dir, selected.data)
-            if self._stop.is_set():
-                raise headless.MatchError("Stopped before the match started.")
-            self._set_phase("smoke" if not skip_smoke else "match", "Starting headless match...")
-            timed_out = threading.Event()
-            stop = self._stop
-
-            def timeout() -> None:
-                timed_out.set()
-                stop.set()
-
-            timer = threading.Timer(min(_MAX_MATCH_SECONDS, 600 + minutes * 60), timeout)
-            timer.daemon = True
-            timer.start()
-
-            def progress(event: headless.MatchProgress) -> None:
-                with self._lock:
-                    if event.summary != "Skipped":
-                        self._change_phase(event.phase)
-                    self._state["progress"].append(asdict(event))
-                    self._state["progress"] = self._state["progress"][-64:]
-                    if event.run_id and _RUN_ID.fullmatch(event.run_id):
-                        key = "smoke_run_id" if event.phase == "smoke" else "run_id"
-                        self._state["logs"][key] = event.run_id
-                    if event.message and not self._state["cancel_requested"]:
-                        self._state["message"] = event.message
-
-            def process_started(process: subprocess.Popen) -> None:
-                with self._lock:
-                    self._process = process
-
-            try:
-                summary, path = headless.run_match(
-                    engine_dir, selected.data, self.local_data, map_name, game, match_players,
-                    minutes, stop, progress, skip_smoke=skip_smoke, process_started=process_started,
-                    record_demo=record_demo,
-                )
-            except Exception as error:
-                if timed_out.is_set():
-                    raise headless.MatchError("Match exceeded its real-time deadline.") from error
-                raise
-            finally:
-                timer.cancel()
-            result = {"summary": summary, "path": str(path)}
             with self._lock:
-                cancelled = self._state["cancel_requested"]
-                events = list(self._state["progress"])
-            logs, telemetry = self._run_artifacts(path, events)
-            if telemetry is not None:
-                result["telemetry"] = telemetry
-            if timed_out.is_set():
-                result["summary"] += "\nMatch exceeded its real-time deadline."
-                return result, logs, "failed"
-            if cancelled:
-                return result, logs, "cancelled"
-            failed = any(event["summary"] == "Failed" for event in events)
-            failed = failed or any(
-                marker in summary for marker in (
-                    "Engine failed (exit", "Stopped: the game did not confirm",
-                    "Invalid winning sides reported:",
+                op_id = self._state["id"] or uuid.uuid4().hex
+
+            def run_single_game(
+                game_map: str, game_players: list[headless.Player], label_prefix: str = "",
+            ) -> tuple[str, Path | None, bool, bool, list[dict]]:
+                return self._run_game(
+                    engine_dir, selected.data, game_map, game, game_players, minutes,
+                    skip_smoke=skip_smoke, record_demo=record_demo, label=label_prefix,
                 )
+
+            if series_cfg is None:
+                summary, path, was_timed_out, cancelled, events = run_single_game(map_name, match_players)
+                logs, telemetry = self._run_artifacts(path, events)
+                result = {"summary": summary, "path": str(path)}
+                if telemetry is not None:
+                    result["telemetry"] = telemetry
+                if was_timed_out:
+                    result["summary"] += "\nMatch exceeded its real-time deadline."
+                    return result, logs, "failed"
+                if cancelled:
+                    record_single_history("cancelled", result["summary"], "Cancelled", path, duration)
+                outcome_code, failed = self._classify_game_outcome(summary, path, False, False, False, events)
+                final_state = "failed" if failed else "completed"
+                return result, logs, final_state
+
+            # Sequential benchmark series
+            total_games = series_cfg["games"]
+            swap_sides = series_cfg["swap_sides"]
+            series_maps = series_cfg["maps"]
+            faction_pairs = series_cfg["faction_pairs"]
+            series_state = {
+                "id": op_id,
+                "total_games": total_games,
+                "completed_games": 0,
+                "current_game": 0,
+                "current_map": None,
+                "swapped": False,
+                "swap_sides": swap_sides,
+                "maps": list(series_maps),
+                "faction_pairs": [list(pair) for pair in faction_pairs],
+                "side1_wins": 0,
+                "side2_wins": 0,
+                "draws": 0,
+                "timeouts": 0,
+                "failures": 0,
+                "cancelled": 0,
+                "games": [],
+            }
+            with self._lock:
+                self._state["series"] = copy.deepcopy(series_state)
+            last_path: Path | None = None
+            last_logs: dict = {}
+            last_telemetry: dict | None = None
+            for idx in range(total_games):
+                with self._lock:
+                    if self._stop.is_set() or self._state["cancel_requested"]:
+                        break
+                    self._state["progress"] = []
+                    self._state["logs"] = {}
+                game_map = series_maps[idx % len(series_maps)]
+                pair = faction_pairs[idx % len(faction_pairs)] if faction_pairs else None
+                swapped = bool(swap_sides and (idx % 2 == 1))
+                game_players = [
+                    headless.Player(
+                        player.short_name,
+                        player.version,
+                        player.profile,
+                        pair[player.ally] if pair is not None else player.faction,
+                        (1 - player.ally) if swapped else player.ally,
+                        player.name,
+                    )
+                    for player in match_players
+                ]
+                headless.build_script(game_map, game, game_players, minutes)
+                series_state["current_game"] = idx + 1
+                series_state["current_map"] = game_map
+                series_state["swapped"] = swapped
+                with self._lock:
+                    self._state["series"] = copy.deepcopy(series_state)
+                game_started = time.monotonic()
+                game_path: Path | None = None
+                game_summary = ""
+                game_outcome = "failed"
+                try:
+                    game_summary, game_path, game_timed_out, game_cancelled, game_events = run_single_game(
+                        game_map, game_players, f"[Game {idx + 1}/{total_games} · {game_map}] ",
+                    )
+                    if game_timed_out:
+                        game_summary = (game_summary + "\nMatch exceeded its real-time deadline.").strip()
+                    game_outcome, _ = self._classify_game_outcome(
+                        game_summary, game_path, game_timed_out, game_cancelled, swapped, game_events,
+                    )
+                except Exception as error:
+                    with self._lock:
+                        game_cancelled = self._state["cancel_requested"] or self._stop.is_set()
+                    game_summary = str(error)
+                    if game_cancelled:
+                        game_outcome = "cancelled"
+                    elif not isinstance(error, headless.MatchError):
+                        raise
+                    else:
+                        game_outcome = "timeout" if "real-time deadline" in game_summary else "failed"
+                game_elapsed = round(max(0.0, time.monotonic() - game_started), 2)
+                if game_path is not None:
+                    last_path = game_path
+                    last_logs, last_telemetry = self._run_artifacts(game_path, game_events)
+                if game_outcome == "side1":
+                    series_state["side1_wins"] += 1
+                    series_state["completed_games"] += 1
+                elif game_outcome == "side2":
+                    series_state["side2_wins"] += 1
+                    series_state["completed_games"] += 1
+                elif game_outcome == "draw":
+                    series_state["draws"] += 1
+                    series_state["completed_games"] += 1
+                elif game_outcome == "timeout":
+                    series_state["timeouts"] += 1
+                    series_state["completed_games"] += 1
+                elif game_outcome == "cancelled":
+                    series_state["cancelled"] += 1
+                else:
+                    series_state["failures"] += 1
+                    series_state["completed_games"] += 1
+
+                game_player_dicts = [asdict(player) for player in game_players]
+                rel_dir = last_logs.get("run_id") if game_path is not None else None
+                series_state["games"].append({
+                    "game_index": idx + 1,
+                    "map": game_map,
+                    "swapped": swapped,
+                    "factions": list(pair) if pair is not None else None,
+                    "outcome": game_outcome,
+                    "elapsed_seconds": game_elapsed,
+                    "summary": game_summary,
+                    "run_dir": rel_dir,
+                    "players": game_player_dicts,
+                })
+                with self._lock:
+                    self._state["series"] = copy.deepcopy(series_state)
+                if game_outcome == "cancelled":
+                    break
+
+            with self._lock:
+                cancelled_series = self._state["cancel_requested"] or self._stop.is_set()
+            overall_state = (
+                "cancelled" if cancelled_series
+                else "failed" if series_state["failures"] == total_games and total_games > 0
+                else "completed"
             )
-            return result, logs, "failed" if failed else "completed"
+            tally = (
+                f"Side 1: {series_state['side1_wins']}W · "
+                f"Side 2: {series_state['side2_wins']}W · "
+                f"Draws: {series_state['draws']} · "
+                f"Timeouts: {series_state['timeouts']} · "
+                f"Failures: {series_state['failures']}"
+            )
+            header = (
+                f"Series cancelled after {len(series_state['games'])}/{total_games} games"
+                if cancelled_series
+                else f"Series complete ({series_state['completed_games']}/{total_games} games)"
+            )
+            lines = [f"{header}: {tally}"]
+            for g in series_state["games"]:
+                lines.append(
+                    f"Game {g['game_index']} ({g['map']}{', swapped' if g['swapped'] else ''}): "
+                    f"{g['outcome']} ({g['elapsed_seconds']:.1f}s)"
+                )
+            series_summary_text = "\n".join(lines)
+            result = {
+                "summary": series_summary_text,
+                "path": str(last_path) if last_path is not None else "",
+                "series": copy.deepcopy(series_state),
+            }
+            if last_telemetry is not None:
+                result["telemetry"] = last_telemetry
+            return result, last_logs, overall_state
 
         return self._launch("match", work)
