@@ -85,24 +85,32 @@ def list_game_sources(data: Path, unpacked: Path | None) -> tuple[list[GameSourc
 def _package_entries(path: Path) -> Iterator[tuple[str, str, int]]:
     try:
         with gzip.open(path, "rb") as source:
-            raw = source.read()
+            remainder = b""
+            while chunk := source.read(64 * 1024):
+                block = remainder + chunk
+                position = 0
+                while position < len(block):
+                    length = block[position]
+                    if not length:
+                        raise GameSourceError(f"Invalid game package manifest: {path}")
+                    name_start = position + 1
+                    metadata = name_start + length
+                    end = metadata + 24
+                    if end > len(block):
+                        break
+                    try:
+                        name = block[name_start:metadata].decode("utf-8")
+                    except UnicodeError as error:
+                        raise GameSourceError(f"Invalid filename in game package {path}: {error}") from error
+                    digest = block[metadata:metadata + 16].hex()
+                    size = struct.unpack_from(">I", block, metadata + 20)[0]
+                    yield name, digest, size
+                    position = end
+                remainder = block[position:]
+            if remainder:
+                raise GameSourceError(f"Invalid game package manifest: {path}")
     except (OSError, EOFError) as error:
         raise GameSourceError(f"Cannot read game package {path}: {error}") from error
-    position = 0
-    while position < len(raw):
-        length = raw[position]
-        position += 1
-        if not length or position + length + 24 > len(raw):
-            raise GameSourceError(f"Invalid game package manifest: {path}")
-        try:
-            name = raw[position:position + length].decode("utf-8")
-        except UnicodeError as error:
-            raise GameSourceError(f"Invalid filename in game package {path}: {error}") from error
-        position += length
-        digest = raw[position:position + 16].hex()
-        size = struct.unpack_from(">I", raw, position + 20)[0]
-        position += 24
-        yield name, digest, size
 
 
 @contextmanager
