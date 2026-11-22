@@ -251,9 +251,37 @@ function baselineLabel(file, label) {
     return file?.baselineChanged ? label + " · Modified from baseline" : label;
 }
 function header(page) {
-    const [title, subtitle] = pages[page], head = element("div", "heading"), left = element("div");
-    left.append(element("div", "eyebrow", "Strategy workshop"), element("h1", "", title), element("p", "lead", subtitle));
+    const [title] = pages[page], head = element("div", "heading"), left = element("div");
+    const guide = window.StudioGuides[page];
+    left.append(element("div", "eyebrow", "Strategy workshop"), element("h1", "", title),
+        element("p", "lead", guide.intro));
+    const actions = element("div", "row guide-actions");
+    actions.append(
+        button("Brief guide", () => showGuide(page, false), "button subtle"),
+        button("In-depth guide", () => showGuide(page, true), "button subtle")
+    );
+    left.append(actions);
     head.append(left); return head;
+}
+function showGuide(page, inDepth) {
+    const guide = window.StudioGuides[page];
+    const body = element("article", "section-guide");
+    if (inDepth) {
+        for (const [title, explanation] of guide.detail) {
+            body.append(element("h3", "", title), element("p", "", explanation));
+        }
+        const glossary = element("dl");
+        for (const [term, definition] of guide.glossary) {
+            glossary.append(element("dt", "", term), element("dd", "", definition));
+        }
+        body.append(element("h3", "", "Glossary"), glossary);
+    } else {
+        const steps = element("ol");
+        for (const step of guide.brief) steps.append(element("li", "", step));
+        body.append(steps);
+    }
+    showDialog(pages[page][0] + " · " + (inDepth ? "In-depth guide" : "Brief guide"), body);
+    $("dialog").querySelector(".dialog-inner").scrollTop = 0;
 }
 function showDialog(title, content) {
     $("dialog-title").textContent = title;

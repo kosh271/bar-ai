@@ -192,3 +192,12 @@
 .cluster-defense-table tr.dragging { opacity: .45; }
 .cluster-defense-table tr[data-drop-edge="before"] > td { box-shadow: inset 0 3px var(--orange); }
 .cluster-defense-table tr[data-drop-edge="after"] > td { box-shadow: inset 0 -3px var(--orange); }
+
+.guide-actions { margin-top: 12px; }
+.section-guide { line-height: 1.6; overflow-wrap: anywhere; }
+.section-guide h3 { margin-top: 18px; }
+.section-guide p { margin: 0 0 12px; }
+.section-guide ol { padding-inline-start: 24px; }
+.section-guide li + li { margin-top: 10px; }
+.section-guide dt { font-weight: 700; }
+.section-guide dd { margin: 0 0 10px; }
