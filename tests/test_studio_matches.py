@@ -230,6 +230,25 @@ class MatchServiceTests(unittest.TestCase):
             self.assertEqual(self.wait()["state"], "cancelled")
         self.assertIsNone(MatchService(self.root).cached_content(self.installation.root, "engine"))
 
+    def test_scan_reports_map_progress_and_cancellation_as_a_terminal_status(self):
+        entered = threading.Event()
+
+        def scan_content(engine, data, write, stop, *, archive_cache, progress):
+            progress(4, 12)
+            entered.set()
+            stop.wait(2)
+            raise MatchError("Content scan cancelled.")
+
+        with patch("app.studio_matches.headless.scan_content", side_effect=scan_content):
+            job = self.service.scan("bar", "engine")
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(self.service.status()["scan_progress"], {"checked": 4, "total": 12})
+            self.service.cancel(job["id"])
+            status = self.wait()
+            self.assertEqual(status["state"], "cancelled")
+            self.assertIsNone(status["error"])
+            self.assertEqual(self.service.cancel(job["id"])["state"], "cancelled")
+
     def test_match_status_checks_each_stage_process_and_reports_exit(self):
         self.scan()
         smoke_ready, match_ready, advance, finish = (threading.Event() for _ in range(4))

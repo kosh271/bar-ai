@@ -117,7 +117,7 @@ function experimentForm(content) {
             state.experiments.selected = "";
             message("");
             updateExperimentStatus();
-            pollMatch();
+            pollMatch(true);
         } catch (error) {
             fields.disabled = false;
             message(errorText(error), true);

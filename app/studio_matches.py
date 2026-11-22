@@ -81,6 +81,7 @@ class MatchService:
             "message": "", "progress": [], "result": None, "error": None,
             "logs": {}, "elapsed_seconds": None, "cancel_requested": False,
             "phase_elapsed_seconds": None, "engine": None, "series": None, "experiment": None,
+            "scan_progress": None,
         }
 
     def is_busy(self, operation: str | None = None) -> bool:
@@ -114,20 +115,21 @@ class MatchService:
     def cancel(self, expected_id: str | None = None) -> dict:
         """Request cooperative cancellation; poll status for the final outcome."""
         with self._lock:
-            if self._state["state"] not in ("running", "cancelling"):
+            if self._state["state"] in ("running", "cancelling"):
+                experiment = self._state["experiment"]
+                if experiment is not None and experiment["state"] != "running":
+                    raise headless.MatchError("The experiment has already finished.")
+                if expected_id is not None and self._state["id"] != expected_id:
+                    raise headless.MatchError("The requested operation is no longer running.")
+                self._state["state"] = "cancelling"
+                self._state["cancel_requested"] = True
+                self._state["message"] = "Cancelling..."
+                self._stop.set()
+                if self._game_stop is not None:
+                    self._game_stop.set()
+                self._experiment_changed.notify_all()
+            elif not (expected_id == self._state["id"] and self._state["operation"] == "scan"):
                 raise headless.MatchError("No scan or match is running.")
-            experiment = self._state["experiment"]
-            if experiment is not None and experiment["state"] != "running":
-                raise headless.MatchError("The experiment has already finished.")
-            if expected_id is not None and self._state["id"] != expected_id:
-                raise headless.MatchError("The requested operation is no longer running.")
-            self._state["state"] = "cancelling"
-            self._state["cancel_requested"] = True
-            self._state["message"] = "Cancelling..."
-            self._stop.set()
-            if self._game_stop is not None:
-                self._game_stop.set()
-            self._experiment_changed.notify_all()
         return self.status()
 
     def _launch(self, operation: str, work: Callable[[], tuple[dict, dict, str]]) -> dict:
@@ -164,10 +166,12 @@ class MatchService:
                             if completion is not None:
                                 self._publish_result(operation, *completion)
                         except Exception as error:
+                            cancelled = self._state["cancel_requested"]
+                            scan_cancelled = cancelled and operation == "scan"
                             self._state.update(
-                                state="cancelled" if self._state["cancel_requested"] else "failed",
-                                error=f"{type(error).__name__}: {error}",
-                                message=str(error) or type(error).__name__,
+                                state="cancelled" if cancelled else "failed",
+                                error=None if scan_cancelled else f"{type(error).__name__}: {error}",
+                                message="Content scan cancelled." if scan_cancelled else str(error) or type(error).__name__,
                             )
                         finally:
                             finished = time.monotonic()
@@ -463,6 +467,10 @@ class MatchService:
 
     def scan(self, bar_root: str | Path, engine: str) -> dict:
         """Scan installed content asynchronously; result.content contains the choices."""
+        def progress(checked: int, total: int) -> None:
+            with self._lock:
+                self._state["scan_progress"] = {"checked": checked, "total": total}
+
         def work() -> tuple[dict, dict, str]:
             selected, engine_dir = self._selected(bar_root, engine)
             with self._lock:
@@ -475,7 +483,9 @@ class MatchService:
             if self._stop.is_set():
                 raise headless.MatchError("Content scan cancelled.")
             self._set_phase("scan", "Scanning installed content...")
-            content = headless.scan_content(engine_dir, selected.data, scan_dir, self._stop, archive_cache=cache)
+            content = headless.scan_content(
+                engine_dir, selected.data, scan_dir, self._stop, archive_cache=cache, progress=progress,
+            )
             if not settings._content_valid(content):
                 raise headless.MatchError("The engine returned an invalid content scan result.")
             return {

@@ -144,7 +144,8 @@ async function loadCachedMatchContent() {
     state.match.cacheError = "";
     try {
         const result = await api("/api/match/cache", state.settings);
-        if (matchSettingsKey(state.settings) !== key) return;
+        if (matchSettingsKey(state.settings) !== key || state.match.cacheKey !== key ||
+            isScanActive(state.match.snapshot)) return;
         state.match.content = result.content;
         state.match.cached = !!result.content;
         if (result.content && !state.match.snapshot) {
@@ -153,7 +154,9 @@ async function loadCachedMatchContent() {
             };
         }
     } catch (error) {
-        if (matchSettingsKey(state.settings) === key) state.match.cacheError = errorText(error);
+        if (matchSettingsKey(state.settings) === key && state.match.cacheKey === key) {
+            state.match.cacheError = errorText(error);
+        }
     }
 }
 async function loadInstallStatus() {
@@ -2227,23 +2230,46 @@ function matchView(target) {
             notice("Install saved changes before scanning. A successful smoke test verifies loading and script compilation, not playing strength."));
     }
     const controls = element("div", "row");
-    controls.append(button(m.content ? "Refresh installed content" : "Scan installed content", async () => {
+    const scanButton = button(m.content ? "Refresh installed content" : "Scan installed content", async () => {
         try {
             if (!state.settings) throw Error("Choose and save an installation first.");
             if (dirty().length) throw Error("Save or discard profile changes before testing.");
-            m.scanSettingsKey = matchSettingsKey(state.settings);
+            const settings = state.settings;
+            m.scanStarting = true;
+            updateMatchControls();
+            message("");
+            m.snapshot = await api("/api/match/scan", settings);
+            m.scanSettingsKey = matchSettingsKey(settings);
             m.content = null;
             m.cached = false;
             m.cacheError = "";
             m.cacheKey = "";
-            m.snapshot = await api("/api/match/scan", state.settings);
             m.statusError = "";
-            render(); pollMatch();
+            pollMatch(true);
         } catch (error) { message(errorText(error), true); }
-    }), button("Cancel operation", async () => {
-        try { m.snapshot = await api("/api/match/cancel", {}); render(); }
+        finally { m.scanStarting = false; if (state.page === "match") render(); }
+    });
+    scanButton.id = "match-scan";
+    scanButton.disabled = !info || m.scanStarting || isMatchActive(m.snapshot);
+    const cancelButton = button("Cancel operation", async () => {
+        const snapshot = m.snapshot;
+        m.cancellingId = snapshot.id;
+        updateMatchControls();
+        try {
+            message("");
+            const result = await api("/api/match/cancel", {id: snapshot.id});
+            if (m.snapshot === snapshot) m.snapshot = result;
+        }
         catch (error) { message(errorText(error), true); }
-    }));
+        finally {
+            m.cancellingId = null;
+            updateMatchStatus();
+            pollMatch();
+        }
+    });
+    cancelButton.id = "match-cancel";
+    cancelButton.disabled = !canCancelMatch(m);
+    controls.append(scanButton, cancelButton);
     if (state.project && (dirty().length || (state.installStatus && state.installStatus.status !== "up_to_date"))) {
         controls.append(button("Save & install active AI", () => saveAndInstall({thenTest: false}), "button primary"));
     }
@@ -2256,7 +2282,7 @@ function matchView(target) {
     const scanProgress = element("progress", "scan-progress");
     scanProgress.id = "scan-progress";
     scanProgress.setAttribute("aria-label", "Scanning installed content");
-    scanProgress.hidden = !isScanActive(m.snapshot);
+    setScanProgress(scanProgress, m.snapshot);
     panel.append(statusBox, scanProgress);
     if (m.cached) panel.append(notice("Showing saved scan results from a previous run. Refresh after changing the selected engine or installing, removing, or updating games, maps, or AIs."));
     if (m.snapshot?.error) panel.append(notice(m.snapshot.error, true));
@@ -2490,7 +2516,7 @@ function matchView(target) {
                     }
                     m.snapshot = await api("/api/match/start", body);
                     m.statusError = "";
-                    render(); pollMatch();
+                    render(); pollMatch(true);
                 } catch (error) { message(errorText(error), true); }
             }, "button primary"));
             const activity = element("span", "match-activity");
@@ -2549,18 +2575,41 @@ function matchActivity(snapshot, error) {
     if (engine.state !== "running") return `${stage}: engine status unavailable`;
     return `${stage}: ${snapshot.state === "cancelling" ? "stopping" : "running"} · ${elapsed}`;
 }
+function isMatchActive(snapshot) {
+    return ["running", "cancelling"].includes(snapshot?.state);
+}
 function isScanActive(snapshot) {
-    return snapshot?.operation === "scan" && ["running", "cancelling"].includes(snapshot.state);
+    return snapshot?.operation === "scan" && isMatchActive(snapshot);
+}
+function canCancelMatch(match) {
+    return !!match.snapshot?.id && match.snapshot.state === "running" && !match.cancellingId;
+}
+function updateMatchControls() {
+    const m = state.match, start = $("match-scan"), cancel = $("match-cancel");
+    if (start) start.disabled = !state.settings || m.scanStarting || isMatchActive(m.snapshot);
+    if (cancel) cancel.disabled = !canCancelMatch(m);
+}
+function setScanProgress(node, snapshot) {
+    node.hidden = !isScanActive(snapshot);
+    const progress = snapshot?.scan_progress;
+    if (progress?.total > 0) {
+        node.max = progress.total;
+        node.value = progress.checked;
+    } else {
+        node.removeAttribute("value");
+    }
 }
 function matchStatusText(snapshot, error, cacheError = "") {
     if (error) return "Status unavailable: " + error + ". Retrying…";
     if (cacheError) return "Saved scan results unavailable: " + cacheError + ". Scan installed content to refresh.";
-    if (!snapshot) return "No scan or match started.";
+    if (!snapshot || snapshot.state === "idle") return "No scan or match started.";
     const status = `${snapshot.state}: ${snapshot.message || ""}`;
     if (!isScanActive(snapshot)) return status;
     const seconds = Math.floor(snapshot.elapsed_seconds || 0);
     const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
-    return `${status} · elapsed ${elapsed} · estimated total ~3 min`;
+    const progress = snapshot.scan_progress;
+    const maps = progress && snapshot.state === "running" ? ` · ${progress.checked}/${progress.total} maps checked` : "";
+    return `${status}${maps} · elapsed ${elapsed}`;
 }
 function setMatchActivity(node, snapshot, error) {
     node.textContent = matchActivity(snapshot, error);
@@ -2570,33 +2619,50 @@ function setMatchActivity(node, snapshot, error) {
 function updateMatchStatus() {
     const m = state.match, statusBox = $("match-status"), scanProgress = $("scan-progress"), activity = $("match-activity");
     if (statusBox) statusBox.textContent = matchStatusText(m.snapshot, m.statusError, m.cacheError);
-    if (scanProgress) scanProgress.hidden = !isScanActive(m.snapshot);
+    if (scanProgress) setScanProgress(scanProgress, m.snapshot);
+    updateMatchControls();
     if (activity) setMatchActivity(activity, m.snapshot, m.statusError);
     setMatchLogActions($("match-log-actions"), m.snapshot);
     renderSeriesScoreboard($("series-scoreboard"), m.snapshot?.series || m.snapshot?.result?.series);
     updateExperimentStatus();
 }
 let matchPoll = null;
-async function pollMatch() {
-    if (matchPoll) return;
-    matchPoll = true;
+async function pollMatch(restart = false) {
+    if (matchPoll && !restart) return;
+    const poll = {};
+    matchPoll = poll;
     try {
-        for (;;) {
+        while (matchPoll === poll) {
             let snapshot;
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 5000);
             try {
                 snapshot = await api("/api/match/status", undefined, controller.signal);
+                if (matchPoll !== poll) return;
                 state.match.statusError = "";
             } catch (error) {
+                if (matchPoll !== poll) return;
                 state.match.statusError = error.name === "AbortError" ? "request timed out" : errorText(error);
                 updateMatchStatus();
                 await new Promise(resolve => setTimeout(resolve, 1500));
                 continue;
             } finally { clearTimeout(timeout); }
+            if (snapshot.state === "idle" && state.match.cached) {
+                updateMatchStatus();
+                return;
+            }
+            const foundActiveScan = isScanActive(snapshot) && state.match.snapshot?.id !== snapshot.id;
+            if (foundActiveScan) {
+                state.match.content = null;
+                state.match.cached = false;
+                state.match.cacheError = "";
+                state.match.cacheKey = "";
+                state.match.scanSettingsKey = "";
+            }
             state.match.snapshot = snapshot;
-            updateMatchStatus();
-            if (!["running", "cancelling"].includes(snapshot.state)) {
+            if (foundActiveScan && state.page === "match") render();
+            else updateMatchStatus();
+            if (!isMatchActive(snapshot)) {
                 if (snapshot.operation === "scan") {
                     if (snapshot.state === "completed" &&
                         state.match.scanSettingsKey === matchSettingsKey(state.settings)) {
@@ -2605,7 +2671,7 @@ async function pollMatch() {
                         state.match.cacheError = "";
                         state.match.cacheKey = state.match.scanSettingsKey;
                     } else {
-                        if (state.match.scanSettingsKey === matchSettingsKey(state.settings)) state.match.cacheKey = "";
+                        state.match.cacheKey = "";
                         await loadCachedMatchContent();
                     }
                 } else if (snapshot.operation === "match") {
@@ -2613,18 +2679,20 @@ async function pollMatch() {
                 } else if (snapshot.operation === "experiment") {
                     await loadExperimentHistory();
                 }
-                if (state.page === "match") render();
-                if (state.page === "experiments") render();
+                if (matchPoll === poll && ["match", "experiments"].includes(state.page)) render();
                 break;
             }
             await new Promise(resolve => setTimeout(resolve, 1500));
         }
-    } finally { matchPoll = null; }
+    } finally { if (matchPoll === poll) matchPoll = null; }
 }
 function navigate(page) {
     state.page = page;
     render();
-    if (page === "match") loadMatchHistory();
+    if (page === "match") {
+        loadMatchHistory();
+        pollMatch();
+    }
     if (page === "experiments") loadExperimentHistory(true);
 }
 function render() {

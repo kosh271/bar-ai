@@ -128,9 +128,24 @@ def _copy_archive_cache(source: Path, destination: Path, *, atomic: bool = False
 
 def scan_content(
     engine: Path, data: Path, write: Path, stop: threading.Event, *, archive_cache: Path | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict:
     command = [sys.executable, "-m", "app.content_scan", str(engine), str(data), str(write), str(write / "content.json")]
-    return _content_query(command, write, "content.json", stop, archive_cache, "Content scan", _content_valid)
+    progress_path = write / "scan-progress.txt"
+
+    def update_progress() -> None:
+        try:
+            text = progress_path.read_text(encoding="ascii")
+            if not text.endswith("\n"):
+                return  # The child may be updating the file.
+            checked, total = map(int, text.split())
+        except (OSError, ValueError):
+            return
+        if progress is not None and 0 <= checked <= total:
+            progress(checked, total)
+
+    return _content_query(command, write, "content.json", stop, archive_cache, "Content scan", _content_valid,
+                          poll_progress=update_progress if progress is not None else None)
 
 
 def scan_units(
@@ -144,7 +159,7 @@ def scan_units(
 
 def _content_query(
     command: list[str], write: Path, filename: str, stop: threading.Event, archive_cache: Path | None,
-    label: str, valid: Callable[[object], bool],
+    label: str, valid: Callable[[object], bool], *, poll_progress: Callable[[], None] | None = None,
 ) -> dict:
     if archive_cache is not None:
         _copy_archive_cache(archive_cache, write / "cache")
@@ -160,6 +175,8 @@ def _content_query(
             while process.poll() is None:
                 if stop.wait(0.25):
                     raise MatchError(f"{label} cancelled.")
+                if poll_progress is not None:
+                    poll_progress()
                 if time.monotonic() - started > 600:
                     raise MatchError(f"{label} timed out after 10 minutes.")
             code = process.wait()
