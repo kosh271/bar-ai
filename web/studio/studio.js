@@ -261,14 +261,14 @@ function layerControl(page, selected) {
     return wrapper;
 }
 function layerPreview(initial, placement = false) {
-    const files = state.files.filter(file => /^config\/[^/]+\.json$/.test(file.path.replace(/\\/g, "/")));
+    const files = state.files.filter(file => /^config\/.+\.json$/i.test(file.path.replace(/\\/g, "/")));
     const order = [initial.path], box = element("div"), content = element("div");
     box.append(element("p", "muted", placement
         ? "Read-only preview of settings files combined in the order shown. Later files can replace earlier values. Unsaved edits are included."
         : "A read-only what-if preview. Add files in the exact order your script loads them; later files can override earlier ones. This includes unsaved edits."),
         notice(placement
             ? "This preview does not run the game startup rules. The game may load other files or choose different settings, so check the result in a game."
-            : "The script is not interpreted. Game options, game-side files, fallback files and your selected DLL may change what actually loads. Verify the order against init.as and test in the engine.", true), content);
+            : "Presets use static loads found in init.as. Game-side files, fallback files, and the active DLL can change what loads in the engine.", true), content);
     const name = initial.path.split("/").pop();
     const family = Object.values(groups).flat().map(item => item.replace(/(_leg|_scav_units|_extra_units)?\.json$/, ""))
         .filter(item => name === item + ".json" || name.startsWith(item + "_"))
@@ -277,7 +277,36 @@ function layerPreview(initial, placement = false) {
     const base = files.find(file => file.path === stem + ".json");
     const variants = files.filter(file => file.path.startsWith(stem + "_"))
         .map(file => [file.path.split("/").pop(), file.path]);
-    if (base && variants.length) {
+    const {presets, warnings} = S.layerPresets(state.files);
+    const scopedPresets = new Map(), filesByPath = new Map(files.map(file => [file.path.replace(/\\/g, "/"), file.path]));
+    const families = new Set(Object.values(groups).flat().map(item => item.replace(/(_leg|_scav_units|_extra_units)?\.json$/, "")));
+    for (const preset of presets) {
+        const custom = preset.name.startsWith("Detected custom branch:");
+        const scoped = preset.order.filter(path => {
+            if (path === stem + ".json" || path.startsWith(stem + "_")) return true;
+            return custom && ![...families].some(family => path === "config/" + family + ".json" || path.startsWith("config/" + family + "_"));
+        }).map(path => filesByPath.get(path));
+        const key = JSON.stringify(scoped);
+        if (scoped.length && !scopedPresets.has(key)) scopedPresets.set(key, {name: preset.name, order: scoped});
+    }
+    if (scopedPresets.size) {
+        const suggested = element("div", "layer-example"), actions = element("div", "row");
+        suggested.append(element("h3", "", "Presets from init.as"), actions);
+        for (const preset of scopedPresets.values()) actions.append(button(preset.name, () => {
+            order.splice(0, order.length, ...preset.order);
+            draw();
+        }));
+        box.insertBefore(suggested, content);
+    }
+    if (warnings.length) {
+        const details = element("details", "notice warning");
+        details.append(element("summary", "", `${warnings.length} startup ${warnings.length === 1 ? "warning" : "warnings"}`));
+        for (const item of warnings) {
+            details.append(element("p", "", `${item.path}:${item.line} · ${item.message}`));
+        }
+        box.insertBefore(details, content);
+    }
+    if (!scopedPresets.size && base && variants.length) {
         const example = element("div", "layer-example"), options = element("div", "row");
         example.append(element("h3", "", "Quick example"),
         element("p", "muted", placement
