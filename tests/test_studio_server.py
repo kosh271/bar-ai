@@ -102,6 +102,21 @@ class StudioServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
 
+    @unittest.skipUnless(shutil.which("git"), "Git is required for project history")
+    def test_checkpoint_diff_endpoint_auth_and_revision_validation(self):
+        endpoint = "/api/history/diff"
+        body = {"project": "ExampleAI"}
+        self.assertEqual(self._request(endpoint, method="POST", body=body, token=False)[0], 401)
+        self.assertEqual(self._request(endpoint, method="POST", body=body)[0], 400)
+        self._request("/api/state")
+        profile = self.projects / "ExampleAI" / "profiles" / "hard"
+        (profile / "script" / "init.as").write_text("updated content", encoding="utf-8")
+        status, diff, _ = self._request(endpoint, method="POST", body=body)
+        self.assertEqual(status, 200)
+        self.assertEqual(diff["paths"], ["profiles/hard/script/init.as"])
+        self.assertIn("+updated content", diff["patch"])
+        self.assertEqual(self._request(endpoint, method="POST", body={**body, "commit": "HEAD"})[0], 400)
+
     @unittest.skipUnless(shutil.which("git"), "Git is required for project import")
     def test_project_mutations_and_zip_round_trip(self):
         def manage(action, **payload):

@@ -140,13 +140,32 @@ async function refreshState(project = state.project, profile = state.profile) {
     selectOptions($("profile"), (projectInfo?.profiles || []).map(p => [p.key, p.name]), state.profile);
     $("clone").disabled = !state.profile;
 }
+let profileRequest = 0;
 async function loadProfile() {
+    const request = ++profileRequest;
+    const {project, profile} = state;
     state.files = []; state.history = [];
-    if (state.project && state.profile) {
-        const result = await api(`/api/profile?project=${encodeURIComponent(state.project)}&profile=${encodeURIComponent(state.profile)}`);
+    const current = () => request === profileRequest && state.project === project && state.profile === profile;
+    if (project && profile) {
+        const result = await api(`/api/profile?project=${encodeURIComponent(project)}&profile=${encodeURIComponent(profile)}`);
+        if (!current()) return;
         state.files = result.files.map(f => ({...f, original: f.text}));
     }
+    await refreshBaseline();
+    if (!current()) return;
     status(); render();
+}
+async function refreshBaseline() {
+    const {project, profile, files} = state;
+    if (!files.length || selectedProject()?.history_error) return;
+    try {
+        const {paths} = await api("/api/history/diff", {project, names_only: true});
+        const changed = new Set(paths);
+        for (const file of files) file.baselineChanged = changed.has(`profiles/${profile}/${file.path}`);
+    } catch (_) { /* History availability is reported in Project History. */ }
+}
+function baselineLabel(file, label) {
+    return file?.baselineChanged ? label + " · Modified from baseline" : label;
 }
 function header(page) {
     const [title, subtitle] = pages[page], head = element("div", "heading"), left = element("div");
@@ -194,7 +213,7 @@ function layerControl(page, selected) {
     const placement = page === "placement";
     const choices = selected.choices.map(f => [
         f.path,
-        placement ? "Building placement rules" : f.path.split("/").pop()
+        baselineLabel(f, placement ? "Building placement rules" : f.path.split("/").pop())
     ]);
     wrapper.append(dropdown(placement ? "Settings file to edit" : "Configuration layer", choices,
         selected.file.path, value => { state.layer[page] = value; state.factory = ""; state.response = ""; render(); }),
@@ -1062,7 +1081,7 @@ function scriptSettings(panel, path, title, definitions) {
     if (!resolved) return;
     const file = resolved.file;
     section.append(element("h3", "", title), element("p", "muted", "These controls edit uniquely recognized expressions in one script file, independently of the selected configuration layer. Other code may affect the result; runtime behavior is not verified."),
-        element("p", "muted", `Script source: ${file.path}${resolved.chain.length > 1 ? " (forwarded from " + path + "; other scripts may also use this file)" : ""}`));
+        element("p", "muted", baselineLabel(file, `Script source: ${file.path}${resolved.chain.length > 1 ? " (forwarded from " + path + "; other scripts may also use this file)" : ""}`)));
     let matched = 0;
     for (const [label, prefix, suffix, kind, min, max] of definitions) {
         const number = "(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][+-]?\\d+)?[fF]?";
@@ -1151,7 +1170,7 @@ function advanced(target) {
     catalogControls(panel);
     if (!state.files.length) { panel.append(notice("No files in this profile.", true)); target.append(panel); return; }
     if (!state.files.some(f => f.path === state.file)) state.file = state.files[0].path;
-    panel.append(dropdown("Profile file", state.files.map(f => [f.path, f.path]), state.file, value => {state.file = value; render();}));
+    panel.append(dropdown("Profile file", state.files.map(f => [f.path, baselineLabel(f, f.path)]), state.file, value => {state.file = value; render();}));
     const file = find(state.file);
     panel.append(notice("Source editing is an escape hatch for custom behavior. JSON syntax is checked before saving; scripts require an engine smoke test."));
     if (file.path.endsWith(".json")) {
@@ -1403,6 +1422,8 @@ async function save() {
             const snapshot = submitted.find(f => f.path === saved.path);
             if (file && snapshot) { file.original = snapshot.text; file.sha256 = saved.sha256; }
         }
+        await refreshBaseline();
+        render();
         message("Profile changes saved. Install the AI before testing in BAR." +
             (warnings.length ? "\nExisting configuration warnings:\n" + warnings.join("\n") : ""), warnings.length > 0);
     } catch (error) { message("Save failed: " + errorText(error), true); }
@@ -1475,11 +1496,37 @@ async function projectHistory() {
     const project = state.project, profile = state.profile;
     const box = element("div"), feedback = element("p", "muted"), list = element("div");
     const [label, input] = textInput("Checkpoint description", "", "e.g. Adjust swarm production");
+    const diffView = element("div");
+    let diffRequest = 0;
+    async function showDiff(revisions) {
+        const request = ++diffRequest;
+        diffView.replaceChildren(element("p", "muted", "Loading checkpoint diff…"));
+        try {
+            const {paths, patch} = await api("/api/history/diff", {project, ...revisions});
+            if (request !== diffRequest) return;
+            const files = element("ul");
+            for (const path of paths) files.append(element("li", "", path));
+            diffView.replaceChildren(element("h3", "", "Changed files"),
+                paths.length ? files : element("p", "muted", "No differences."),
+                element("pre", "checkpoint-diff", patch));
+        } catch (error) {
+            if (request === diffRequest) diffView.replaceChildren(notice(errorText(error), true));
+        }
+    }
     box.append(element("p", "muted", "History covers the entire AI project, including every profile. Save is separate from creating a checkpoint. History is local and is not a backup."),
-        label, feedback, list);
+        label, feedback, list, diffView);
     showDialog("Project history", box);
     function draw(checkpoints) {
         list.replaceChildren(element("h3", "", "Checkpoints"));
+        const choices = checkpoints.map(checkpoint => [checkpoint.id,
+            `${checkpoint.description} · ${checkpoint.id.slice(0, 12)}`]);
+        let base = checkpoints.at(-1)?.id;
+        let commit = "";
+        const compare = element("div", "row");
+        compare.append(dropdown("From checkpoint", choices, base, value => { base = value; }),
+            dropdown("To", [["", "Current saved files"], ...choices], commit, value => { commit = value; }),
+            button("Compare", () => showDiff({base, ...(commit ? {commit} : {})})));
+        list.append(compare);
         for (const checkpoint of checkpoints) {
             const row = element("div", "chain-card"), details = element("div");
             details.append(element("strong", "", checkpoint.description),
@@ -1501,7 +1548,7 @@ async function projectHistory() {
                     feedback.textContent = (restored ? "Restore succeeded, but reloading failed: " : "Restore failed: ") + errorText(error);
                 } finally { state.saving = false; status(); restore.disabled = false; }
             });
-            row.append(details, restore); list.append(row);
+            row.append(details, button("View diff", () => showDiff({commit: checkpoint.id})), restore); list.append(row);
         }
     }
     const create = button("Create checkpoint", async () => {

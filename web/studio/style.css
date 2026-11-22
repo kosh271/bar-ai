@@ -14,3 +14,4 @@
 .layer-example{border:1px solid var(--line);border-radius:8px;padding:14px;margin:14px 0}.option-check{display:flex;align-items:center;gap:7px;margin-bottom:12px}
 .match-activity{color:var(--mint);font-size:12px;align-self:center}.match-activity.error{color:#f2d3ae}
 .scan-progress{display:block;width:100%;height:8px;margin:12px 0;accent-color:var(--orange)}.scan-progress[hidden]{display:none}
+.checkpoint-diff { max-height: 55vh; overflow: auto; white-space: pre; }

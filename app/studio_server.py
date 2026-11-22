@@ -276,6 +276,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/client/heartbeat", "/api/client/close",
             "/api/save", "/api/clone", "/api/clone-project", "/api/sources",
             "/api/create-project", "/api/inspect", "/api/history", "/api/history/checkpoint", "/api/history/restore",
+            "/api/history/diff",
             "/api/project/manage", "/api/project/import",
             "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
@@ -320,6 +321,19 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/project/manage":
                 with self.server.write_lock:
                     return self._json(200, self._manage_project(payload))
+            if parsed.path == "/api/history/diff":
+                self._require_fields(payload, ("project",))
+                names_only = payload.get("names_only", False)
+                if type(names_only) is not bool:
+                    raise ValueError("names_only must be a boolean.")
+                with self.server.write_lock:
+                    project = self._project(self._string(payload["project"], "project"))
+                    return self._json(200, project_history.diff(
+                        project,
+                        base=self._string(payload["base"], "base") if "base" in payload else "",
+                        commit=self._string(payload["commit"], "commit") if "commit" in payload else "",
+                        names_only=names_only,
+                    ))
             if parsed.path in {"/api/history", "/api/history/checkpoint", "/api/history/restore"}:
                 self._require_fields(payload, ("project",))
                 with self.server.write_lock:
