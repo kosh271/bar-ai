@@ -179,8 +179,9 @@ window.StudioConfig = (() => {
                 if (clean.slice(list.start, list.end) !== text.slice(list.start, list.end)) {
                     throw Error("Cannot remove entries from a list containing comments; use All files");
                 }
-                const values = list.children.filter((_, i) => i !== index).map(e => e.node.value);
-                changes.push({start: list.start, end: list.end, text: JSON.stringify(values)});
+                const values = list.children.filter((_, i) => i !== index)
+                    .map(({node}) => text.slice(node.start, node.end));
+                changes.push({start: list.start, end: list.end, text: `[${values.join(",")}]`});
             }
         }
         return patch(text, changes);

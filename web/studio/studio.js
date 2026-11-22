@@ -369,14 +369,15 @@ function previewNode(node, title, path) {
     const value = element("pre", "preview-value", JSON.stringify(node.value));
     row.append(label, value); return row;
 }
-function fieldInput(file, node, aria, callback) {
+function fieldInput(file, node, aria, callback, {preserveNumberText = false} = {}) {
     const input = element("input");
     input.setAttribute("aria-label", aria);
+    const rawNumber = current => preserveNumberText ? file.text.slice(current.start, current.end) : current.value;
     if (node.kind === "boolean") { input.type = "checkbox"; input.checked = node.value; }
     else {
         input.type = node.kind === "number" ? "number" : "text";
         if (node.kind === "number") input.step = "any";
-        input.value = node.value;
+        input.value = node.kind === "number" ? rawNumber(node) : node.value;
     }
     input.addEventListener("change", () => {
         try {
@@ -387,14 +388,18 @@ function fieldInput(file, node, aria, callback) {
                 value = Number(input.value);
             } else value = input.value;
             const current = C.at(parse(file), node.path);
-            assign(file, C.scalar(file.text, current, value));
+            const validJsonNumber = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+            const text = preserveNumberText && validJsonNumber.test(input.value)
+                ? C.patch(file.text, [{start: current.start, end: current.end, text: input.value}])
+                : C.scalar(file.text, current, value);
+            assign(file, text);
             message("");
             if (callback) callback(value);
         } catch (error) {
             message(errorText(error), true);
             const current = C.at(parse(file), node.path);
             if (node.kind === "boolean") input.checked = current.value;
-            else input.value = current.value;
+            else input.value = current.kind === "number" ? rawNumber(current) : current.value;
         }
     });
     return input;
@@ -639,7 +644,7 @@ function catalogDialog() {
 function production(target, selected) {
     const file = selected.file, root = parse(file), factories = C.at(root, ["factory"]);
     const panel = element("div", "panel"); panel.append(layerControl("production", selected));
-    panel.append(notice("This is one source layer, not a merged effective view. Later enabled layers can override values. Weights are relative, not guaranteed percentages."));
+    panel.append(notice("Each percentage shows its share of positive weights in this tier. Later layers and runtime rules can change the effective selection."));
     catalogControls(panel);
     if (!factories || factories.kind !== "object" || !factories.children.length) {
         panel.append(notice("No factory definitions in this layer.", true)); target.append(panel); return;
@@ -674,6 +679,11 @@ function production(target, selected) {
         target.append(panel); return;
     }
     const wrap = element("div", "table-wrap"), table = element("table"), head = element("tr");
+    const weightColumns = tiers.map(() => []);
+    function refreshShares(column) {
+        const shares = window.StudioEditors.weightShares(column.map(({input}) => input.valueAsNumber));
+        column.forEach(({hint}, index) => { hint.textContent = window.StudioEditors.weightPercent(shares[index]); });
+    }
     head.append(element("th", "", "Unit ID"));
     for (const tier of tiers) head.append(element("th", "", `Tier ${tier.key.slice(4)}`));
     head.append(element("th", "", "")); table.append(head);
@@ -688,11 +698,21 @@ function production(target, selected) {
             name.append(element("div", "unit-sub", "Not listed in this factory's catalog options"));
         }
         tr.append(name);
-        for (const tier of tiers) {
+        tiers.forEach((tier, index) => {
             const td = element("td"), entry = tier.node.children[i].node;
-            td.append(entry.kind === "number" ? fieldInput(file, entry, `${unit.node.value} ${tier.key} weight`) : element("span", "muted", "Unsupported"));
+            if (entry.kind === "number") {
+                const weight = element("div", "weight"), hint = element("span", "weight-share");
+                hint.id = `production-share-${index}-${i}`;
+                const input = fieldInput(file, entry, `${unit.node.value} ${tier.key} weight`, null, {preserveNumberText: true});
+                input.setAttribute("aria-describedby", hint.id);
+                const column = weightColumns[index];
+                column.push({input, hint});
+                input.addEventListener("input", () => refreshShares(column));
+                input.addEventListener("change", () => refreshShares(column));
+                weight.append(input, hint); td.append(weight);
+            } else td.append(element("span", "muted", "Unsupported"));
             tr.append(td);
-        }
+        });
         const td = element("td");
         td.append(button("Remove", () => {
             if (!confirm(`Remove ${unit.node.value} from this factory and every tier in this file?`)) return;
@@ -701,6 +721,7 @@ function production(target, selected) {
         }));
         tr.append(td); table.append(tr);
     });
+    weightColumns.forEach(refreshShares);
     wrap.append(table); panel.append(wrap);
     const factoryEntry = catalogUnit(state.factory);
     if (state.catalog && !factoryEntry) panel.append(notice("This factory was not found in the catalog; its build options are unknown.", true));

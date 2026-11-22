@@ -8,6 +8,19 @@ require("../web/studio/config.js");
 require("../web/studio/editors.js");
 const editors = window.StudioEditors;
 
+test("relative shares handle decimals, invalid weights and totals larger than a finite number", () => {
+    assert.deepEqual(editors.weightShares([0.25, 0.75, -4, Infinity, NaN]), [25, 75, 0, 0, 0]);
+    assert.deepEqual(editors.weightShares([0, -2, NaN]), [0, 0, 0]);
+    assert.deepEqual(editors.weightShares([1e308, 1e308]), [50, 50]);
+});
+
+test("production row changes retain the exact spelling of existing weights", () => {
+    const text = '{"factory":{"armfac":{"unit":["armone"],"land":{"tier1":[1.2500]}}}}';
+    const added = window.StudioConfig.changeFactoryUnit(text, "armfac", "armtwo", null);
+    assert.match(added, /\[1\.2500,\s*0\]/);
+    assert.match(window.StudioConfig.changeFactoryUnit(added, "armfac", "", 1), /\[1\.2500\]/);
+});
+
 test("profile comparison distinguishes semantic edits from JSONC formatting and lists file changes", () => {
     const oldFiles = [
         {path: "same.json", text: '{"a":0, "b":[1.0,2,],}'},

@@ -1,6 +1,20 @@
 "use strict";
 
 window.StudioEditors = (() => {
+    function weightShares(weights) {
+        const positive = weights.map(weight => Number.isFinite(weight) && weight > 0 ? weight : 0);
+        const total = positive.reduce((sum, weight) => sum + weight, 0);
+        if (!total) return positive;
+        if (Number.isFinite(total)) return positive.map(weight => weight / total * 100);
+        const largest = positive.reduce((max, weight) => Math.max(max, weight), 0);
+        return weightShares(positive.map(weight => weight / largest));
+    }
+
+    const percent = new Intl.NumberFormat(undefined, {style: "percent", maximumFractionDigits: 1});
+    function weightPercent(share) {
+        return percent.format(share / 100);
+    }
+
     function compareFiles(before, after) {
         const left = new Map(before.map(file => [file.path, file.text]));
         const right = new Map(after.map(file => [file.path, file.text]));
@@ -106,5 +120,5 @@ window.StudioEditors = (() => {
         return visible;
     }
 
-    return {compareFiles, lineDiff};
+    return {weightShares, weightPercent, compareFiles, lineDiff};
 })();
