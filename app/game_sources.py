@@ -44,10 +44,9 @@ def _last_game(data: Path) -> str | None:
     return latest
 
 
-def list_game_sources(data: Path, unpacked: Path | None) -> tuple[list[GameSource], GameSource | None]:
+def list_package_sources(data: Path, indices: tuple[Path, ...]) -> list[GameSource]:
     sources: list[GameSource] = []
     seen: set[tuple[str, str]] = set()
-    indices = sorted((data / "rapid").glob("*/byar/versions.gz"))
     try:
         for index in indices:
             with gzip.open(index, "rt", encoding="utf-8") as file:
@@ -73,6 +72,11 @@ def list_game_sources(data: Path, unpacked: Path | None) -> tuple[list[GameSourc
         1 if source.tag == "byar:stable" else 2,
         source.label.casefold(),
     ))
+    return sources
+
+
+def list_game_sources(data: Path, unpacked: Path | None) -> tuple[list[GameSource], GameSource | None]:
+    sources = list_package_sources(data, tuple(sorted((data / "rapid").glob("*/byar/versions.gz"))))
     if unpacked is not None:
         sources.append(GameSource("Unpacked BAR.sdd (version may differ)", "", data, unpacked=unpacked))
 

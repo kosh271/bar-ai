@@ -230,13 +230,17 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._handle_error(error)
             if parsed.path == "/api/unit-icons" and not parsed.query:
                 try:
-                    return self._json(200, unit_icons.icon_status(load_settings(self.server.settings_path)))
+                    return self._json(200, unit_icons.icon_status(
+                        load_settings(self.server.settings_path), catalog_game=self._unit_icon_catalog_game(),
+                    ))
                 except Exception as error:
                     return self._handle_error(error)
             if parsed.path.startswith("/api/unit-icon/") and not parsed.query:
                 try:
                     unit_id = parsed.path.removeprefix("/api/unit-icon/")
-                    image = unit_icons.read_icon(load_settings(self.server.settings_path), unit_id)
+                    image = unit_icons.read_icon(
+                        load_settings(self.server.settings_path), unit_id, catalog_game=self._unit_icon_catalog_game(),
+                    )
                     if image is None:
                         return self._error(404, "Unit icon not found.")
                     return self._send(200, image, "image/png")
@@ -1010,6 +1014,13 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             return {"confirmation": challenge.message}
         return {"path": str(target), "project": project_dir.name, "engine": engine}
 
+    def _unit_icon_catalog_game(self) -> str:
+        try:
+            catalog = self.server.match_service.latest_catalog()
+        except (MatchError, installation.InstallationError):
+            return ""
+        return catalog["game"] if catalog else ""
+
     def _save_settings(self, payload: dict[str, Any]) -> dict[str, str]:
         self._require_fields(payload, ("bar_root", "engine"))
         bar_root = self._string(payload["bar_root"], "bar_root")
@@ -1022,6 +1033,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("Selected engine is not ready: " + "; ".join(missing))
         saved = Settings(str(found.root), engine)
         save_settings(self.server.settings_path, saved)
+        unit_icons.clear_icon_cache()
         return {"bar_root": saved.bar_root, "engine": saved.engine}
 
     @staticmethod

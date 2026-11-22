@@ -702,13 +702,14 @@ async function loadIconStatus() {
     for (const promise of state.icons.cache.values()) {
         promise.then(url => { if (url) URL.revokeObjectURL(url); });
     }
-    state.icons = {available: false, message: "", cache: new Map()};
+    const icons = {available: false, message: "", cache: new Map()};
+    state.icons = icons;
     try {
         const result = await api("/api/unit-icons");
-        state.icons.available = result.available;
-        state.icons.message = result.message;
+        icons.available = result.available;
+        icons.message = result.message;
     } catch (error) {
-        state.icons.message = "Could not load unit icons: " + errorText(error);
+        icons.message = "Could not load unit icons: " + errorText(error);
     }
 }
 function unitIcon(id) {
@@ -798,6 +799,7 @@ function catalogDialog() {
                         }
                         const catalog = snapshot.result.catalog;
                         setCatalog(catalog);
+                        await loadIconStatus();
                         render();
                         feedback.textContent = `Loaded ${catalog.units.length} units. ${catalog.warnings.length} warning(s).`;
                         use.disabled = false; break;
