@@ -6,7 +6,7 @@ const S = window.StudioScripts;
 const state = {
     projects: [], project: "", profile: "", files: [], page: "overview",
     layer: {}, factory: "", situation: "land", response: "", file: "",
-    settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), icons: {available: false, message: "", cache: new Map()}, saving: false, history: [],
+    settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), icons: {available: false, message: "", cache: new Map()}, saving: false, history: [], installStatus: null,
     match: {
         content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "",
         first: "", second: "", faction1: "Armada", faction2: "Cortex",
@@ -66,10 +66,30 @@ async function api(url, data, signal) {
 }
 function selectedProject() { return state.projects.find(p => p.key === state.project); }
 function dirty() { return state.files.filter(f => f.text !== f.original); }
+function installBadgeInfo() {
+    if (!state.project || !state.profile) return {hidden: true, text: "", cls: "install-badge"};
+    if (dirty().length) return {hidden: false, text: "Unsaved edits", cls: "install-badge warn"};
+    const statusName = state.installStatus?.status;
+    if (statusName === "up_to_date") return {hidden: false, text: "Installed · Up to date", cls: "install-badge ok"};
+    if (statusName === "out_of_date") return {hidden: false, text: "Out of date · Saved changes not installed", cls: "install-badge warn"};
+    if (statusName === "modified_externally") return {hidden: false, text: "Modified externally", cls: "install-badge error"};
+    if (statusName === "not_installed") return {hidden: false, text: "Not installed", cls: "install-badge neutral"};
+    if (statusName === "not_configured") return {hidden: false, text: "Not configured", cls: "install-badge neutral"};
+    return {hidden: true, text: "", cls: "install-badge"};
+}
 function status() {
     const count = dirty().length;
     $("save-status").textContent = !state.profile ? "No profile loaded" : count ? `${count} unsaved ${count === 1 ? "file" : "files"}` : "All changes saved";
+    const badge = $("install-status");
+    if (badge) {
+        const info = installBadgeInfo();
+        badge.hidden = info.hidden;
+        badge.className = info.cls;
+        badge.textContent = info.text;
+        badge.title = state.installStatus?.message || "";
+    }
     $("save").disabled = !count || state.saving;
+    if ($("save-install")) $("save-install").disabled = state.saving || !state.project;
     $("undo").disabled = !state.history.length;
     $("project").disabled = state.saving;
     $("profile").disabled = state.saving;
@@ -132,6 +152,17 @@ async function loadCachedMatchContent() {
         if (matchSettingsKey(state.settings) === key) state.match.cacheError = errorText(error);
     }
 }
+async function loadInstallStatus() {
+    const project = state.project;
+    if (!project) { state.installStatus = null; status(); return; }
+    try {
+        const result = await api(`/api/install-status?project=${encodeURIComponent(project)}`);
+        if (state.project === project) state.installStatus = result;
+    } catch (_) {
+        if (state.project === project) state.installStatus = null;
+    }
+    status();
+}
 async function refreshState(project = state.project, profile = state.profile) {
     const data = await api("/api/state");
     state.projects = data.projects; setSettings(data.settings);
@@ -145,6 +176,7 @@ async function refreshState(project = state.project, profile = state.profile) {
     selectOptions($("project"), state.projects.map(p => [p.key, p.name]), state.project);
     selectOptions($("profile"), (projectInfo?.profiles || []).map(p => [p.key, p.name]), state.profile);
     $("clone").disabled = !state.profile;
+    await loadInstallStatus();
 }
 let profileRequest = 0;
 async function loadProfile() {
@@ -416,7 +448,12 @@ function overview(target) {
         element("h2", "", `${selectedProject()?.name || "No project"} / ${state.profile || "No profile"}`),
         element("p", "muted", "Start with a working profile, make one change, then save and test it in BAR."));
     const actions = element("div", "row");
-    actions.append(button("Create AI from this project", cloneProject), button("AI install & remove", () => navigate("manage")), button("Test match", () => navigate("match")));
+    actions.append(
+        button("Save, install & test", () => saveAndInstall({thenTest: true}), "button primary"),
+        button("Create AI from this project", cloneProject),
+        button("AI install & remove", () => navigate("manage")),
+        button("Test match", () => navigate("match"))
+    );
     info.append(actions);
     if (selectedProject()?.history_error) info.append(notice("Project history unavailable: " + selectedProject().history_error, true));
     info.append(notice("Compatibility is not verified against the selected DLL. Settings and scripts can behave differently between AI versions."));
@@ -1416,6 +1453,9 @@ function matchView(target) {
         try { m.snapshot = await api("/api/match/cancel", {}); render(); }
         catch (error) { message(errorText(error), true); }
     }));
+    if (state.project && (dirty().length || (state.installStatus && state.installStatus.status !== "up_to_date"))) {
+        controls.append(button("Save & install active AI", () => saveAndInstall({thenTest: false}), "button primary"));
+    }
     panel.append(controls);
     const statusBox = element("div", "notice");
     statusBox.id = "match-status";
@@ -1799,6 +1839,7 @@ async function save() {
             if (file && snapshot) { file.original = snapshot.text; file.sha256 = saved.sha256; }
         }
         await refreshBaseline();
+        await loadInstallStatus();
         render();
         message("Profile changes saved. Install the AI before testing in BAR." +
             (warnings.length ? "\nExisting configuration warnings:\n" + warnings.join("\n") : ""), warnings.length > 0);
@@ -1845,6 +1886,62 @@ function validateConfig(file) {
         }
     }
     return issues;
+}
+async function installActiveProject() {
+    if (!state.project) throw Error("Select an AI project first.");
+    if (!state.settings) throw Error("Inspect and save a BAR installation selection first.");
+    if (dirty().length) throw Error("Save or discard profile changes before installing.");
+    const confirmations = [];
+    let result;
+    for (;;) {
+        result = await api("/api/install", {
+            project: state.project,
+            bar_root: state.settings.bar_root,
+            engine: state.settings.engine,
+            confirmations
+        });
+        if (!result.confirmation) break;
+        if (confirmations.includes(result.confirmation)) throw Error("The requested confirmation was not accepted.");
+        if (!confirm(result.confirmation)) return {cancelled: true};
+        confirmations.push(result.confirmation);
+    }
+    if (result.cache_updated) {
+        state.match.cacheKey = "";
+        await loadCachedMatchContent();
+    }
+    await loadInstallStatus();
+    return {cancelled: false, result};
+}
+async function saveAndInstall({thenTest = false} = {}) {
+    if (state.saving) return;
+    try {
+        if (dirty().length) {
+            await save();
+            if (dirty().length) return;
+        }
+        if (!state.settings) {
+            message("Configure a BAR installation and engine before installing.", true);
+            navigate("manage");
+            return;
+        }
+        state.saving = true; status();
+        const title = selectedProject()?.name || state.project;
+        const outcome = await installActiveProject();
+        if (outcome.cancelled) {
+            message("Installation cancelled. No changes were made.");
+            return;
+        }
+        const msg = outcome.result.changed
+            ? `${title} saved and installed.${outcome.result.cache_updated ? " Test Match profiles updated." : ""}`
+            : `${title} is already installed and up to date.`;
+        message(msg);
+        if (thenTest) navigate("match");
+        else if (["match", "overview", "manage"].includes(state.page)) render();
+    } catch (error) {
+        message("Save & install failed: " + errorText(error), true);
+    } finally {
+        state.saving = false; status();
+    }
 }
 function review() {
     const box = element("div");
@@ -2146,6 +2243,7 @@ function manageAIs(target) {
             setSettings(saved);
             await loadIconStatus();
             await loadCachedMatchContent();
+            await loadInstallStatus();
             render();
         } catch (error) {
             feedback.textContent = errorText(error);
@@ -2247,6 +2345,11 @@ async function manageSelectedAI(remove, feedback, installButton, removeButton) {
             }
             confirmations.push(result.confirmation);
         }
+        if (result?.cache_updated) {
+            state.match.cacheKey = "";
+            await loadCachedMatchContent();
+        }
+        await loadInstallStatus();
         const success = remove
             ? `${title} removed successfully. Restart BAR to refresh the AI list.`
             : result.changed
@@ -2270,6 +2373,7 @@ $("reload").addEventListener("click", async () => {
     catch (error) { message("Reload failed: " + errorText(error), true); }
 });
 $("save").addEventListener("click", save);
+if ($("save-install")) $("save-install").addEventListener("click", () => saveAndInstall());
 $("undo").addEventListener("click", () => {
     const previous = state.history.pop();
     const file = previous && find(previous.path);

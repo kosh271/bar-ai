@@ -363,6 +363,44 @@ class MatchService:
         installation._check_links(self.root, path)
         return settings.load_content_cache(path, data, engine)
 
+    def sync_installed_ai(
+        self, bar_root: str | Path, engine: str, short_name: str,
+        version: str, display_name: str, profiles: list[dict[str, str]],
+    ) -> bool:
+        """Update cached AI display name and profiles after an installation without full rescan."""
+        if not isinstance(bar_root, (str, Path)) or not str(bar_root).strip():
+            raise headless.MatchError("BAR root is required.")
+        if not isinstance(engine, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", engine) or engine in (".", ".."):
+            raise headless.MatchError("Invalid engine folder.")
+        root = Path(bar_root).expanduser().resolve()
+        data = root / "data"
+        cache_path = self._content_cache_path(data, engine)
+        installation._check_links(self.root, cache_path)
+        with self._lock:
+            if self._content is not None and self._scan_key == (root, engine):
+                content = copy.deepcopy(self._content)
+            else:
+                content = settings.load_content_cache(cache_path, data, engine)
+            if content is None:
+                return False
+            matches = [
+                ai for ai in content["ais"]
+                if ai["short_name"] == short_name and ai["version"] == version
+            ]
+            if len(matches) != 1:
+                return False
+            matches[0]["name"] = display_name
+            matches[0]["profiles"] = [
+                {"key": str(item["key"]), "name": str(item["name"])}
+                for item in profiles
+            ]
+            if not settings._content_valid(content):
+                raise headless.MatchError("Updated AI profile metadata is invalid.")
+            if self._scan_key == (root, engine) and self._content is not None:
+                self._content = copy.deepcopy(content)
+        settings.save_content_cache(cache_path, data, engine, content)
+        return True
+
     def _save_catalog(self, catalog: dict) -> None:
         path = self.local_data / "latest-catalog.json"
         installation._check_links(self.root, path)

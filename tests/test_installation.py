@@ -8,6 +8,7 @@ from app.installation import (
     LOBBY_FILE,
     InstallationError,
     _lobby_content,
+    inspect_status,
     install,
     remove,
 )
@@ -231,6 +232,49 @@ class InstallationTests(unittest.TestCase):
         (self.target.parent / ".bar-ai-stage-recovery").mkdir()
         with self.assertRaisesRegex(InstallationError, "interrupted"):
             install(self.project, self.data, self.engine, lambda _message: True)
+
+    def test_inspect_status_reports_sync_states_without_mutating_files(self):
+        before = inspect_status(self.project, self.data, self.engine)
+        self.assertEqual(before["status"], "not_installed")
+        self.assertFalse(before["installed"])
+        self.assertFalse(before["managed"])
+        self.assertFalse(self.target.exists())
+
+        install(self.project, self.data, self.engine, lambda _message: True)
+        self.assertEqual(inspect_status(self.project, self.data, self.engine)["status"], "up_to_date")
+
+        main_script = self.project / "profiles" / "hard" / "script" / "main.as"
+        main_script.write_text("edited locally", encoding="utf-8")
+        out_of_date = inspect_status(self.project, self.data, self.engine)
+        self.assertEqual(out_of_date["status"], "out_of_date")
+        self.assertTrue(out_of_date["installed"])
+        self.assertTrue(out_of_date["managed"])
+        self.assertEqual((self.target / "script" / "hard" / "main.as").read_text(encoding="utf-8"), "main")
+
+        install(self.project, self.data, self.engine, lambda _message: True)
+        self.assertEqual(inspect_status(self.project, self.data, self.engine)["status"], "up_to_date")
+
+        clone_profile(self.project, "Rush", "hard")
+        self.assertEqual(inspect_status(self.project, self.data, self.engine)["status"], "out_of_date")
+        install(self.project, self.data, self.engine, lambda _message: True)
+        self.assertEqual(inspect_status(self.project, self.data, self.engine)["status"], "up_to_date")
+
+        self.lobby.unlink()
+        self.assertEqual(inspect_status(self.project, self.data, self.engine)["status"], "out_of_date")
+        install(self.project, self.data, self.engine, lambda _message: True)
+        self.assertEqual(inspect_status(self.project, self.data, self.engine)["status"], "up_to_date")
+
+        (self.target / "script" / "hard" / "main.as").write_text("external edit", encoding="utf-8")
+        modified = inspect_status(self.project, self.data, self.engine)
+        self.assertEqual(modified["status"], "modified_externally")
+        self.assertTrue(modified["installed"])
+        self.assertTrue(modified["managed"])
+
+        (self.target / ".bar-ai-editor.json").unlink()
+        unmanaged = inspect_status(self.project, self.data, self.engine)
+        self.assertEqual(unmanaged["status"], "modified_externally")
+        self.assertTrue(unmanaged["installed"])
+        self.assertFalse(unmanaged["managed"])
 
 
 if __name__ == "__main__":

@@ -650,5 +650,123 @@ class StudioServerTests(unittest.TestCase):
             create.assert_not_called()
 
 
+class StudioInstallSeriesHistoryTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(dir=TEST_DIR)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        stock = self.root / "stock"
+        (stock / "config" / "hard").mkdir(parents=True)
+        (stock / "script" / "hard").mkdir(parents=True)
+        (stock / "config" / "hard" / "settings.json").write_text("{}", encoding="utf-8")
+        (stock / "script" / "hard" / "init.as").write_text("init", encoding="utf-8")
+        (stock / "script" / "hard" / "main.as").write_text("main", encoding="utf-8")
+        self.projects = self.root / "projects"
+        create_project(self.projects, "Example AI", stock)
+        self.settings = self.root / "settings.json"
+        self.studio = self.root / "studio"
+        self.studio.mkdir()
+        (self.studio / "index.html").write_text("editor", encoding="utf-8")
+        self.server = StudioServer(
+            ("127.0.0.1", 0),
+            projects_root=self.projects,
+            settings_path=self.settings,
+            studio_root=self.studio,
+        )
+        self.server.match_service = MatchService(self.root, projects_root=self.projects)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._close_server)
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def _close_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+
+    def _request(self, path, *, method="GET", body=None, token=True):
+        headers = {"X-Workshop-Token": self.server.session_token} if token else {}
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
+        try:
+            response = urllib.request.urlopen(request)
+        except urllib.error.HTTPError as error:
+            response = error
+        return response.status, json.loads(response.read().decode("utf-8"))
+
+    def _setup_bar(self):
+        bar_root = self.root / "bar"
+        data = bar_root / "data"
+        engine = "engine1"
+        stock = data / "engine" / engine / "AI" / "Skirmish" / "BARb" / "stable"
+        stock.mkdir(parents=True)
+        (stock / "AIInfo.lua").write_text(
+            "local infos = {\n"
+            "{ key = 'shortName', value = 'BARb' },\n"
+            "{ key = 'version', value = 'stable' },\n"
+            "{ key = 'name', value = 'BARbarIAn' },\n"
+            "}\nreturn infos\n",
+            encoding="utf-8",
+        )
+        (stock / "AIOptions.lua").write_text(
+            "local options = {\n{key='profile', def='hard'},\n{key='game_config', def=true},\n}\nreturn options\n",
+            encoding="utf-8",
+        )
+        (stock / "SkirmishAI.dll").write_bytes(b"stock")
+        (data / "engine" / engine / "spring-headless.exe").write_bytes(b"engine")
+        (data / "launcher_cfg.json").write_text('{"config":"setup1"}', encoding="utf-8")
+        (data / "config.json").write_text(json.dumps({
+            "setups": [{"package": {"id": "setup1"}, "launch": {"engine": engine}}],
+        }), encoding="utf-8")
+        return bar_root, data, engine
+
+    def test_install_status_endpoint_and_cache_sync_on_install(self):
+        self.assertEqual(self._request("/api/install-status?project=ExampleAI", token=False)[0], 401)
+        status, info = self._request("/api/install-status?project=ExampleAI")
+        self.assertEqual(status, 200)
+        self.assertEqual(info["status"], "not_configured")
+
+        bar_root, data, engine = self._setup_bar()
+        save_settings(self.settings, Settings(str(bar_root), engine))
+        status, info = self._request("/api/install-status?project=ExampleAI")
+        self.assertEqual((status, info["status"]), (200, "not_installed"))
+
+        # Pre-seed scan cache with ExampleAI
+        from app.settings import save_content_cache
+        cache_path = self.server.match_service._content_cache_path(data, engine)
+        save_content_cache(cache_path, data, engine, {
+            "maps": [{"name": "Map", "width": 512, "height": 512}],
+            "games": ["Game"],
+            "ais": [{"short_name": "ExampleAI", "version": "1", "name": "Example AI",
+                     "profiles": [{"key": "hard", "name": "Hard"}]}],
+            "warnings": [],
+        })
+
+        # Clone a profile and install via /api/install -> updates cache without rescan
+        self._request("/api/clone", method="POST", body={"project": "ExampleAI", "profile": "hard", "name": "Fast"})
+        status, install_res = self._request("/api/install", method="POST", body={
+            "project": "ExampleAI", "bar_root": str(bar_root), "engine": engine, "confirmations": [],
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(install_res["changed"])
+        self.assertTrue(install_res["cache_updated"])
+
+        cached = self.server.match_service.cached_content(bar_root, engine)
+        self.assertEqual([p["key"] for p in cached["ais"][0]["profiles"]], ["fast", "hard"])
+
+        status, info = self._request("/api/install-status?project=ExampleAI")
+        self.assertEqual((status, info["status"]), (200, "up_to_date"))
+
+        # Edit saved project file -> out_of_date
+        (self.projects / "ExampleAI" / "profiles" / "hard" / "script" / "main.as").write_text("edited", encoding="utf-8")
+        status, info = self._request("/api/install-status?project=ExampleAI")
+        self.assertEqual((status, info["status"]), (200, "out_of_date"))
+
+        # Edit installed file -> modified_externally
+        installed_main = data / "engine" / engine / "AI" / "Skirmish" / "ExampleAI" / "1" / "script" / "hard" / "main.as"
+        installed_main.write_text("external", encoding="utf-8")
+        status, info = self._request("/api/install-status?project=ExampleAI")
+        self.assertEqual((status, info["status"]), (200, "modified_externally"))
+
 if __name__ == "__main__":
     unittest.main()

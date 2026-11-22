@@ -15,6 +15,12 @@
 .match-activity{color:var(--mint);font-size:12px;align-self:center}.match-activity.error{color:#f2d3ae}
 .scan-progress{display:block;width:100%;height:8px;margin:12px 0;accent-color:var(--orange)}.scan-progress[hidden]{display:none}
 .checkpoint-diff { max-height: 55vh; overflow: auto; white-space: pre; }
+.install-badge{display:inline-flex;align-items:center;font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px;border:1px solid var(--line);background:#1b2531;color:var(--muted);white-space:nowrap}
+.install-badge[hidden]{display:none}
+.install-badge.ok{border-color:#446b5c;background:#1a2e28;color:var(--mint)}
+.install-badge.warn{border-color:#8a6534;background:#2f2518;color:#f0c486}
+.install-badge.error{border-color:#8f4a46;background:#321e1e;color:var(--red)}
+.install-badge.neutral{border-color:#3a4856;background:#18212b;color:#a5b4c2}
 .roster-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:14px 0}
 @media(max-width:850px){.roster-grid{grid-template-columns:1fr}}
 .roster-side{background:#121b25;border:1px solid var(--line);border-radius:9px;padding:14px}

@@ -191,6 +191,14 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, result)
                 except Exception as error:
                     return self._handle_error(error)
+            if parsed.path == "/api/install-status":
+                try:
+                    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+                    if set(query) != {"project"} or any(len(values) != 1 for values in query.values()):
+                        raise ValueError("project query value is required exactly once.")
+                    return self._json(200, self._install_status(query["project"][0]))
+                except Exception as error:
+                    return self._handle_error(error)
             if parsed.path == "/api/catalog/latest" and not parsed.query:
                 try:
                     return self._json(200, {"catalog": self.server.match_service.latest_catalog()})
@@ -903,12 +911,53 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             result = installation.install(project_dir, found.data, engine, confirm)
         except ConfirmationRequired as challenge:
             return {"confirmation": challenge.message}
+        short_name, name, _default = installation._metadata(project_dir)
+        profiles = [{"key": key, "name": label} for key, label in projects.list_profiles(project_dir)]
+        cache_updated = False
+        try:
+            cache_updated = self.server.match_service.sync_installed_ai(
+                bar_root, engine, short_name, installation.VERSION, name, profiles,
+            )
+        except (MatchError, SettingsError):
+            cache_updated = False
         return {
             "path": str(result.path),
             "project": project_dir.name,
             "engine": engine,
             "changed": result.changed,
+            "cache_updated": cache_updated,
         }
+
+    def _install_status(self, project_key: str) -> dict[str, Any]:
+        project_dir = self._project(self._string(project_key, "project"))
+        configured = load_settings(self.server.settings_path)
+        if configured is None:
+            return {
+                "installed": False,
+                "managed": False,
+                "status": "not_configured",
+                "target": None,
+                "message": "No BAR installation configured.",
+            }
+        try:
+            found = discovery.discover(Path(configured.bar_root).expanduser())
+            if configured.engine not in found.engines:
+                return {
+                    "installed": False,
+                    "managed": False,
+                    "status": "not_configured",
+                    "target": None,
+                    "message": f"Configured engine {configured.engine!r} is not installed.",
+                }
+            return installation.inspect_status(project_dir, found.data, configured.engine)
+        except discovery.DiscoveryError as error:
+            return {
+                "installed": False,
+                "managed": False,
+                "status": "not_configured",
+                "target": None,
+                "message": str(error),
+            }
 
     def _remove(self, payload: dict[str, Any]) -> dict[str, str]:
         if "confirm" in payload:

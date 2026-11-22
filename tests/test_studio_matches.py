@@ -668,5 +668,30 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(status["series"]["side1_wins"], 1)
         self.assertEqual(status["series"]["cancelled"], 1)
+    def test_sync_installed_ai_updates_cached_profiles_without_rescan(self):
+        self.scan()
+        updated = self.service.sync_installed_ai(
+            self.bar_root, self.engine, "AI", "1", "My AI",
+            [{"key": "hard", "name": "Hard"}, {"key": "rush", "name": "Rush"}],
+        )
+        self.assertTrue(updated)
+        cached = MatchService(self.root).cached_content(self.bar_root, self.engine)
+        ai_entry = next(item for item in cached["ais"] if item["short_name"] == "AI")
+        self.assertEqual([p["key"] for p in ai_entry["profiles"]], ["hard", "rush"])
+        self.assertFalse(self.service.sync_installed_ai(
+            self.bar_root, self.engine, "MissingAI", "1", "Missing", [{"key": "hard", "name": "Hard"}],
+        ))
+        with patch("app.studio_matches.headless.run_match", return_value=("Winner: side 1.", self.root / "match")):
+            self.service.start(
+                self.bar_root, self.engine, "Game", "Map",
+                [
+                    {"short_name": "AI", "version": "1", "profile": "rush", "faction": "Armada", "ally": 0},
+                    {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+                ],
+                10, True,
+            )
+            self.assertEqual(self.wait()["state"], "completed")
+
+
 if __name__ == "__main__":
     unittest.main()
