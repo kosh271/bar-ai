@@ -98,6 +98,7 @@ function status() {
     $("new-project").disabled = state.saving;
     $("clone").disabled = state.saving || !state.profile;
     $("review").disabled = !count;
+    $("compare-profiles").disabled = state.saving || !state.profile;
     $("project-history").disabled = state.saving || !state.project;
     $("manage-project").disabled = state.saving;
 }
@@ -2084,6 +2085,135 @@ function review() {
     }
     showDialog("Review changes", box);
 }
+function comparisonChanges(file, headings) {
+    const wrap = element("div", "table-wrap"), table = element("table", "comparison-table"), row = element("tr");
+    for (const name of ["JSON path", ...headings]) {
+        const header = element("th", "", name);
+        header.scope = "col"; row.append(header);
+    }
+    const head = element("thead"), body = element("tbody");
+    head.append(row); table.append(head, body); wrap.append(table);
+    for (const change of file.changes) {
+        const row = element("tr"), pathCell = element("th", "comparison-path");
+        pathCell.scope = "row";
+        const path = change.path.reduce((result, key) => `${result}[${JSON.stringify(key)}]`, "$");
+        pathCell.append(element("code", "", path));
+        const units = new Set([...change.units, ...change.path.filter(key => typeof key === "string" && friendlyUnitName(key))]);
+        for (const id of units) {
+            const unit = element("span", "comparison-unit");
+            unit.append(unitIcon(id), element("span", "", unitLabel(id)));
+            pathCell.append(unit);
+        }
+        row.append(pathCell);
+        for (const value of [change.left, change.right]) {
+            const cell = element("td");
+            cell.append(value === null ? element("span", "muted", "Absent") : element("pre", "", value));
+            row.append(cell);
+        }
+        body.append(row);
+    }
+    return wrap;
+}
+function comparisonLines(file) {
+    const diff = window.StudioEditors.lineDiff(file.left, file.right);
+    if (!diff.length) return notice("Only line-ending characters differ.");
+    const view = element("div", "comparison-lines"), table = element("table"), head = element("thead"), body = element("tbody"), row = element("tr");
+    table.setAttribute("aria-label", `Line differences in ${file.path}`);
+    ["Active", "Target", "Source"].forEach(name => {
+        const label = element("th", "", name);
+        label.scope = "col"; row.append(label);
+    });
+    head.append(row); table.append(head, body); view.append(table);
+    for (const line of diff) {
+        const row = element("tr", `comparison-${line.kind}`);
+        if (line.kind === "hunk") {
+            const label = element("td", "muted", "⋯ Unchanged lines ⋯");
+            label.colSpan = 3; row.append(label);
+        } else {
+            const marker = line.kind === "added" ? "+" : line.kind === "removed" ? "−" : " ";
+            row.append(element("td", "comparison-line-number", line.left ?? ""),
+                element("td", "comparison-line-number", line.right ?? ""),
+                element("td", "comparison-source", `${marker} ${line.text}`));
+        }
+        body.append(row);
+    }
+    return view;
+}
+function compareProfiles() {
+    const activeProject = selectedProject();
+    const active = activeProject?.profiles.find(profile => profile.key === state.profile);
+    if (!active) return;
+    const projects = state.projects.map(project => ({...project, profiles: project.profiles.filter(profile =>
+        project.key !== activeProject.key || profile.key !== active.key)})).filter(project => project.profiles.length);
+    const box = element("div"), activeName = `${activeProject.name} / ${active.name}`;
+    box.append(element("p", "muted", `Active profile: ${activeName}. The comparison includes unsaved edits on the active side.`));
+    if (!projects.length) {
+        box.append(notice("Create another profile to compare with the active profile."));
+        showDialog("Compare profiles", box);
+        return;
+    }
+    const controls = element("div", "row comparison-controls"), feedback = element("p", "muted"), result = element("div");
+    feedback.setAttribute("role", "status");
+    const project = dropdown("Target project", projects.map(({key, name}) => [key, name]),
+        (projects.find(project => project.key === state.project) || projects[0]).key, updateProfiles);
+    const profile = dropdown("Target saved profile", [], "", clear);
+    const projectInput = project.querySelector("select"), profileInput = profile.querySelector("select");
+    const raw = element("input"), rawLabel = element("label", "option-check comparison-raw", "Show raw source differences");
+    raw.type = "checkbox"; raw.hidden = false; rawLabel.hidden = true; rawLabel.prepend(raw);
+    let request = 0, comparison = null;
+    function clear() { request++; comparison = null; feedback.textContent = ""; result.replaceChildren(); rawLabel.hidden = true; }
+    function updateProfiles() {
+        const target = projects.find(item => item.key === projectInput.value);
+        selectOptions(profileInput, target.profiles.map(({key, name}) => [key, name]), target.profiles[0].key);
+        clear();
+    }
+    function showResults() {
+        if (!comparison) return;
+        const files = comparison.files.filter(file => raw.checked || file.kind !== "formatting");
+        const formatted = comparison.files.length - files.length;
+        const kinds = [["added", "Added"], ["removed", "Removed"], ["modified", "Modified"], ["formatting", "Text only"]];
+        feedback.textContent = files.length
+            ? kinds.map(([key, label]) => `${label} ${files.filter(file => file.kind === key).length}`).join(" · ")
+            : "No differences found.";
+        if (formatted) feedback.textContent += ` ${formatted} JSONC ${formatted === 1 ? "file has" : "files have"} text-only changes.`;
+        result.replaceChildren();
+        files.forEach((file, index) => {
+            const details = element("details"), title = element("summary", "", file.path), body = element("div", "tree-body");
+            title.append(element("span", "tag", kinds.find(([key]) => key === file.kind)[1]));
+            details.append(title, body); result.append(details);
+            function populate() {
+                if (!details.open || body.childNodes.length) return;
+                if (file.parseError) body.append(notice(`JSONC could not be parsed: ${file.parseError}`, true));
+                body.append(!raw.checked && file.changes ? comparisonChanges(file, comparison.headings) : comparisonLines(file));
+            }
+            details.addEventListener("toggle", populate);
+            if (!index) { details.open = true; populate(); }
+        });
+    }
+    raw.addEventListener("change", showResults);
+    controls.append(project, profile, button("Compare", async () => {
+        clear();
+        const thisRequest = request;
+        const target = projects.find(item => item.key === projectInput.value);
+        const saved = target.profiles.find(item => item.key === profileInput.value);
+        const left = state.files.map(({path, text}) => ({path, text}));
+        feedback.textContent = "Loading saved profile…";
+        try {
+            const query = new URLSearchParams({project: target.key, profile: saved.key});
+            const response = await api(`/api/profile?${query}`);
+            if (thisRequest !== request || !box.isConnected || !$('dialog').open) return;
+            comparison = {files: window.StudioEditors.compareFiles(left, response.files),
+                headings: [activeName, `${target.name} / ${saved.name}`]};
+            rawLabel.hidden = !comparison.files.length;
+            showResults();
+        } catch (error) {
+            if (thisRequest === request) feedback.textContent = `Comparison failed: ${errorText(error)}`;
+        }
+    }));
+    updateProfiles();
+    box.append(controls, rawLabel, feedback, result);
+    showDialog("Compare profiles", box);
+}
 async function projectHistory() {
     const project = state.project, profile = state.profile;
     const box = element("div"), feedback = element("p", "muted"), list = element("div");
@@ -2500,6 +2630,7 @@ $("undo").addEventListener("click", () => {
     status();
 });
 $("review").addEventListener("click", review);
+$("compare-profiles").addEventListener("click", compareProfiles);
 $("project-history").addEventListener("click", projectHistory);
 $("project").addEventListener("change", async event => {
     if (!confirmDiscard()) { event.target.value = state.project; return; }
