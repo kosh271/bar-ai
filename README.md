@@ -39,6 +39,13 @@ download them.
    AI list. **Test match** scans installed content and can run a smoke test
    followed by a headless match.
 
+The defense and placement walkthroughs use a BARbarIAn Hard profile.
+
+- [Shield Advanced Fusion Reactors](docs/fusion-shields.md)
+- [Build more Pulsars, Bulwarks and Bastions](docs/heavy-defenses.md)
+- [Shield groups of heavy defenses](docs/cluster-shields.md)
+- [Keep factory routes clear](docs/keeping-chokepoints-open.md)
+
 During a test, the indicator beside **Start match** shows the current stage
 and its elapsed real time. Running status is checked against the engine process;
 an exited engine or an unavailable status connection is reported instead.
