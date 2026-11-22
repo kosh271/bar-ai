@@ -44,6 +44,7 @@ class MatchService:
         self._process: subprocess.Popen | None = None
         self._content: dict | None = None
         self._scan_key: tuple[Path, str] | None = None
+        self._invalidated_scans: set[tuple[Path, str]] = set()
 
     @staticmethod
     def _empty_state() -> dict:
@@ -107,52 +108,39 @@ class MatchService:
                 self._scan_key = None
 
             def worker() -> None:
+                completion = None
+                failure = None
                 try:
-                    result, logs, outcome = work()
-                    with self._lock:
-                        if outcome == "completed" and self._state["cancel_requested"]:
-                            outcome = "cancelled"
-                        if operation == "scan" and outcome == "completed":
-                            cache_info = result.pop("_content_cache", None)
-                            if cache_info:
-                                data, engine = cache_info
-                                try:
-                                    cache_path = self._content_cache_path(data, engine)
-                                    installation._check_links(self.root, cache_path)
-                                    settings.save_content_cache(cache_path, data, engine, result["content"])
-                                except settings.SettingsError as error:
-                                    result["summary"] += f" Scan results could not be saved for next run: {error}"
-                        if operation == "catalog" and outcome == "completed":
-                            self._save_catalog(result["catalog"])
-                        if operation == "scan" and outcome != "completed":
-                            self._content = None
-                            self._scan_key = None
-                        self._state.update(result=result, logs=logs, state=outcome)
-                        if outcome == "failed":
-                            self._state["error"] = result.get("summary", "Operation failed.")
-                        self._state["message"] = result.get("summary", outcome.capitalize())
+                    completion = work()
                 except Exception as error:
-                    with self._lock:
-                        cancelled = self._stop.is_set() and self._state["cancel_requested"]
-                        self._state.update(
-                            state="cancelled" if cancelled else "failed",
-                            error=f"{type(error).__name__}: {error}",
-                            message=str(error) or type(error).__name__,
-                        )
+                    failure = error
                 finally:
                     with self._lock:
-                        started = self._state.pop("_started")
-                        self._state["elapsed_seconds"] = max(0.0, time.monotonic() - started)
-                        phase_started = self._state.pop("_phase_started", None)
-                        if phase_started is not None:
-                            self._state["phase_elapsed_seconds"] = max(0.0, time.monotonic() - phase_started)
-                        if self._state["state"] in ("running", "cancelling"):
+                        try:
+                            if failure is not None:
+                                raise failure
+                            if completion is not None:
+                                self._publish_result(operation, *completion)
+                        except Exception as error:
                             self._state.update(
-                                state="failed", error="Operation worker stopped unexpectedly.",
-                                message="Operation worker stopped unexpectedly.",
+                                state="cancelled" if self._state["cancel_requested"] else "failed",
+                                error=f"{type(error).__name__}: {error}",
+                                message=str(error) or type(error).__name__,
                             )
-                        self._process = None
-                        _operation_lock.release()
+                        finally:
+                            finished = time.monotonic()
+                            started = self._state.pop("_started")
+                            self._state["elapsed_seconds"] = max(0.0, finished - started)
+                            phase_started = self._state.pop("_phase_started", None)
+                            if phase_started is not None:
+                                self._state["phase_elapsed_seconds"] = max(0.0, finished - phase_started)
+                            if self._state["state"] in ("running", "cancelling"):
+                                self._state.update(
+                                    state="failed", error="Operation worker stopped unexpectedly.",
+                                    message="Operation worker stopped unexpectedly.",
+                                )
+                            self._process = None
+                            _operation_lock.release()
 
             try:
                 threading.Thread(target=worker, name=f"studio-{operation}", daemon=True).start()
@@ -162,6 +150,32 @@ class MatchService:
                 self._state.pop("_started", None)
                 raise
         return self.status()
+
+    def _publish_result(self, operation: str, result: dict, logs: dict, outcome: str) -> None:
+        """Publish the result while holding the service lock."""
+        if outcome == "completed" and self._state["cancel_requested"]:
+            outcome = "cancelled"
+        if operation == "scan":
+            cache_info = result.pop("_content_cache", None)
+            if cache_info and outcome == "completed":
+                data, engine = cache_info
+                try:
+                    cache_path = self._content_cache_path(data, engine)
+                    installation._check_links(self.root, cache_path)
+                    settings.save_content_cache(cache_path, data, engine, result["content"])
+                except settings.SettingsError as error:
+                    result["summary"] += f" Scan results could not be saved for next run: {error}"
+                self._content = result["content"]
+                self._scan_key = (data.parent, engine)
+                self._invalidated_scans.discard(self._scan_key)
+            elif outcome == "cancelled":
+                result = {"summary": "Content scan cancelled."}
+        if operation == "catalog" and outcome == "completed":
+            self._save_catalog(result["catalog"])
+        self._state.update(result=result, logs=logs, state=outcome)
+        if outcome == "failed":
+            self._state["error"] = result.get("summary", "Operation failed.")
+        self._state["message"] = result.get("summary", outcome.capitalize())
 
     def _set_phase(self, phase: str, message: str) -> None:
         with self._lock:
@@ -210,7 +224,11 @@ class MatchService:
             raise headless.MatchError("BAR root is required.")
         if not isinstance(engine, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", engine) or engine in (".", ".."):
             raise headless.MatchError("Invalid engine folder.")
-        data = Path(bar_root).expanduser().resolve() / "data"
+        root = Path(bar_root).expanduser().resolve()
+        with self._lock:
+            if (root, engine) in self._invalidated_scans:
+                return None
+        data = root / "data"
         path = self._content_cache_path(data, engine)
         installation._check_links(self.root, path)
         return settings.load_content_cache(path, data, engine)
@@ -263,6 +281,8 @@ class MatchService:
         """Scan installed content asynchronously; result.content contains the choices."""
         def work() -> tuple[dict, dict, str]:
             selected, engine_dir = self._selected(bar_root, engine)
+            with self._lock:
+                self._invalidated_scans.add((selected.root, engine))
             cache = self._prepare_storage(engine_dir, selected.data)
             scan_dir = Path(tempfile.mkdtemp(prefix="scan-", dir=self.local_data / "scans"))
             logs = {"directory": str(scan_dir), "output": str(scan_dir / "scan-output.txt")}
@@ -274,14 +294,8 @@ class MatchService:
             content = headless.scan_content(engine_dir, selected.data, scan_dir, self._stop, archive_cache=cache)
             if not settings._content_valid(content):
                 raise headless.MatchError("The engine returned an invalid content scan result.")
-            summary = "Content scan complete."
-            with self._lock:
-                if self._state["cancel_requested"]:
-                    return {"summary": "Content scan cancelled."}, logs, "cancelled"
-                self._content = copy.deepcopy(content)
-                self._scan_key = (selected.root, engine)
             return {
-                "summary": summary, "content": content,
+                "summary": "Content scan complete.", "content": content,
                 "_content_cache": (selected.data, engine),
             }, logs, "completed"
 
@@ -314,7 +328,7 @@ class MatchService:
         self, bar_root: str | Path, engine: str, game: str, map_name: str,
         players: list[dict], minutes: int, skip_smoke: bool = False,
     ) -> dict:
-        """Start a match from the last successful scan for the same installation.
+        """Start a match from the latest in-memory or saved scan for the selected engine.
 
         Each player is an object with short_name, version, profile, faction and
         ally (0 or 1). The AI display name is taken from the scan, not the client.
@@ -327,9 +341,10 @@ class MatchService:
             if missing:
                 raise headless.MatchError("Engine is not ready: " + "; ".join(missing))
             with self._lock:
-                content = copy.deepcopy(self._content)
-                key = self._scan_key
-            if content is None or key != (selected.root, engine):
+                content = self._content if self._scan_key == (selected.root, engine) else None
+            if content is None:
+                content = self.cached_content(selected.root, engine)
+            if content is None:
                 raise headless.MatchError("Scan installed content for the selected engine first.")
             if not isinstance(game, str) or game not in content["games"]:
                 raise headless.MatchError("Select an installed game.")
@@ -363,10 +378,11 @@ class MatchService:
                 raise headless.MatchError("Stopped before the match started.")
             self._set_phase("smoke" if not skip_smoke else "match", "Starting headless match...")
             timed_out = threading.Event()
+            stop = self._stop
 
             def timeout() -> None:
                 timed_out.set()
-                self._stop.set()
+                stop.set()
 
             timer = threading.Timer(min(_MAX_MATCH_SECONDS, 600 + minutes * 60), timeout)
             timer.daemon = True
@@ -388,7 +404,7 @@ class MatchService:
             try:
                 summary, path = headless.run_match(
                     engine_dir, selected.data, self.local_data, map_name, game, match_players,
-                    minutes, self._stop, progress, skip_smoke=skip_smoke, process_started=process_started,
+                    minutes, stop, progress, skip_smoke=skip_smoke, process_started=process_started,
                 )
             except Exception as error:
                 if timed_out.is_set():

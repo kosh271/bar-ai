@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 from app.discovery import Installation
 from app.headless import MatchError, MatchProgress
 from app.settings import SettingsError
-from app.studio_matches import MatchService
+from app.studio_matches import MatchService, _operation_lock
 from app.unit_catalog import _RANDOM_SCRIPT, scan, valid_catalog
 
 
@@ -124,6 +124,51 @@ class MatchServiceTests(unittest.TestCase):
         self.assertEqual(self.scan()["state"], "completed")
         restored = MatchService(self.root)
         self.assertEqual(restored.cached_content(self.installation.root, "engine"), CONTENT)
+        with patch.object(restored, "_selected", return_value=(self.installation, self.root / "engine")), \
+                patch("app.studio_matches.headless.run_match", return_value=("Draw.", self.root / "match")) as run:
+            self.service = restored
+            restored.start(str(self.installation.root), "engine", "Game", "Map", PLAYERS, 30)
+            status = self.wait()
+        self.assertEqual(status["state"], "completed", status["error"])
+        self.assertEqual(run.call_args.args[5][0].name, "Display")
+
+    def test_completed_operation_has_released_the_worker_slot(self):
+        published, resume, finished = threading.Event(), threading.Event(), threading.Event()
+        service = self.service
+
+        class PublicationLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+
+            def __enter__(self):
+                self.lock.acquire()
+
+            def __exit__(self, *_):
+                terminal = (threading.current_thread().name == "studio-scan"
+                            and service._state["state"] == "completed")
+                self.lock.release()
+                if terminal and not published.is_set():
+                    published.set()
+                    resume.wait(3)
+
+        def run_worker(target):
+            try:
+                target()
+            finally:
+                finished.set()
+
+        thread_factory = threading.Thread
+        service._lock = PublicationLock()
+        with patch("app.studio_matches.threading.Thread", side_effect=lambda target, **kwargs:
+                   thread_factory(target=run_worker, args=(target,), **kwargs)):
+            service._launch("scan", lambda: ({}, {}, "completed"))
+        try:
+            self.assertTrue(published.wait(3))
+            self.assertEqual(service.status()["state"], "completed")
+            self.assertFalse(_operation_lock.locked())
+        finally:
+            resume.set()
+            self.assertTrue(finished.wait(3))
 
     def test_scan_cache_write_failure_keeps_successful_result_and_reports_warning(self):
         with patch("app.studio_matches.settings.save_content_cache",
@@ -382,6 +427,28 @@ class MatchServiceTests(unittest.TestCase):
             status = self.wait()
         self.assertEqual(status["state"], "failed")
         self.assertIn("real-time deadline", status["error"])
+
+    def test_late_timeout_does_not_stop_the_next_match(self):
+        self.scan()
+        callbacks = []
+
+        def timer(_seconds, callback):
+            callbacks.append(callback)
+            return MagicMock()
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            if len(callbacks) == 2:
+                callbacks[0]()
+                if stop.is_set():
+                    raise MatchError("The previous match stopped this match.")
+            return "Draw.", self.root / "match"
+
+        with patch("app.studio_matches.threading.Timer", side_effect=timer), \
+                patch("app.studio_matches.headless.run_match", side_effect=run):
+            for _ in range(2):
+                self.service.start("bar", "engine", "Game", "Map", PLAYERS, 30)
+                status = self.wait()
+                self.assertEqual(status["state"], "completed", status["error"])
 
     def test_engine_path_traversal_is_rejected(self):
         with patch.object(self.service, "_selected", wraps=MatchService._selected.__get__(self.service)):
