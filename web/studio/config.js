@@ -133,15 +133,130 @@ window.StudioConfig = (() => {
         }
         return patch(text, changes);
     }
+    function appendEntry(text, container, encoded) {
+        const last = container.children[container.children.length - 1], closing = container.end - 1;
+        if (last && last.node.end === closing) return patch(text, [{start: closing, end: closing, text: ", " + encoded}]);
+        const newline = text.includes("\r\n") ? "\r\n" : "\n";
+        const closingIndent = text.slice(text.lastIndexOf("\n", closing - 1) + 1, closing);
+        const indent = /^[\t ]*$/.test(closingIndent) ? closingIndent : "";
+        const changes = [{start: closing, end: closing, text: "\t" + encoded + newline + indent}];
+        if (!indent && closingIndent) changes[0].text = newline + changes[0].text;
+        if (last && !mask(text).slice(last.node.end, closing).includes(",")) changes.push({start: last.node.end, end: last.node.end, text: ","});
+        return patch(text, changes);
+    }
     function appendArray(text, path, value) {
         const list = at(parse(text), path);
         if (!list || list.kind !== "array") throw Error("This list is unavailable");
-        const last = list.children[list.children.length - 1], closing = list.end - 1;
-        const encoded = JSON.stringify(value);
-        if (last && last.node.end === closing) return patch(text, [{start: closing, end: closing, text: ", " + encoded}]);
-        const changes = [{start: closing, end: closing, text: "\n" + encoded + "\n"}];
-        if (last && !mask(text).slice(last.node.end, closing).includes(",")) changes.push({start: last.node.end, end: last.node.end, text: ","});
+        return appendEntry(text, list, JSON.stringify(value));
+    }
+    function editDefenseSequence(text, terrain, index, action) {
+        if (!["land", "water"].includes(terrain)) throw Error("Choose a defense terrain");
+        const list = at(parse(text), ["porcupine", terrain]);
+        if (list?.kind !== "array" || list.children.some(({node}) => node.kind !== "number")) {
+            throw Error("This defense sequence is unavailable in the structured editor");
+        }
+        const row = at(list, [index]);
+        if (index !== null && !row) throw Error("This defense sequence row is unavailable");
+        if (action === "up" || action === "down") {
+            const neighbor = row && at(list, [index + (action === "up" ? -1 : 1)]);
+            if (!neighbor) throw Error("This defense cannot move in that direction");
+            return patch(text, [
+                {start: row.start, end: row.end, text: text.slice(neighbor.start, neighbor.end)},
+                {start: neighbor.start, end: neighbor.end, text: text.slice(row.start, row.end)}
+            ]);
+        }
+        if (action === null) {
+            if (!row) throw Error("Choose a defense sequence row to remove");
+            const clean = mask(text), after = clean.indexOf(",", row.end);
+            const before = clean.lastIndexOf(",", row.start - 1);
+            const comma = after !== -1 && after < list.end ? after : before > list.start ? before : -1;
+            const changes = [{start: row.start, end: row.end, text: ""}];
+            if (comma !== -1) changes.push({start: comma, end: comma + 1, text: ""});
+            return patch(text, changes);
+        }
+        if (!Number.isInteger(action) || action < 0 || action > 0xffffffff) throw Error("Choose a valid defense unit slot");
+        return index === null ? appendEntry(text, list, String(action))
+            : row.value === action ? text : scalar(text, row, action);
+    }
+    function editBaseDefense(text, index, entry) {
+        const root = parse(text), porcupine = at(root, ["porcupine"]);
+        const schedule = at(porcupine, ["base"]);
+        if (porcupine?.kind !== "object" || (schedule && schedule.kind !== "array")) {
+            throw Error("The base defense schedule has an unsupported structure");
+        }
+        if (entry !== null) {
+            const [slot, seconds] = entry;
+            const factions = at(porcupine, ["unit"]);
+            if (!Number.isInteger(slot) || slot < 0 || factions?.kind !== "object" ||
+                !factions.children.some(({node}) => node.kind === "array" && at(node, [slot])?.kind === "string")) {
+                throw Error("Choose a unit slot from this configuration layer");
+            }
+            if (!Number.isInteger(seconds) || seconds < 0 || seconds > 71582788) {
+                throw Error("Enter game time in whole seconds between 0 and 71582788");
+            }
+            if (index === null) {
+                return schedule ? appendEntry(text, schedule, JSON.stringify(entry))
+                    : appendEntry(text, porcupine, '"base": ' + JSON.stringify([entry]));
+            }
+        }
+        const row = at(schedule, [index]);
+        if (!row) throw Error("This scheduled build is unavailable");
+        if (entry !== null) {
+            const fields = row.children || [];
+            if (fields.length !== 2 || fields.some(({node}) => node.kind !== "number")) {
+                throw Error("This scheduled build has an unsupported structure");
+            }
+            return patch(text, fields.flatMap(({node}, field) => node.value === entry[field] ? [] :
+                [{start: node.start, end: node.end, text: String(entry[field])}]));
+        }
+        const next = at(schedule, [index + 1]), previous = at(schedule, [index - 1]);
+        const clean = mask(text);
+        const after = clean.indexOf(",", row.end);
+        const before = clean.lastIndexOf(",", row.start - 1);
+        const comma = after !== -1 && after < (next?.start ?? schedule.end) ? after
+            : previous && before >= previous.end ? before : -1;
+        const original = text.slice(row.start, row.end);
+        const masked = clean.slice(row.start, row.end);
+        const retained = original === masked ? "" : original.split("")
+            .filter((_, index) => /\s/.test(masked[index])).join("");
+        const changes = [{start: row.start, end: row.end, text: retained}];
+        if (comma !== -1) changes.push({start: comma, end: comma + 1, text: ""});
         return patch(text, changes);
+    }
+    const completionBuildCategories = Object.freeze([
+        "factory", "nano", "store", "pylon", "energy", "geo",
+        "defence", "bunker", "big_gun", "radar", "sonar", "convert", "mex", "mexup",
+    ]);
+    function addDefenseAction(text, category, triggerId, chainIndex, unitId, direction, distance, chance = 100) {
+        if (!completionBuildCategories.includes(category)) throw Error("Choose a supported building category");
+        if (typeof triggerId !== "string" || !/^[a-z0-9_]+$/.test(triggerId) ||
+            typeof unitId !== "string" || !/^[a-z0-9_]+$/.test(unitId)) {
+            throw Error("Enter the completed building and defense building IDs");
+        }
+        if (!["front", "back", "left", "right"].includes(direction)) throw Error("Choose an offset direction");
+        if (!Number.isFinite(distance) || !Number.isFinite(Math.fround(distance))) throw Error("Enter a numeric offset distance");
+        if (!Number.isFinite(chance) || chance < 0 || chance > 100) throw Error("Enter a chance from 0 to 100 percent");
+        const action = {unit: unitId, category: "defence", offset: {[direction]: distance}};
+        if (chance < 100) action.condition = {chance: chance / 100};
+
+        const root = parse(text);
+        const keys = ["build_chain", category, triggerId, "hub"];
+        let container = root;
+        for (const [index, key] of keys.entries()) {
+            if (container.kind !== "object") throw Error("This build chain has an unsupported structure");
+            const child = at(container, [key]);
+            if (!child) {
+                if (chainIndex !== null) throw Error("This chain is unavailable");
+                const value = keys.slice(index + 1).reduceRight((nested, name) => ({[name]: nested}), [[action]]);
+                return appendEntry(text, container, JSON.stringify(key) + ": " + JSON.stringify(value));
+            }
+            container = child;
+        }
+        if (container.kind !== "array") throw Error("This build chain has an unsupported structure");
+        if (chainIndex === null) return appendEntry(text, container, JSON.stringify([action]));
+        const chain = at(container, [chainIndex]);
+        if (chain?.kind !== "array") throw Error("This chain is unavailable");
+        return appendEntry(text, chain, JSON.stringify(action));
     }
     function changeFactoryUnit(text, factory, unit, index) {
         const root = parse(text), fac = at(root, ["factory", factory]);
@@ -423,5 +538,6 @@ window.StudioConfig = (() => {
         warnings.sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
         return {errors, warnings};
     }
-    return {parse, at, patch, scalar, editArrays, appendArray, changeFactoryUnit, previewLayers, validateProfile};
+    return {parse, at, patch, scalar, editArrays, appendArray, editBaseDefense, editDefenseSequence,
+        completionBuildCategories, addDefenseAction, changeFactoryUnit, previewLayers, validateProfile};
 })();

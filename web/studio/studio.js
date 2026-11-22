@@ -1095,32 +1095,332 @@ function unitsView(panel, file, root) {
         panel.append(treeNode(file, child.node, String(child.key).replace(/_/g, " ")));
     }
 }
+function constructionRulesView(panel) {
+    const section = element("section", "script-settings");
+    section.append(element("h3", "", "Construction completion rules"));
+    panel.append(section);
+    let model;
+    try { model = S.readConstructionRules(state.files); }
+    catch (error) { section.append(notice(errorText(error))); return; }
+    const {file, rules} = model;
+    section.append(element("p", "muted", "Request a building near the one that just finished. The count can cover all completions by this AI or a group of nearby buildings. The AI still needs an available builder and a suitable site."),
+        element("p", "muted", "These rules apply to the whole profile through its main script. Counts start fresh when a match starts or reloads."));
+    const knownIds = [...new Set([...state.unitNames.keys(), ...(state.catalog?.byId.keys() || []),
+        ...rules.flatMap(rule => [rule.trigger, rule.target])])];
+    if (!knownIds.length) {
+        section.append(notice("Load a unit catalog to choose buildings."));
+        return;
+    }
+
+    function saveRules(updated) {
+        try {
+            assign(file, S.writeConstructionRules(state.files, updated));
+            message("");
+            render();
+        } catch (error) { message(errorText(error), true); }
+    }
+    function ruleRow(rule, index) {
+        const row = element("div", "row");
+        let trigger = rule?.trigger || "", target = rule?.target || "", nearby = (rule?.radius || 0) > 0;
+        const [countLabel, count] = textInput("Completion count", rule?.count ?? 1);
+        count.type = "number"; count.min = "1"; count.step = "1";
+        const [radiusLabel, radius] = textInput("Nearby search radius (elmos)", rule?.radius || 400);
+        radius.type = "number"; radius.min = "1"; radius.step = "1";
+        radiusLabel.hidden = !nearby;
+        const unitChoices = ["", ...knownIds];
+        row.append(unitPicker("Completed building", unitChoices, trigger, value => {trigger = value;}),
+            unitPicker("Requested building", unitChoices, target, value => {target = value;}),
+            dropdown("Count completions", [["all", "Across this AI"], ["nearby", "Within nearby groups"]],
+                nearby ? "nearby" : "all", value => {nearby = value === "nearby"; radiusLabel.hidden = !nearby;}),
+            countLabel, radiusLabel, button(rule ? "Update completion rule" : "Add completion rule", () => {
+                const distance = nearby ? radius.valueAsNumber : 0;
+                if (nearby && !(distance > 0)) { message("Enter a positive nearby search radius.", true); return; }
+                const entry = {trigger, target, count: count.valueAsNumber, radius: distance};
+                saveRules(rule ? rules.map((existing, i) => i === index ? entry : existing) : [...rules, entry]);
+            }));
+        if (rule) row.append(button("Remove completion rule", () => saveRules(rules.filter((_, i) => i !== index))));
+        return row;
+    }
+    rules.forEach((rule, index) => section.append(ruleRow(rule, index)));
+    section.append(ruleRow());
+}
+function clusterDefenseView(panel, file, root) {
+    const porcupine = C.at(root, ["porcupine"]);
+    if (porcupine?.kind !== "object") return;
+
+    const terrains = [["land", "Land"], ["water", "Water"]]
+        .filter(([key]) => C.at(porcupine, [key])?.kind === "array");
+    panel.append(element("h3", "", "Cluster defense order"));
+    if (!terrains.length) {
+        panel.append(element("p", "muted", "This layer has no editable land or water order. Choose a layer that supplies the order."));
+        return;
+    }
+
+    const path = file.path.replace(/\\/g, "/");
+    const factions = new Map();
+    function addUnitLists(unitLists) {
+        for (const {key: faction, node} of unitLists?.children || []) {
+            if (node.kind === "array") factions.set(faction, node);
+        }
+    }
+    function addReferenceLayer(reference) {
+        if (!reference) return;
+        try { addUnitLists(C.at(parse(reference), ["porcupine", "unit"])); }
+        catch { /* A second layer is optional context for the slot labels. */ }
+    }
+    if (path !== "config/build_chain.json") addReferenceLayer(find("config/build_chain.json"));
+    if (path === "config/build_chain.json") addReferenceLayer(find("config/build_chain_leg.json"));
+    addUnitLists(C.at(porcupine, ["unit"]));
+
+    const labelsBySlot = new Map();
+    for (const [faction, units] of factions) {
+        const factionName = faction.charAt(0).toUpperCase() + faction.slice(1);
+        for (const {key: slot, node: unit} of units.children) {
+            if (unit.kind !== "string") continue;
+            if (!labelsBySlot.has(slot)) labelsBySlot.set(slot, []);
+            labelsBySlot.get(slot).push(`${factionName} ${unitLabel(unit.value)}`);
+        }
+    }
+    const choices = [...labelsBySlot].sort(([a], [b]) => a - b)
+        .map(([slot, names]) => [String(slot), `${slot} · ${names.join(" / ")}`]);
+    const terrain = terrains.some(([key]) => key === state.clusterDefenseTerrain) ? state.clusterDefenseTerrain : terrains[0][0];
+    const sequence = C.at(porcupine, [terrain]);
+    const prevent = C.at(porcupine, ["prevent"]);
+    const terrainPicker = dropdown("Cluster terrain", terrains, terrain, value => {state.clusterDefenseTerrain = value; render();});
+    const controls = element("div", "row");
+    controls.append(terrainPicker);
+    if (prevent?.kind === "number") {
+        const [label, input] = textInput("Preventive defenses (first slots)", prevent.value);
+        input.type = "number"; input.min = "0"; input.max = String(0xffffffff); input.step = "1";
+        input.addEventListener("change", () => {
+            try {
+                const count = input.valueAsNumber;
+                if (!Number.isInteger(count) || count < 0 || count > 0xffffffff) throw Error("Enter a whole, nonnegative preventive count");
+                assign(file, C.scalar(file.text, C.at(parse(file), prevent.path), count));
+                message("");
+            } catch (error) {
+                input.value = C.at(parse(file), prevent.path).value;
+                message(errorText(error), true);
+            }
+        });
+        controls.append(label);
+    }
+    panel.append(element("p", "muted", "The AI tries these slots in order around metal clusters, subject to income, threat and builder availability. Repeat a slot to allow another copy."),
+        element("p", "muted", "The order applies to all factions that load this layer. Each faction uses its own building for the slot. Check Preview combined layers for overrides."), controls);
+
+    const amount = C.at(porcupine, ["amount"]);
+    if (amount?.kind === "object") {
+        const budget = element("details"), body = element("div", "tree-body");
+        budget.append(element("summary", "", "Cluster defense budget"), body);
+        body.append(element("p", "muted", "The income multiplier scales how much defense metal the AI can queue at a point. Factor and map-size pairs are interpolated together."));
+        for (const [key, title] of [["factor", "Income multiplier"], ["map", "Map-size reference"], ["offset", "Random multiplier offset"]]) {
+            const field = C.at(amount, [key]);
+            if (field?.kind === "array") body.append(treeNode(file, field, title));
+        }
+        panel.append(budget);
+    }
+    if (sequence.children.some(({node}) => node.kind !== "number")) {
+        panel.append(notice("This order contains nonnumeric entries. Inspect it in All files.", true));
+        return;
+    }
+
+    function edit(index, action, focusId) {
+        try {
+            assign(file, C.editDefenseSequence(file.text, terrain, index, action));
+            message("");
+            render();
+            if (focusId) $(focusId)?.focus();
+        } catch (error) { message(errorText(error), true); }
+    }
+    const wrap = element("div", "table-wrap"), table = element("table");
+    const head = element("thead"), header = element("tr"), body = element("tbody");
+    for (const title of ["Order", "Defense slot", "Actions"]) header.append(element("th", "", title));
+    head.append(header);
+    table.append(head, body); wrap.append(table);
+    for (const {key: index, node} of sequence.children) {
+        const row = element("tr"), order = element("td", "", String(index + 1));
+        const slot = element("td"), actions = element("td"), buttons = element("div", "row");
+        const options = labelsBySlot.has(node.value) ? choices : [[String(node.value), `Unmapped slot ${node.value}`], ...choices];
+        const pickerId = `cluster-defense-slot-${index}`;
+        const select = element("select");
+        select.id = pickerId;
+        select.setAttribute("aria-label", `Defense slot at position ${index + 1}`);
+        selectOptions(select, options, String(node.value));
+        select.addEventListener("change", () => edit(index, Number(select.value), pickerId));
+        slot.append(select);
+        for (const [label, action, next] of [["Move up", "up", index - 1], ["Move down", "down", index + 1], ["Remove", null, index]]) {
+            const control = button(label, () => edit(index, action,
+                next < sequence.children.length - (action === null ? 1 : 0) ? `cluster-defense-slot-${next}` : "cluster-defense-add"));
+            control.setAttribute("aria-label", `${label} defense at position ${index + 1}`);
+            control.disabled = next < 0 || (action === "down" && next >= sequence.children.length);
+            buttons.append(control);
+        }
+        actions.append(buttons);
+        row.append(order, slot, actions);
+        body.append(row);
+    }
+    if (sequence.children.length) panel.append(wrap);
+    else panel.append(element("p", "muted", "This order is empty."));
+    if (choices.length) {
+        let slot = "";
+        const picker = dropdown("Defense to add", [["", "Choose a defense slot"], ...choices], slot, value => {slot = value; add.disabled = !slot;});
+        const add = button("Add to order", () => edit(null, Number(slot), `cluster-defense-slot-${sequence.children.length}`));
+        add.id = "cluster-defense-add";
+        add.disabled = true;
+        const row = element("div", "row");
+        row.append(picker, add);
+        panel.append(row);
+    }
+}
+function baseDefenseView(panel, file, root) {
+    const porcupine = C.at(root, ["porcupine"]);
+    const factions = C.at(porcupine, ["unit"]);
+    const schedule = C.at(porcupine, ["base"]);
+    if (factions?.kind !== "object" || (schedule && schedule.kind !== "array")) return;
+
+    const labelsBySlot = new Map();
+    for (const {key: faction, node: units} of factions.children) {
+        if (units.kind !== "array") continue;
+        for (const {key: slot, node: unit} of units.children) {
+            if (unit.kind !== "string") continue;
+            if (!labelsBySlot.has(slot)) labelsBySlot.set(slot, []);
+            const factionName = faction.charAt(0).toUpperCase() + faction.slice(1);
+            labelsBySlot.get(slot).push(`${factionName} · ${unitLabel(unit.value)}`);
+        }
+    }
+    if (!labelsBySlot.size) return;
+    // The stock Legion layer contributes its unit list and can inherit the shared schedule.
+    if (file.path === "config/build_chain.json") {
+        const legion = find("config/build_chain_leg.json");
+        if (legion) {
+            try {
+                const layer = C.at(parse(legion), ["porcupine"]);
+                const units = C.at(layer, ["unit", "legion"]);
+                if (!C.at(layer, ["base"]) && units?.kind === "array") {
+                    for (const {key: slot, node: unit} of units.children) {
+                        if (unit.kind === "string") labelsBySlot.get(slot)?.push(`Legion · ${unitLabel(unit.value)}`);
+                    }
+                }
+            } catch { /* The selected schedule remains usable when another layer cannot be parsed. */ }
+        }
+    }
+    const choices = [...labelsBySlot].sort(([a], [b]) => a - b)
+        .map(([slot, labels]) => [String(slot), labels.join(" / ")]);
+    panel.append(element("h3", "", "Scheduled base defenses"),
+        element("p", "muted", "Choose a building and when the AI should attempt it. The AI needs a constructor that can build it at that time. A schedule in a later configuration layer can replace this one."));
+    if (!schedule) {
+        const shared = file.path === "config/build_chain.json";
+        panel.append(element("p", "muted", shared
+            ? "This layer has no base defense schedule yet."
+            : "Adding a build here creates a schedule that can replace the shared schedule for all factions. Edit build_chain.json to add a build for all factions that inherit it."));
+    }
+
+    function edit(index, entry) {
+        try {
+            assign(file, C.editBaseDefense(file.text, index, entry));
+            message("");
+            render();
+        } catch (error) { message(errorText(error), true); }
+    }
+    function buildRow(index, initialSlot, initialTime) {
+        let slot = initialSlot === undefined ? "" : String(initialSlot);
+        const row = element("div", "row");
+        const options = labelsBySlot.has(initialSlot) ? choices : [
+            ["", "Choose a building"],
+            ...(slot ? [[slot, `Unknown unit slot ${slot}`]] : []),
+            ...choices
+        ];
+        const picker = dropdown("Defense building", options, slot, value => {slot = value;});
+        const [timeLabel, time] = textInput("Game time (seconds)", initialTime ?? "");
+        time.type = "number"; time.min = "0"; time.step = "1";
+        row.append(picker, timeLabel, button(index === null ? "Add scheduled build" : "Update scheduled build",
+            () => edit(index, [slot === "" ? NaN : Number(slot), time.valueAsNumber])));
+        if (index !== null) row.append(button("Remove scheduled build", () => edit(index, null)));
+        return row;
+    }
+    for (const {key: index, node} of schedule?.children || []) {
+        const slot = C.at(node, [0]), time = C.at(node, [1]);
+        if (node.kind === "array" && node.children.length === 2 && slot?.kind === "number" && time?.kind === "number") {
+            panel.append(buildRow(index, slot.value, time.value));
+        } else {
+            const row = element("div", "row");
+            row.append(element("span", "muted", `Unsupported scheduled build (row ${index + 1})`),
+                button("Remove scheduled build", () => edit(index, null)));
+            panel.append(row);
+        }
+    }
+    panel.append(buildRow(null));
+}
+function defenseActionForm(file, getTrigger, chains = []) {
+    let direction = "front", chain = "";
+    const [unitLabel, unit] = textInput("Defense building ID", "", "e.g. armgate");
+    const [distanceLabel, distance] = textInput("Offset distance (elmos)", "80");
+    const [chanceLabel, chance] = textInput("Chance (%)", "100");
+    distance.type = chance.type = "number";
+    distance.step = chance.step = "any";
+    chance.min = "0"; chance.max = "100";
+    const row = element("div", "row");
+    if (chains.length) row.append(dropdown("Chain", [["", "As a new chain"], ...chains], chain, value => {chain = value;}));
+    row.append(unitLabel, dropdown("Offset direction", [["front", "Front"], ["back", "Back"], ["left", "Left"], ["right", "Right"]],
+        direction, value => {direction = value;}), distanceLabel, chanceLabel, button("Add defense action", () => {
+        try {
+            const [category, triggerId] = getTrigger();
+            assign(file, C.addDefenseAction(file.text, category, triggerId, chain === "" ? null : Number(chain),
+                unit.value.trim(), direction, distance.valueAsNumber, chance.valueAsNumber));
+            state.chainCategory = category;
+            state.chainUnit = triggerId;
+            message("Defense action added.");
+            render();
+        } catch (error) { message(errorText(error), true); }
+    }));
+    return row;
+}
+
 function defenseView(panel, file, root) {
+    baseDefenseView(panel, file, root);
     const chains = C.at(root, ["build_chain"]);
-    if (!chains || chains.kind !== "object") return;
-    const categories = chains.children.filter(e => e.node.kind === "object" && e.node.children.length);
-    if (!categories.length) return;
+    if (!chains && !/^config\/build_chain(?:_.*)?\.json$/.test(file.path)) return;
+    panel.append(element("h3", "", "On building completed"),
+        element("p", "muted", "Choose a follow-up defense to build near the completed building. Chance is checked separately on each completion. Actions in an existing chain wait for earlier eligible actions, while a new chain can start independently."));
+    if (chains && chains.kind !== "object") {
+        panel.append(notice("This layer uses an unsupported build chain structure. Inspect it in All files.", true));
+        return;
+    }
+    const categories = (chains?.children || []).filter(({node}) =>
+        node.kind === "object" && node.children.some(entry => entry.node.kind === "object"));
+    const addTrigger = element("details", "chain-card");
+    const triggerControls = element("div", "row");
+    const categoryOptions = C.completionBuildCategories.map(key => [key, key]);
+    let triggerCategory = "";
+    const [triggerLabel, trigger] = textInput("New completed building ID", "", "e.g. armafus");
+    triggerControls.append(dropdown("New completed building category", [["", "Choose a category"], ...categoryOptions],
+        triggerCategory, value => {triggerCategory = value;}), triggerLabel);
+    addTrigger.append(element("summary", "", "Add completed building"), triggerControls,
+        element("p", "muted", "Use the category under which the AI builds the trigger. Adding a chain in a later layer can replace chains inherited for that building."),
+        defenseActionForm(file, () => [triggerCategory, trigger.value.trim()]));
+
+    if (!categories.length) { panel.append(addTrigger); return; }
     if (!categories.some(e => e.key === state.chainCategory)) state.chainCategory = categories[0].key;
     const category = C.at(chains, [state.chainCategory]);
     const buildings = category.children.filter(e => e.node.kind === "object");
-    if (!buildings.length) return;
     if (!buildings.some(e => e.key === state.chainUnit)) state.chainUnit = buildings[0].key;
     const controls = element("div", "row");
     controls.append(dropdown("Completed building category", categories.map(e => [e.key, e.key]), state.chainCategory,
         value => {state.chainCategory = value; state.chainUnit = ""; render();}),
         unitPicker("Completed building ID", buildings.map(e => e.key), state.chainUnit,
-            value => {state.chainUnit = value; render();}));
-    controls.append(unitIcon(state.chainUnit));
-    panel.append(element("h3", "", "On building completed"), controls);
-    const hub = C.at(root, ["build_chain", state.chainCategory, state.chainUnit, "hub"]);
-    if (!hub || hub.kind !== "array") {
-        panel.append(notice("No supported hub chains exist for this building. Other settings remain available in the tree.")); return;
+            value => {state.chainUnit = value; render();}), unitIcon(state.chainUnit));
+    panel.append(controls);
+    const hub = C.at(chains, [state.chainCategory, state.chainUnit, "hub"]);
+    if (hub && hub.kind !== "array") {
+        panel.append(notice("Inspect this building's unsupported chain structure in All files.", true), addTrigger);
+        return;
     }
-    panel.append(element("p", "muted", "Each chain contains building actions and optional conditions. Positions are relative to the completed building; exact behavior depends on the runtime."));
-    hub.children.forEach((chain, index) => {
+    const options = [];
+    (hub?.children || []).forEach((chain, index) => {
         const card = element("div", "chain-card");
         card.append(element("h3", "", `Chain ${index + 1}`));
         if (chain.node.kind !== "array") {card.append(notice("Unsupported chain; use the settings tree.", true)); panel.append(card); return;}
+        options.push([String(index), `Append to chain ${index + 1}`]);
         chain.node.children.forEach((step, stepIndex) => {
             const action = element("div", "chain-step");
             action.append(element("div", "chain-number", String(stepIndex + 1)));
@@ -1134,19 +1434,9 @@ function defenseView(panel, file, root) {
             }
             action.append(body); card.append(action);
         });
-        const [label, input] = textInput("Add building unit ID", "", "e.g. armbeamer");
-        const [offsetLabel, offset] = textInput("Front offset (elmos)", "80");
-        const row = element("div", "row");
-        row.append(label, offsetLabel, button("Add defense action", () => {
-            try {
-                const unit = input.value.trim(), distance = Number(offset.value);
-                if (!unit || !offset.value.trim() || !Number.isFinite(distance)) throw Error("Enter a unit ID and numeric offset.");
-                assign(file, C.appendArray(file.text, chain.node.path, {unit, category: "defence", offset: {front: distance}}));
-                message("Action added. Verify that the builder and game version support this unit."); render();
-            } catch (error) { message(errorText(error), true); }
-        }));
-        card.append(row); panel.append(card);
+        panel.append(card);
     });
+    panel.append(defenseActionForm(file, () => [state.chainCategory, state.chainUnit], options), addTrigger);
 }
 const placementGroupNames = {
     fac_land: "Land factories",
@@ -1194,7 +1484,7 @@ const placementCategories = {
     def_high: "Strong defensive buildings",
     special: "Other special-purpose buildings",
     nano: "Units that help build",
-    terra: "Units that reshape the ground",
+    terra: "Terrain markers, including reserved factory lanes",
     unknown: "Other or unclassified buildings"
 };
 function placementGroupLabel(key) {
@@ -1251,7 +1541,7 @@ function placementInfo(path, value) {
             label: section === "class_land" ? "Land building rules" : "Water building rules",
             description: section === "class_land"
                 ? "Spacing rules for buildings placed on land."
-                : "Rules for buildings placed in water. When a water rule exists, it takes priority over the land rule."
+                : "On maps BARb classifies as water maps, this rule takes priority over the matching land rule."
         };
     }
     const groupIndex = buildingIndex + 2;
@@ -1311,13 +1601,39 @@ function placementInfo(path, value) {
     }
     return {label: parts[parts.length - 1].replace(/_/g, " "), description: "A game-specific setting. Its exact effect may depend on the game version."};
 }
+function placementLaneControl(panel, file, path) {
+    const rule = C.at(parse(file), path);
+    const ignore = C.at(rule, ["ignore"]);
+    const keepApart = C.at(rule, ["not_ignore"]);
+    const includesLanes = list => list.children.some(({node}) => node.value === "terra" || node.value === "all");
+    if (ignore?.children?.length) {
+        if (ignore.kind === "array" && includesLanes(ignore)) {
+            panel.append(element("p", "muted", "This rule ignores reserved factory lanes. Review its allowed building types to include lanes in spacing checks."));
+        }
+        return;
+    }
+    if (keepApart?.kind !== "array" || !keepApart.children.length) return;
+    if (includesLanes(keepApart)) {
+        panel.append(element("p", "muted", "This land rule includes reserved factory lanes in its spacing checks."));
+        return;
+    }
+    const listPath = [...path, "not_ignore"];
+    panel.append(element("p", "muted", "This rule checks only the building types listed below. Include reserved lanes to check for BARb's factory routes as well."),
+        button("Include reserved lanes", () => {
+            try {
+                assign(file, C.appendArray(file.text, listPath, "terra"));
+                message("");
+                render();
+            } catch (error) { message(errorText(error), true); }
+        }));
+}
 function placementView(panel, file, root) {
     const classes = C.at(root, ["building", "class_land"]);
     if (!classes || classes.kind !== "object" || !classes.children.length) return;
     if (!classes.children.some(e => e.key === state.placement)) state.placement = classes.children[0].key;
     const selected = C.at(classes, [state.placement]);
     panel.append(element("h3", "", "Land building spacing"),
-        element("p", "muted", "Choose a building group to edit. Group names in the settings file are internal labels; the building list below shows what each group covers. These rules help the AI estimate open space and avoid crowding; they do not change the game's own placement limits."),
+        element("p", "muted", "Choose a building group to set its clearance. BARb checks local spacing and may reserve routes from factories. Even with those checks, buildings can close a passage elsewhere on the map."),
         dropdown("Buildings covered by this rule", classes.children.map(e => [e.key, placementGroupLabel(e.key)]), state.placement,
             v => {state.placement = v; render();}));
     const instances = C.at(root, ["building", "instance", state.placement]);
@@ -1336,9 +1652,10 @@ function placementView(panel, file, root) {
     } else {
         panel.append(element("p", "muted", "This group has no explicit building list; the group name is an internal label from the settings file."));
     }
-    const preview = element("div", "placement-preview");
+    const preview = element("div", "placement-preview"), laneControl = element("div");
+    const rulePath = selected.path;
     function updatePreview() {
-        const currentRoot = parse(file), current = C.at(currentRoot, ["building", "class_land", state.placement]);
+        const current = C.at(parse(file), rulePath);
         const type = C.at(current, ["type", 0]), size = C.at(current, ["size"]), yard = C.at(current, ["yard"]);
         const shape = element("div", type?.value === "circle" ? "placement-shape circle" : "placement-shape",
             type?.value === "circle" ? "Round area" : "Rectangular area");
@@ -1349,8 +1666,10 @@ function placementView(panel, file, root) {
             element("p", "muted", "A guide to the configured space, not a map or an exact drawing."),
             element("p", "muted", `Building area: ${footprint} · Extra clearance: ${spacing}`));
         preview.replaceChildren(shape, info);
+        laneControl.replaceChildren();
+        placementLaneControl(laneControl, file, rulePath);
     }
-    updatePreview(); panel.append(preview);
+    updatePreview(); panel.append(preview, laneControl);
     panel.append(element("p", "muted", "For size, clearance, and radius values, each step represents 16 units of in-game distance. If a value is missing, the game uses its built-in default."));
     if (selected?.children) for (const item of selected.children) {
         panel.append(treeNode(file, item.node, item.key.replace(/_/g, " "), 0, updatePreview, placementInfo));
@@ -1427,7 +1746,11 @@ function configPage(target, page, selected) {
     if (page === "combat" && file.path.endsWith("/response.json")) responseView(panel, file, root);
     if (page === "economy") economyView(panel, file, root);
     if (page === "units") unitsView(panel, file, root);
-    if (page === "defense") defenseView(panel, file, root);
+    if (page === "defense") {
+        clusterDefenseView(panel, file, root);
+        defenseView(panel, file, root);
+        constructionRulesView(panel);
+    }
     if (page === "placement") placementView(panel, file, root);
     if (page === "economy") scriptSettings(panel, "script/manager/economy.as", "Economy script thresholds", [
         ["Metal empty: fraction of storage", "aiEconomyMgr\\.isMetalEmpty\\s*=\\s*metal\\.current\\s*<\\s*metal\\.storage\\s*\\*\\s*", "\\s*;", "float", 0, 1],

@@ -341,5 +341,161 @@ window.StudioScripts = (() => {
         }
         return {presets, warnings};
     }
-    return {mask, resolve, layerPresets};
+    const constructionStart = "// BAR AI Studio construction rules ";
+    const constructionEnd = "// End BAR AI Studio construction rules";
+
+    function normalizeConstructionRules(rules) {
+        if (!Array.isArray(rules) || !rules.length) throw Error("Construction rules must be a nonempty list.");
+        const seen = new Set();
+        return rules.map(({trigger, target, count, radius}) => {
+            if (![trigger, target].every(id => typeof id === "string" && /^[a-z0-9_]+$/.test(id))) {
+                throw Error("Enter a BAR unit ID for both buildings.");
+            }
+            if (trigger === target) throw Error("Choose different trigger and requested buildings.");
+            if (!Number.isInteger(count) || count < 1 || count > 10000) {
+                throw Error("Use a completion count from 1 to 10000.");
+            }
+            if (!Number.isInteger(radius) || radius < 0 || radius > 100000) {
+                throw Error("Use a whole-number search radius from 0 to 100000.");
+            }
+            const rule = {trigger, target, count, radius};
+            const key = JSON.stringify(rule);
+            if (seen.has(key)) throw Error("Duplicate construction rule.");
+            seen.add(key);
+            return rule;
+        });
+    }
+
+    function constructionBlock(rules, newline) {
+        const entries = rules.map(({trigger, target, count, radius}) =>
+            `    BuildRule("${trigger}", "${target}", ${count}, ${radius}.f)`);
+        return `\n${constructionStart}${JSON.stringify(rules)}
+namespace StudioConstruction {
+
+class Anchor {
+    Id id;
+    AIFloat3 position;
+
+    Anchor(Id unitId, const AIFloat3& in pos) {
+        id = unitId;
+        position = pos;
+    }
+}
+
+class BuildRule {
+    string trigger;
+    string target;
+    uint count;
+    float radius;
+    uint completed;
+    array<Anchor@> anchors;
+
+    BuildRule(const string& in watched, const string& in requested, uint every, float distance) {
+        trigger = watched;
+        target = requested;
+        count = every;
+        radius = distance;
+        completed = 0;
+    }
+
+    void Finish(CCircuitUnit@ unit, const string& in name) {
+        if (name != trigger) return;
+        AIFloat3 position = unit.GetPos(ai.frame);
+        if (radius == 0.f) {
+            if (++completed < count) return;
+            completed = 0;
+        } else {
+            array<uint> members;
+            for (uint i = 0; i < anchors.length(); i++) {
+                const Anchor@ anchor = anchors[i];
+                if (anchor.id == unit.id) return;
+                float dx = anchor.position.x - position.x;
+                float dz = anchor.position.z - position.z;
+                if ((dx * dx + dz * dz) <= radius * radius && members.length() + 1 < count) {
+                    members.insertLast(i);
+                }
+            }
+            if (members.length() + 1 < count) {
+                anchors.insertLast(Anchor(unit.id, position));
+                return;
+            }
+            for (uint n = members.length(); n > 0; n--) anchors.removeAt(members[n - 1]);
+        }
+        CCircuitDef@ build = ai.GetCircuitDef(target);
+        if (build is null || !build.IsAvailable(ai.frame)) return;
+        aiBuilderMgr.Enqueue(TaskB::Common(Task::BuildType::DEFENCE, Task::Priority::NORMAL, build, position, 0.f));
+        AiLog("Studio construction request: " + target + " near " + trigger);
+    }
+
+    void Forget(Id id) {
+        for (uint i = 0; i < anchors.length(); i++) {
+            if (anchors[i].id == id) {
+                anchors.removeAt(i);
+                return;
+            }
+        }
+    }
+}
+
+array<BuildRule@> rules = {
+${entries.join(",\n")}
+};
+}
+
+namespace Main {
+void AiUnitFinished(CCircuitUnit@ unit) {
+    const string name = unit.circuitDef.GetName();
+    for (uint i = 0; i < StudioConstruction::rules.length(); i++) {
+        StudioConstruction::rules[i].Finish(unit, name);
+    }
+}
+
+void AiUnitDestroyed(CCircuitUnit@ unit) {
+    for (uint i = 0; i < StudioConstruction::rules.length(); i++) {
+        StudioConstruction::rules[i].Forget(unit.id);
+    }
+}
+}
+${constructionEnd}\n`.replace(/\n/g, newline);
+    }
+
+    function readConstructionRules(files) {
+        const path = "script/main.as";
+        const source = resolve(files, path, {all: true});
+        if (!source.files.length) throw Error("This profile needs a main.as script to use construction rules.");
+        const issue = source.issues.find(item => item.code !== "include-cycle");
+        if (issue) throw Error(issue.message);
+        const file = source.files[0];
+        const newline = file.text.includes("\r\n") ? "\r\n" : "\n";
+        const start = file.text.indexOf(constructionStart);
+        const end = file.text.indexOf(constructionEnd);
+        let original = file.text;
+        let rules = [];
+        if (start !== -1 || end !== -1) {
+            try {
+                const metadataEnd = file.text.indexOf(newline, start);
+                rules = normalizeConstructionRules(JSON.parse(file.text.slice(start + constructionStart.length, metadataEnd)));
+                const block = constructionBlock(rules, newline);
+                const blockStart = start - newline.length;
+                if (blockStart < 0 || file.text.slice(blockStart, blockStart + block.length) !== block) throw Error();
+                original = file.text.slice(0, blockStart) + file.text.slice(blockStart + block.length);
+            } catch { throw Error("The generated construction rules script was edited. Restore its generated block to resume visual editing."); }
+        }
+        for (const candidate of source.files) {
+            if (/\b(?:AiUnitFinished|AiUnitDestroyed|StudioConstruction)\b/.test(mask(candidate === file ? original : candidate.text))) {
+                throw Error("This profile already defines custom construction callbacks.");
+            }
+        }
+        return {file, original, newline, rules};
+    }
+
+    function writeConstructionRules(files, rules) {
+        const {original, newline} = readConstructionRules(files);
+        if (!rules.length) return original;
+        const block = constructionBlock(normalizeConstructionRules(rules), newline);
+        // The block starts on a new line even when the original file had no final newline.
+        return original + block;
+    }
+
+    return {mask, resolve, layerPresets, readConstructionRules, writeConstructionRules};
 })();
