@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,6 +119,72 @@ def save_match_map(path: Path, map_name: str) -> None:
     if not map_name:
         raise SettingsError("Cannot save an empty match map.")
     _save_json(path, {"map": map_name}, "match state")
+
+
+def _preference_text(value: object, *, allow_empty: bool = False) -> bool:
+    return (isinstance(value, str) and len(value) <= 256 and (bool(value.strip()) or allow_empty)
+            and not any(ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in value))
+
+
+def _preference_ai(player: object) -> bool:
+    return (isinstance(player, list) and len(player) == 3
+            and all(_preference_text(item, allow_empty=i == 2) for i, item in enumerate(player)))
+
+
+def _studio_preferences(value: object) -> dict:
+    if not isinstance(value, dict) or not value or value.keys() - {"workspace", "match"}:
+        raise SettingsError("Supply workspace or match preferences.")
+    if "workspace" in value:
+        workspace = value["workspace"]
+        if (not isinstance(workspace, dict) or workspace.keys() != {"project", "profile"}
+                or not isinstance(workspace["project"], str) or not isinstance(workspace["profile"], str)
+                or not re.fullmatch(r"[A-Za-z0-9]{0,64}", workspace["project"])
+                or not re.fullmatch(r"[A-Za-z0-9_-]{0,64}", workspace["profile"])
+                or (workspace["profile"] and not workspace["project"])):
+            raise SettingsError("Invalid Studio workspace selection.")
+    if "match" in value:
+        match = value["match"]
+        fields = {"game", "map", "first", "second", "faction1", "faction2", "minutes", "skip_smoke"}
+        if (not isinstance(match, dict) or not fields <= match.keys() <= fields | {"rosters"}
+                or not all(_preference_text(match[key]) for key in ("game", "map"))
+                or type(match["minutes"]) is not int or not 1 <= match["minutes"] <= 2147483647 // 1800
+                or type(match["skip_smoke"]) is not bool
+                or any(match[key] not in ("Armada", "Cortex", "Legion") for key in ("faction1", "faction2"))):
+            raise SettingsError("Invalid Studio match preferences.")
+        if not all(_preference_ai(match[key]) for key in ("first", "second")):
+            raise SettingsError("Invalid Studio AI selection.")
+        if "rosters" in match:
+            rosters = match["rosters"]
+            if (not isinstance(rosters, list) or len(rosters) != 2
+                    or not all(isinstance(team, list) and team for team in rosters)
+                    or sum(map(len, rosters)) > 16
+                    or not all(isinstance(slot, dict) and slot.keys() == {"ai", "faction"}
+                               and _preference_ai(slot["ai"]) and slot["faction"] in ("Armada", "Cortex", "Legion")
+                               for team in rosters for slot in team)):
+                raise SettingsError("Invalid Studio roster selection.")
+    return value
+
+
+def load_studio_preferences(path: Path) -> dict:
+    _check_preferences_path(path)
+    if not path.exists():
+        return {}
+    try:
+        with path.open(encoding="utf-8") as source:
+            return _studio_preferences(json.load(source))
+    except (OSError, ValueError, SettingsError):
+        return {}
+
+
+def _check_preferences_path(path: Path) -> None:
+    for candidate in (path.parent, path):
+        if candidate.is_symlink() or getattr(candidate, "is_junction", lambda: False)():
+            raise SettingsError("Studio preferences paths cannot contain links.")
+
+
+def save_studio_preferences(path: Path, update: object) -> None:
+    data = {**load_studio_preferences(path), **_studio_preferences(update)}
+    _save_json(path, data, "Studio preferences")
 
 
 def _content_valid(content: object) -> bool:

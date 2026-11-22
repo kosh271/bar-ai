@@ -70,7 +70,8 @@ def _lua(value: str) -> str:
 def _metadata(project: Path) -> tuple[str, str, str]:
     try:
         info = _read_metadata(project / "project.json", ("name", "short_name", "default_profile"))
-        if project.is_symlink() or _key(info["name"], project=True) != info["short_name"]:
+        _key(info["name"], project=True)
+        if project.is_symlink() or _key(info["short_name"], project=True) != info["short_name"]:
             raise InstallationError("Invalid project name or short name.")
         if project.name != info["short_name"] or info["short_name"].casefold() == "barb":
             raise InstallationError("The project name conflicts with the stock BARbarIAn.")
@@ -164,6 +165,94 @@ def _options(stock: str, profiles: list[tuple[str, str]], default: str) -> str:
         "return options"
     )
     return re.sub(pattern, lambda _match: addition, stock)
+
+
+def _expected_hashes(project: Path, stock: Path, short_name: str, name: str, default: str) -> dict[str, str]:
+    for filename in ("SkirmishAI.dll", "AIInfo.lua", "AIOptions.lua"):
+        source = stock / filename
+        if not source.is_file() or _link(source):
+            raise InstallationError(f"Stock BARbarIAn file not found or is a link: {source}")
+    profiles = list_profiles(project)
+    info_text = _info((stock / "AIInfo.lua").read_text(encoding="utf-8"), short_name, name)
+    options_text = _options((stock / "AIOptions.lua").read_text(encoding="utf-8"), profiles, default)
+    result = {
+        "SkirmishAI.dll": hashlib.sha256((stock / "SkirmishAI.dll").read_bytes()).hexdigest(),
+        "AIInfo.lua": hashlib.sha256(info_text.replace("\n", os.linesep).encode("utf-8")).hexdigest(),
+        "AIOptions.lua": hashlib.sha256(options_text.replace("\n", os.linesep).encode("utf-8")).hexdigest(),
+    }
+    for key, _name in profiles:
+        profile = project / "profiles" / key
+        files = profile_files(profile)
+        if Path("script") / "init.as" not in files or Path("script") / "main.as" not in files:
+            raise InstallationError(f"Profile {key} is missing init.as or main.as.")
+        for relative in files:
+            destination = (Path(relative.parts[0]) / key / Path(*relative.parts[1:])).as_posix()
+            result[destination] = hashlib.sha256((profile / relative).read_bytes()).hexdigest()
+    return result
+
+
+def inspect_status(project: Path, data: Path, engine: str) -> dict[str, object]:
+    """Compare a Studio project against its installation in the selected engine without mutating files."""
+    short_name, name, default = _metadata(project)
+    stock, target = _target(data, engine, short_name)
+    lobby = data / LOBBY_FILE
+    _check_links(data, lobby)
+    if not target.exists():
+        return {
+            "installed": False,
+            "managed": False,
+            "status": "not_installed",
+            "target": str(target),
+            "message": "Not installed for this engine.",
+        }
+    _snapshot(target)
+    if not _managed(target, short_name):
+        return {
+            "installed": True,
+            "managed": False,
+            "status": "modified_externally",
+            "target": str(target),
+            "message": "Unmanaged AI files exist at the target location.",
+        }
+    if not _unchanged(target):
+        return {
+            "installed": True,
+            "managed": True,
+            "status": "modified_externally",
+            "target": str(target),
+            "message": "Installed AI files were modified outside Studio.",
+        }
+    try:
+        expected = _expected_hashes(project, stock, short_name, name, default)
+    except ProjectError as error:
+        raise InstallationError(str(error)) from error
+    actual = _hashes(target)
+    try:
+        old_lobby = _read_lobby(lobby)
+        new_lobby = _lobby_content(old_lobby, f"{short_name} {VERSION}", name)
+    except InstallationError as error:
+        return {
+            "installed": True,
+            "managed": True,
+            "status": "modified_externally",
+            "target": str(target),
+            "message": str(error),
+        }
+    if actual == expected and old_lobby == new_lobby:
+        return {
+            "installed": True,
+            "managed": True,
+            "status": "up_to_date",
+            "target": str(target),
+            "message": "Installed and up to date.",
+        }
+    return {
+        "installed": True,
+        "managed": True,
+        "status": "out_of_date",
+        "target": str(target),
+        "message": "Saved project changes are not yet installed.",
+    }
 
 
 def _prepare(project: Path, stock: Path, target: Path, short_name: str, name: str, default: str) -> None:

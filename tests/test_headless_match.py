@@ -1,9 +1,11 @@
+import json
 import threading
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app import headless
 from app.headless import MatchError, Player, archive_cache_path, run_match
 
 
@@ -22,6 +24,136 @@ class HeadlessMatchTests(unittest.TestCase):
     def run_match(self, **kwargs):
         return run_match(self.engine, self.data, self.local_data, "Map", "Game", self.players, 30,
                          self.stop, self.events.append, **kwargs)
+
+    @patch("app.headless.subprocess.Popen")
+    def test_opt_in_records_only_match_and_persists_replays_and_telemetry(self, popen):
+        def launch(command, **kwargs):
+            run = Path(command[-1]).parent
+            match = run.name.startswith("match-")
+            self.assertIn(f"RecordDemo={int(match)};", (run / "script.txt").read_text(encoding="utf-8"))
+            script = r"LuaRules\Configs\BARb\stable\script\hard\main.as"
+            (run / "infolog.txt").write_text(f"Skirmish AI <AI-1>: Load script: {script}\n"
+                                            "[t=00:01:01.000000][f=0001800] Executing debugcommand, quitforce\n",
+                                            encoding="utf-8")
+            if match:
+                (run / "demos").mkdir()
+                (run / "demos" / "example.sdfz").write_bytes(b"demo")
+                (run / "demos" / "notes.txt").write_text("text", encoding="utf-8")
+            return process
+
+        process = unittest.mock.Mock()
+        process.poll.return_value = process.wait.return_value = 0
+        popen.side_effect = launch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "spring-headless.exe").touch()
+            self.assertIn("RecordDemo=0;", headless.build_script("Map", "Game", self.players, 1))
+            _, run = run_match(root, root, root, "Map", "Game", self.players, 1, self.stop,
+                               record_demo=True)
+            details = json.loads((run / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(details["replays"], [{"path": "demos/example.sdfz", "size_bytes": 4}])
+            self.assertEqual(details["telemetry"]["end_frame"], 1800)
+        self.assertEqual(popen.call_count, 2)
+
+    @patch("app.headless.subprocess.Popen")
+    def test_extra_units_pack_applies_to_smoke_and_match(self, popen):
+        def launch(command, **kwargs):
+            run = Path(command[-1]).parent
+            self.assertIn("experimentalextraunits=1;", (run / "script.txt").read_text(encoding="utf-8"))
+            (run / "infolog.txt").write_text(
+                "Skirmish AI <AI-1>: Load script: script/hard/main.as\n"
+                "[f=0001800] Executing debugcommand, quitforce\n", encoding="utf-8"
+            )
+            return process
+
+        process = unittest.mock.Mock()
+        process.poll.return_value = process.wait.return_value = 0
+        popen.side_effect = launch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "spring-headless.exe").touch()
+            self.assertNotIn("experimentalextraunits=", headless.build_script("Map", "Game", self.players, 1))
+            run_match(root, root, root, "Map", "Game", self.players, 1, self.stop, extra_units=True)
+        self.assertEqual(popen.call_count, 2)
+
+    def test_match_telemetry_associates_startup_and_explicit_team_events(self):
+        log = r"""
+[t=00:00:08.800001][f=-000001] Skirmish AI <AI-1>: Load script: LuaRules\Configs\BARb\stable\script\hard\main.as
+[t=00:00:08.800002][f=-000001] Skirmish AI <AI-1>: AI 1.6.29 (0) Initialized!
+[t=00:00:08.800003][f=-000001] Skirmish AI <AI-1>: Load script: LuaRules\Configs\BARb\stable\script\normal\main.as
+[t=00:00:08.800004][f=-000001] Skirmish AI <AI-1>: AI 1.6.29 (1) Initialized!
+[t=00:00:09.000000][f=0000010] Skirmish AI <AI-1>: [Team 0] Selected factory: armlab
+[t=00:00:09.100000][f=0000030] Skirmish AI <AI-1>: [Team 0] Opener queue: armck, armpw
+[t=00:00:10.100000][f=0001000] Skirmish AI <AI-1>: [Team 1] Switching factory: corlab -> corvp
+[t=00:00:12.000000][f=0001200] Skirmish AI <AI-1>: [Team 1] AngelScript runtime exception: null pointer
+[t=00:00:12.000001][f=0001300] Skirmish AI <AI-1>: Selected factory: armvp
+[t=00:00:12.000002][f=0001800] Team 0 stats: metalProduced=15, unitsKilled=3
+[t=00:00:12.100000][f=0001860] Game over
+[t=00:00:12.200000][f=0001863] [Game::KillRendering][1]
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            config = run / "LuaUI" / "Config"
+            config.mkdir(parents=True)
+            (config / "teamstats.json").write_text(
+                '{"teams":{"1":[{"metalProduced":12},{"metalProduced":28,"unitsProduced":7}],"bad":null}}',
+                encoding="utf-8",
+            )
+            summary = headless.match_telemetry(run, self.players, log, log)
+        self.assertEqual((summary["end_frame"], summary["duration"]), (1860, "01:02"))
+        self.assertEqual(summary["ai_script_errors"], 1)
+        first, second = summary["teams"]
+        self.assertEqual(first["profile_loaded"], "hard")
+        self.assertEqual(first["factory"], "armlab")
+        self.assertEqual(first["opener"], "armck, armpw")
+        self.assertEqual(first["stats"], {"metal_produced": 15, "units_killed": 3})
+        self.assertEqual(second["profile_loaded"], "normal")
+        self.assertEqual(second["factory_switches"], ["corlab -> corvp"])
+        self.assertEqual(second["ai_script_errors"], 1)
+        self.assertEqual(second["stats"], {"metal_produced": 28, "units_produced": 7})
+        self.assertEqual(summary["unassigned_ai"]["factory"], "armvp")
+
+    def test_partial_telemetry_and_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            config = run / "LuaUI" / "Config"
+            config.mkdir(parents=True)
+            (config / "teamstats.json").write_text('{"teams":[', encoding="utf-8")
+            missing = headless.match_telemetry(run, self.players, "[f=-000001] pregame", "")
+            self.assertIsNone(missing["duration"])
+            self.assertEqual(missing["teams"][0]["stats"], {})
+            early = headless.match_telemetry(run, self.players, "[f=0000196] Team 1 was defeated\n"
+                                             "[f=0000199] [Game::KillRendering][1]", "")
+            self.assertEqual((early["end_frame"], early["duration"]), (196, "00:06"))
+        for line, category in (
+            ("[f=0000001] script.as (12, 5) : ERR Unexpected token", "ai_script"),
+            ("Skirmish AI <BARbarIAn-stable>: Load script: main.as", "ai_script"),
+            ("Error: Skirmish AI BARb not found!", "ai_script"),
+            ("Error: sync failure", "engine_error"),
+            ("Warning: weaponDef missing model", "engine_warning"),
+            ("LuaShader: shader error(s):", "engine_warning"),
+            ("[unitdefs.lua] yardmap row has incorrect length", "engine_warning"),
+            ("Loaded synced gadget", "other"),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(headless.diagnostic_category(line), category)
+
+    def test_replay_discovery_skips_linked_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            (outside / "test").mkdir(parents=True)
+            (outside / "mock.sdfz").write_bytes(b"demo")
+            run = root / "match-test"
+            (run / "demos").mkdir(parents=True)
+            (run / "demos" / "empty.sdfz").touch()
+            try:
+                (run / "demos" / "linked.sdfz").symlink_to(outside / "mock.sdfz")
+                (outside / "test" / "demos").symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"Cannot create symlinks: {error}")
+            self.assertEqual(headless.replay_files(run), [])
+            self.assertEqual(headless.replay_files(outside / "test"), [])
 
     @patch("app.headless._run_match")
     @patch("app.headless._run_smoke")
@@ -103,6 +235,27 @@ class HeadlessMatchTests(unittest.TestCase):
         self.assertEqual(processes, [popen.return_value])
         popen.assert_called_once()
 
+    @patch("app.headless.subprocess.Popen")
+    def test_failed_smoke_persists_compilation_error_telemetry(self, popen):
+        process = popen.return_value
+        process.poll.return_value = process.wait.return_value = 0
+
+        def launch(command, **kwargs):
+            path = Path(command[command.index("--write-dir") + 1])
+            (path / "infolog.txt").write_text(
+                "main.as (12, 7) : ERR Unexpected token\n", encoding="utf-8",
+            )
+            return process
+
+        popen.side_effect = launch
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "spring-headless.exe").touch()
+            passed, _, run = headless._run_smoke(work, work, work / "local", "Map", "Game", self.players, self.stop)
+            metadata = json.loads((run / "result.json").read_text(encoding="utf-8"))
+        self.assertFalse(passed)
+        self.assertEqual(metadata["telemetry"]["ai_script_errors"], 1)
+
     @patch("app.headless._run_match")
     @patch("app.headless._run_smoke")
     def test_smoke_error_reports_elapsed_time_and_remains_an_error(self, smoke, match):
@@ -139,6 +292,30 @@ class HeadlessMatchTests(unittest.TestCase):
         self.assertEqual(self.events[0].summary, "Passed")
         self.assertEqual(self.events[-1].summary, "Not started (stopped)")
         match.assert_not_called()
+
+
+class MultiAIRosterScriptTests(unittest.TestCase):
+    def test_build_script_supports_2v2_and_asymmetric_rosters(self):
+        players_2v2 = [
+            Player("MyAI", "1", "hard", "Armada", 0, "My AI"),
+            Player("BARb", "stable", "medium", "Cortex", 0, "BARbarIAn"),
+            Player("MyAI", "1", "fast", "Legion", 1, "My AI"),
+            Player("BARb", "stable", "hard", "Armada", 1, "BARbarIAn"),
+        ]
+        script_2v2 = headless.build_script("Map", "Game", players_2v2, 30)
+        for index in range(4):
+            self.assertIn(f"[AI{index}]", script_2v2)
+            self.assertIn(f"[TEAM{index}]", script_2v2)
+        self.assertIn("profile=fast;", script_2v2)
+        self.assertEqual(script_2v2.count("AllyTeam=0;"), 2)
+        self.assertEqual(script_2v2.count("AllyTeam=1;"), 2)
+
+        asymmetric = players_2v2[:3]
+        script_2v1 = headless.build_script("Map", "Game", asymmetric, 20)
+        self.assertIn("[AI2]", script_2v1)
+        self.assertNotIn("[AI3]", script_2v1)
+        self.assertEqual(script_2v1.count("AllyTeam=0;"), 2)
+        self.assertEqual(script_2v1.count("AllyTeam=1;"), 1)
 
 
 if __name__ == "__main__":

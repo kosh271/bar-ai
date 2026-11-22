@@ -22,9 +22,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import discovery, game_sources, installation, project_history, projects, unit_icons
+from . import discovery, game_sources, installation, project_archive, project_history, projects, unit_icons
 from .headless import MatchError
-from .settings import Settings, SettingsError, load_settings, save_settings
+from .settings import (Settings, SettingsError, load_settings, load_studio_preferences, save_settings,
+                       save_studio_preferences)
 from .studio_matches import MatchService
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -56,7 +57,7 @@ class StudioServer(ThreadingHTTPServer):
         self.projects_root = projects_root
         self.settings_path = settings_path
         self.studio_root = studio_root
-        self.match_service = MatchService(APP_ROOT)
+        self.match_service = MatchService(APP_ROOT, projects_root=projects_root)
         self.write_lock = threading.RLock()
         self.session_token = secrets.token_urlsafe(32)
         self._client_lock = threading.Lock()
@@ -101,6 +102,9 @@ class StudioServer(ThreadingHTTPServer):
             self._expire_stale_clients_locked(time.monotonic())
             if self._clients:
                 self._schedule_client_expiry_locked()
+                return
+            if self.match_service.is_busy():
+                self._schedule_shutdown_locked()
                 return
         self.shutdown()
 
@@ -168,6 +172,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, {
                         "projects": self._state_projects(),
                         "settings": self._settings(),
+                        "preferences": load_studio_preferences(self._preferences_path()),
                         "default_bar_root": str(default_bar_root) if default_bar_root is not None else None,
                     })
                 except Exception as error:
@@ -177,6 +182,57 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, self.server.match_service.status())
                 except Exception as error:
                     return self._handle_error(error)
+            if parsed.path == "/api/match/logs":
+                try:
+                    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True,
+                                                  strict_parsing=True, max_num_fields=3)
+                    if (not {"run_id", "file"} <= set(query) <= {"run_id", "file", "offset"}
+                            or any(len(values) != 1 for values in query.values())):
+                        raise ValueError("Provide a run ID, a log file, and an optional byte offset.")
+                    offset = query.get("offset", ["0"])[0]
+                    if not re.fullmatch(r"[0-9]{1,19}", offset):
+                        raise ValueError("Invalid log byte offset.")
+                    result = self.server.match_service.read_log(query["run_id"][0], query["file"][0], int(offset))
+                    return self._json(200, result)
+                except Exception as error:
+                    return self._handle_error(error)
+            if parsed.path == "/api/experiment/history" and not parsed.query:
+                try:
+                    return self._json(200, {"experiments": self.server.match_service.experiment_history()})
+                except Exception as error:
+                    return self._handle_error(error)
+            if parsed.path == "/api/match/history":
+                try:
+                    query = (
+                        urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+                        if parsed.query else {}
+                    )
+                    allowed = {"project", "profile", "map", "checkpoint", "limit"}
+                    if not set(query) <= allowed or any(len(values) != 1 for values in query.values()):
+                        raise ValueError("Unsupported or duplicate history query parameter.")
+                    limit = 100
+                    if "limit" in query:
+                        raw_limit = query["limit"][0]
+                        if not raw_limit.isdecimal():
+                            raise ValueError("limit must be a positive integer.")
+                        limit = int(raw_limit)
+                    return self._json(200, {"history": self.server.match_service.history(
+                        project=query["project"][0] or None if "project" in query else None,
+                        profile=query["profile"][0] or None if "profile" in query else None,
+                        map_name=query["map"][0] or None if "map" in query else None,
+                        checkpoint=query["checkpoint"][0] or None if "checkpoint" in query else None,
+                        limit=limit,
+                    )})
+                except Exception as error:
+                    return self._handle_error(error)
+            if parsed.path == "/api/install-status":
+                try:
+                    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+                    if set(query) != {"project"} or any(len(values) != 1 for values in query.values()):
+                        raise ValueError("project query value is required exactly once.")
+                    return self._json(200, self._install_status(query["project"][0]))
+                except Exception as error:
+                    return self._handle_error(error)
             if parsed.path == "/api/catalog/latest" and not parsed.query:
                 try:
                     return self._json(200, {"catalog": self.server.match_service.latest_catalog()})
@@ -184,13 +240,17 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._handle_error(error)
             if parsed.path == "/api/unit-icons" and not parsed.query:
                 try:
-                    return self._json(200, unit_icons.icon_status(load_settings(self.server.settings_path)))
+                    return self._json(200, unit_icons.icon_status(
+                        load_settings(self.server.settings_path), catalog_game=self._unit_icon_catalog_game(),
+                    ))
                 except Exception as error:
                     return self._handle_error(error)
             if parsed.path.startswith("/api/unit-icon/") and not parsed.query:
                 try:
                     unit_id = parsed.path.removeprefix("/api/unit-icon/")
-                    image = unit_icons.read_icon(load_settings(self.server.settings_path), unit_id)
+                    image = unit_icons.read_icon(
+                        load_settings(self.server.settings_path), unit_id, catalog_game=self._unit_icon_catalog_game(),
+                    )
                     if image is None:
                         return self._error(404, "Unit icon not found.")
                     return self._send(200, image, "image/png")
@@ -205,6 +265,24 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                         "project": query["project"][0],
                         "profile": query["profile"][0],
                     })})
+                except Exception as error:
+                    return self._handle_error(error)
+            if parsed.path == "/api/project/export":
+                try:
+                    query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+                    if set(query) != {"project"} or len(query["project"]) != 1:
+                        raise ValueError("Supply one project to export.")
+                    with tempfile.TemporaryFile() as archive:
+                        with self.server.write_lock:
+                            project = self._project(query["project"][0])
+                            project_archive.write(project, archive)
+                        size = archive.tell()
+                        archive.seek(0)
+                        self._send_headers(200, size, "application/zip", filename=f"{project.name}.zip")
+                        shutil.copyfileobj(archive, self.wfile)
+                    return
+                except (BrokenPipeError, ConnectionResetError):
+                    return
                 except Exception as error:
                     return self._handle_error(error)
             else:
@@ -258,12 +336,18 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/client/heartbeat", "/api/client/close",
             "/api/save", "/api/clone", "/api/clone-project", "/api/sources",
             "/api/create-project", "/api/inspect", "/api/history", "/api/history/checkpoint", "/api/history/restore",
+            "/api/history/diff",
+            "/api/project/manage", "/api/project/import",
+            "/api/preferences",
             "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
-            "/api/match/start", "/api/match/cancel",
+            "/api/match/start", "/api/match/cancel", "/api/match/replay/copy",
+            "/api/experiment/start", "/api/experiment/pause", "/api/experiment/promote",
         }:
             return self._error(404, "Unknown API endpoint.")
         try:
+            if parsed.path == "/api/project/import":
+                return self._json(200, self._import_project())
             payload = self._read_json(allow_empty=parsed.path == "/api/match/cancel")
             if parsed.path in {"/api/client/heartbeat", "/api/client/close"}:
                 self._require_fields(payload, ("client_id",))
@@ -296,6 +380,26 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/clone-project":
                 with self.server.write_lock:
                     return self._json(200, self._clone_project(payload))
+            if parsed.path == "/api/project/manage":
+                with self.server.write_lock:
+                    return self._json(200, self._manage_project(payload))
+            if parsed.path == "/api/preferences":
+                with self.server.write_lock:
+                    save_studio_preferences(self._preferences_path(), payload)
+                return self._json(200, {"ok": True})
+            if parsed.path == "/api/history/diff":
+                self._require_fields(payload, ("project",))
+                names_only = payload.get("names_only", False)
+                if type(names_only) is not bool:
+                    raise ValueError("names_only must be a boolean.")
+                with self.server.write_lock:
+                    project = self._project(self._string(payload["project"], "project"))
+                    return self._json(200, project_history.diff(
+                        project,
+                        base=self._string(payload["base"], "base") if "base" in payload else "",
+                        commit=self._string(payload["commit"], "commit") if "commit" in payload else "",
+                        names_only=names_only,
+                    ))
             if parsed.path in {"/api/history", "/api/history/checkpoint", "/api/history/restore"}:
                 self._require_fields(payload, ("project",))
                 with self.server.write_lock:
@@ -317,12 +421,12 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, self._create_project(payload))
             if parsed.path == "/api/inspect":
                 return self._json(200, self._inspect(payload))
-            if parsed.path == "/api/install":
+            if parsed.path in {"/api/install", "/api/remove"}:
                 with self.server.write_lock:
-                    return self._json(200, self._install(payload))
-            if parsed.path == "/api/remove":
-                with self.server.write_lock:
-                    return self._json(200, self._remove(payload))
+                    if self.server.match_service.is_busy("experiment"):
+                        raise MatchError("Wait for the experiment to finish before changing installed AIs.")
+                    change = self._install if parsed.path == "/api/install" else self._remove
+                    return self._json(200, change(payload))
             if parsed.path == "/api/match/cache":
                 self._require_fields(payload, ("bar_root", "engine"))
                 return self._json(200, {"content": self.server.match_service.cached_content(
@@ -349,6 +453,12 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 self._require_fields(payload, (
                     "bar_root", "engine", "game", "map_name", "players", "minutes", "skip_smoke",
                 ))
+                record_demo = payload.get("record_demo", False)
+                if type(record_demo) is not bool:
+                    raise ValueError("record_demo must be a boolean.")
+                extra_units = payload.get("extra_units", False)
+                if type(extra_units) is not bool:
+                    raise ValueError("extra_units must be a boolean.")
                 return self._json(200, self.server.match_service.start(
                     payload["bar_root"],
                     payload["engine"],
@@ -357,9 +467,39 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     payload["players"],
                     payload["minutes"],
                     payload["skip_smoke"],
+                    series=payload.get("series"), record_demo=record_demo, extra_units=extra_units,
                 ))
+            if parsed.path == "/api/match/replay/copy":
+                self._require_fields(payload, ("run_id", "path"))
+                selected = load_settings(self.server.settings_path)
+                if selected is None:
+                    raise ValueError("Choose and save a BAR installation before copying a replay.")
+                return self._json(200, self.server.match_service.copy_replay(
+                    self._string(payload["run_id"], "run_id"), self._string(payload["path"], "path"),
+                    selected.bar_root, selected.engine,
+                ))
+            if parsed.path == "/api/experiment/start":
+                fields = ("bar_root", "engine", "game", "maps", "minutes", "game_limit", "seconds_limit", "mode", "players")
+                self._require_fields(payload, fields)
+                with self.server.write_lock:
+                    return self._json(200, self.server.match_service.start_experiment(
+                        *(payload[field] for field in fields), sweep=payload.get("sweep"),
+                    ))
+            if parsed.path == "/api/experiment/pause":
+                self._require_fields(payload, ("id", "paused"))
+                return self._json(200, self.server.match_service.pause_experiment(
+                    payload["paused"], self._string(payload["id"], "id"),
+                ))
+            if parsed.path == "/api/experiment/promote":
+                self._require_fields(payload, ("id", "candidate_id", "name"))
+                with self.server.write_lock:
+                    return self._json(200, self.server.match_service.promote_experiment(
+                        self._string(payload["id"], "id"), self._string(payload["candidate_id"], "candidate_id"),
+                        self._string(payload["name"], "name"),
+                    ))
             if parsed.path == "/api/match/cancel":
-                return self._json(200, self.server.match_service.cancel())
+                expected = self._string(payload["id"], "id") if "id" in payload else None
+                return self._json(200, self.server.match_service.cancel(expected))
             with self.server.write_lock:
                 return self._json(200, self._save_settings(payload))
         except Exception as error:
@@ -375,15 +515,20 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         return
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
+        self._send_headers(status, len(body), content_type)
+        self.wfile.write(body)
+
+    def _send_headers(self, status: int, length: int, content_type: str, *, filename: str = "") -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(length))
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
-        self.wfile.write(body)
 
     def _json(self, status: int, payload: object) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -430,18 +575,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         return bool(supplied) and hmac.compare_digest(supplied, self.server.session_token)
 
     def _read_json(self, *, allow_empty: bool = False) -> dict[str, Any]:
-        if self.headers.get("Transfer-Encoding"):
-            self.close_connection = True
-            raise ValueError("Transfer-encoded requests are not supported.")
-        lengths = self.headers.get_all("Content-Length", [])
-        if allow_empty and not lengths:
-            return {}
-        if len(lengths) != 1 or not lengths[0].isdecimal():
-            raise ValueError("A valid Content-Length header is required.")
-        length = int(lengths[0])
-        if length > MAX_REQUEST_BYTES:
-            self.close_connection = True
-            raise ValueError("Request body is too large.")
+        length = self._body_length(MAX_REQUEST_BYTES, allow_empty=allow_empty)
         body = self.rfile.read(length)
         if len(body) != length:
             raise ValueError("Incomplete request body.")
@@ -454,6 +588,22 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             raise ValueError("Request body must be a JSON object.")
         return value
+
+    def _body_length(self, limit: int, *, allow_empty: bool = False) -> int:
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            raise ValueError("Transfer-encoded requests are not supported.")
+        lengths = self.headers.get_all("Content-Length", [])
+        if allow_empty and not lengths:
+            return 0
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+            self.close_connection = True
+            raise ValueError("A valid Content-Length header is required.")
+        length = int(lengths[0])
+        if length > limit:
+            self.close_connection = True
+            raise ValueError("Request body is too large.")
+        return length
 
     @staticmethod
     def _require_fields(payload: dict[str, Any], fields: tuple[str, ...]) -> None:
@@ -483,6 +633,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 result.append({
                     "key": key,
                     "name": name,
+                    "default_profile": projects.project_metadata(project)["default_profile"],
                     "history_error": self._initialize_history(project),
                     "profiles": [{"key": profile_key, "name": profile_name}
                                  for profile_key, profile_name in profiles],
@@ -495,6 +646,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "bar_root": configured.bar_root,
             "engine": configured.engine,
         }
+
+    def _preferences_path(self) -> Path:
+        return self.server.settings_path.with_name("studio-preferences.json")
 
     def _clone_project(self, payload: dict[str, Any]) -> dict[str, str]:
         self._require_fields(payload, ("project", "name"))
@@ -557,17 +711,20 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "suggested": suggested.label if suggested is not None else None,
         }
 
-    def _create_project(self, payload: dict[str, Any]) -> dict[str, str]:
-        self._require_fields(payload, ("bar_root", "source", "name"))
+    def _stock_source(self, payload: dict[str, Any]) -> game_sources.GameSource:
         bar_root = Path(self._string(payload["bar_root"], "bar_root")).expanduser()
         source_label = self._string(payload["source"], "source")
-        name = self._string(payload["name"], "name")
         found = discovery.discover(bar_root)
         sources = game_sources.list_game_sources(found.data, found.game_directory)[0]
         matches = [source for source in sources if source.label == source_label]
         if len(matches) != 1:
             raise game_sources.GameSourceError("Selected game source is no longer available.")
-        source = matches[0]
+        return matches[0]
+
+    def _create_project(self, payload: dict[str, Any]) -> dict[str, str]:
+        self._require_fields(payload, ("bar_root", "source", "name"))
+        name = self._string(payload["name"], "name")
+        source = self._stock_source(payload)
         with game_sources.stock_directory(source, self.server.projects_root) as stock:
             created = projects.create_project(
                 self.server.projects_root,
@@ -580,6 +737,54 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         if error:
             result["history_error"] = error
         return result
+
+    def _manage_project(self, payload: dict[str, Any]) -> dict[str, str]:
+        self._require_fields(payload, ("project", "action"))
+        project = self._project(self._string(payload["project"], "project"))
+        action = self._string(payload["action"], "action")
+        self._check_project_tree(project)
+        profile = ""
+        if action in ("delete_project", "delete_profile") and payload.get("confirm") is not True:
+            raise ValueError("Confirm the deletion before proceeding.")
+        if action == "delete_project":
+            projects.delete_project(self.server.projects_root, project.name)
+            return {"project": "", "profile": ""}
+        if action == "rename_project":
+            projects.rename_project(project, self._string(payload.get("name"), "name"))
+            return {"project": project.name}
+        elif action == "create_profile":
+            self._require_fields(payload, ("bar_root", "source", "name"))
+            source = self._stock_source(payload)
+            with game_sources.stock_directory(source, self.server.projects_root) as stock:
+                profile = projects.create_profile_from_hard(
+                    project, self._string(payload["name"], "name"), stock, source_label=source.label,
+                ).name
+        elif action in ("rename_profile", "set_default", "delete_profile"):
+            profile = self._string(payload.get("profile"), "profile")
+            if action == "rename_profile":
+                projects.rename_profile(project, profile, self._string(payload.get("name"), "name"))
+            elif action == "set_default":
+                projects.set_default_profile(project, profile)
+            else:
+                projects.delete_profile(project, profile)
+                profile = ""
+        else:
+            raise ValueError("Unknown project management action.")
+        return {"project": project.name, "profile": profile}
+
+    def _import_project(self) -> dict[str, str]:
+        remaining = self._body_length(project_archive.MAX_ARCHIVE_BYTES)
+        with tempfile.TemporaryFile() as archive:
+            while remaining:
+                chunk = self.rfile.read(min(remaining, 64 * 1024))
+                if not chunk:
+                    raise ValueError("Incomplete project upload.")
+                archive.write(chunk)
+                remaining -= len(chunk)
+            archive.seek(0)
+            with self.server.write_lock:
+                project = project_archive.load(self.server.projects_root, archive)
+                return {"project": project.name, "profile": projects.project_metadata(project)["default_profile"]}
 
     @staticmethod
     def _check_project_tree(root: Path) -> None:
@@ -776,12 +981,53 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             result = installation.install(project_dir, found.data, engine, confirm)
         except ConfirmationRequired as challenge:
             return {"confirmation": challenge.message}
+        short_name, name, _default = installation._metadata(project_dir)
+        profiles = [{"key": key, "name": label} for key, label in projects.list_profiles(project_dir)]
+        cache_updated = False
+        try:
+            cache_updated = self.server.match_service.sync_installed_ai(
+                bar_root, engine, short_name, installation.VERSION, name, profiles,
+            )
+        except (MatchError, SettingsError):
+            cache_updated = False
         return {
             "path": str(result.path),
             "project": project_dir.name,
             "engine": engine,
             "changed": result.changed,
+            "cache_updated": cache_updated,
         }
+
+    def _install_status(self, project_key: str) -> dict[str, Any]:
+        project_dir = self._project(self._string(project_key, "project"))
+        configured = load_settings(self.server.settings_path)
+        if configured is None:
+            return {
+                "installed": False,
+                "managed": False,
+                "status": "not_configured",
+                "target": None,
+                "message": "No BAR installation configured.",
+            }
+        try:
+            found = discovery.discover(Path(configured.bar_root).expanduser())
+            if configured.engine not in found.engines:
+                return {
+                    "installed": False,
+                    "managed": False,
+                    "status": "not_configured",
+                    "target": None,
+                    "message": f"Configured engine {configured.engine!r} is not installed.",
+                }
+            return installation.inspect_status(project_dir, found.data, configured.engine)
+        except discovery.DiscoveryError as error:
+            return {
+                "installed": False,
+                "managed": False,
+                "status": "not_configured",
+                "target": None,
+                "message": str(error),
+            }
 
     def _remove(self, payload: dict[str, Any]) -> dict[str, str]:
         if "confirm" in payload:
@@ -810,6 +1056,13 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             return {"confirmation": challenge.message}
         return {"path": str(target), "project": project_dir.name, "engine": engine}
 
+    def _unit_icon_catalog_game(self) -> str:
+        try:
+            catalog = self.server.match_service.latest_catalog()
+        except (MatchError, installation.InstallationError):
+            return ""
+        return catalog["game"] if catalog else ""
+
     def _save_settings(self, payload: dict[str, Any]) -> dict[str, str]:
         self._require_fields(payload, ("bar_root", "engine"))
         bar_root = self._string(payload["bar_root"], "bar_root")
@@ -822,6 +1075,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("Selected engine is not ready: " + "; ".join(missing))
         saved = Settings(str(found.root), engine)
         save_settings(self.server.settings_path, saved)
+        unit_icons.clear_icon_cache()
         return {"bar_root": saved.bar_root, "engine": saved.engine}
 
     @staticmethod

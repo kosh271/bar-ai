@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 
@@ -18,9 +19,36 @@ _INCLUDE = re.compile(r'(?m)^([ \t]*#[ \t]*include[ \t]*")([^"\r\n]+)(")')
 _DEVICES = {"CON", "PRN", "AUX", "NUL"} | {
     f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
 }
+_RESERVED_PATH = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\..*)?\Z", re.I)
+MAX_WORKSPACE_FILE_BYTES = 8 * 1024 * 1024
+
+
+def is_private_path_name(name: str) -> bool:
+    value = name.casefold()
+    return value == ".git" or value.startswith(".staging-") or value.endswith(".tmp")
+
+
+def workspace_path_parts(name: str) -> tuple[str, ...]:
+    parts = tuple(name.removesuffix("/").split("/"))
+    if len(name) > 512 or any(
+        not part or part in {".", ".."} or part.endswith((" ", ".")) or is_private_path_name(part)
+        or _RESERVED_PATH.fullmatch(part) or re.search(r'[\x00-\x1f\x7f<>:"\\|?*]', part)
+        for part in parts
+    ):
+        raise ProjectError(f"Unsafe workspace path: {name!r}")
+    return parts
+
+
+def check_workspace_size(size: int, total: int, count: int) -> None:
+    if size > MAX_WORKSPACE_FILE_BYTES or total > 64 * 1024 * 1024 or count > 5000:
+        raise ProjectError("Project files exceed their count or size limit.")
 
 
 def _key(name: str, *, project: bool) -> str:
+    try:
+        name.encode("utf-8")
+    except UnicodeError as error:
+        raise ProjectError("The name must contain valid Unicode characters.") from error
     if not name.strip() or "\n" in name or "\r" in name:
         raise ProjectError("Enter a non-empty name on one line.")
     if project:
@@ -60,18 +88,25 @@ def _read_metadata(path: Path, fields: tuple[str, ...]) -> dict[str, str]:
         if not isinstance(value["source"], str):
             raise ProjectError(f"Invalid source metadata: {path}")
         result["source"] = value["source"]
+    try:
+        for text in result.values():
+            text.encode("utf-8")
+    except UnicodeError as error:
+        raise ProjectError(f"Invalid Unicode in metadata: {path}") from error
     return result
 
 
 def list_projects(root: Path) -> list[tuple[str, str]]:
+    if _is_link(root):
+        raise ProjectError("Projects directory cannot be a link.")
     if not root.exists():
         return []
     result = []
     for path in root.iterdir():
         if not path.is_dir() or path.name.startswith("."):
             continue
-        if path.is_symlink():
-            raise ProjectError(f"Project cannot be a symbolic link: {path}")
+        if _is_link(path) or _is_link(path / "project.json"):
+            raise ProjectError(f"Project paths cannot contain links: {path}")
         metadata = _read_metadata(path / "project.json", ("name", "short_name"))
         if path.name != metadata["short_name"]:
             raise ProjectError(f"Project folder does not match its short name: {path}")
@@ -81,14 +116,14 @@ def list_projects(root: Path) -> list[tuple[str, str]]:
 
 def list_profiles(project: Path) -> list[tuple[str, str]]:
     root = project / "profiles"
-    if not root.is_dir():
+    if _is_link(project) or _is_link(root) or not root.is_dir():
         raise ProjectError(f"Profile directory not found: {root}")
     result = []
     for path in root.iterdir():
         if not path.is_dir() or path.name.startswith("."):
             continue
-        if path.is_symlink():
-            raise ProjectError(f"Profile cannot be a symbolic link: {path}")
+        if _is_link(path) or _is_link(path / "profile.json"):
+            raise ProjectError(f"Profile paths cannot contain links: {path}")
         metadata = _read_metadata(path / "profile.json", ("name",))
         result.append((path.name, metadata["name"]))
     return sorted(result, key=lambda item: item[1].casefold())
@@ -240,30 +275,107 @@ def profile_files(profile: Path) -> list[Path]:
     ]
 
 
+def project_metadata(project: Path) -> dict[str, str]:
+    path = project / "project.json"
+    if _is_link(path):
+        raise ProjectError("Project metadata cannot be a link.")
+    return _read_metadata(path, ("name", "short_name", "default_profile"))
+
+
+def _is_link(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (stat.S_ISLNK(metadata.st_mode)
+            or bool(getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT))
+
+
+def _existing_child(parent: Path, key: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", key):
+        raise ProjectError("Invalid project or profile key.")
+    path = parent / key
+    if (_is_link(parent) or _is_link(path) or not path.is_dir()
+            or path.resolve().parent != parent.resolve()
+            or not any(child.name == key for child in parent.iterdir())):
+        raise ProjectError(f"Not a regular workspace directory: {key}")
+    return path
+
+
+def _profile_path(project: Path, key: str) -> Path:
+    if _is_link(project):
+        raise ProjectError("Project paths cannot contain links.")
+    return _existing_child(project / "profiles", key)
+
+
+def _replace_metadata(path: Path, data: dict[str, str]) -> None:
+    if _is_link(path):
+        raise ProjectError(f"Metadata cannot be a link: {path}")
+    with tempfile.TemporaryDirectory(prefix=".staging-", dir=path.parent) as directory:
+        staged = Path(directory) / path.name
+        _write_metadata(staged, data)
+        staged.replace(path)
+
+
+def rename_project(project: Path, name: str) -> None:
+    _key(name, project=True)
+    _replace_metadata(project / "project.json", {**project_metadata(project), "name": name.strip()})
+
+
+def rename_profile(project: Path, profile_key: str, name: str) -> None:
+    _key(name, project=False)
+    path = _profile_path(project, profile_key) / "profile.json"
+    if _is_link(path):
+        raise ProjectError("Profile metadata cannot be a link.")
+    _replace_metadata(path, {**_read_metadata(path, ("name",)), "name": name.strip()})
+
+
+def set_default_profile(project: Path, profile_key: str) -> None:
+    profile = _profile_path(project, profile_key)
+    metadata = profile / "profile.json"
+    if _is_link(metadata):
+        raise ProjectError("Profile metadata cannot be a link.")
+    _read_metadata(metadata, ("name",))
+    _replace_metadata(project / "project.json", {**project_metadata(project), "default_profile": profile_key})
+
+
+def _delete_tree(path: Path) -> None:
+    def walk_error(error: OSError) -> None:
+        raise error
+
+    def remove_readonly(operation, filename, exc_info) -> None:
+        error = exc_info[1]
+        file = Path(filename)
+        if (os.name != "nt" or not isinstance(error, PermissionError)
+                or _is_link(file) or not file.resolve().is_relative_to(path.resolve())
+                or file.stat().st_mode & stat.S_IWRITE):
+            raise error
+        file.chmod(stat.S_IWRITE)
+        operation(filename)
+
+    try:
+        for root, directories, files in os.walk(path, onerror=walk_error):
+            for name in directories + files:
+                if _is_link(Path(root) / name):
+                    raise ProjectError(f"Cannot delete a workspace containing links: {name}")
+        shutil.rmtree(path, onerror=remove_readonly)
+    except OSError as error:
+        raise ProjectError(f"Cannot delete {path.name}: {error}") from error
+
+
 def delete_profile(project: Path, profile_key: str) -> None:
     """Delete a profile from a project."""
-    root = project / "profiles"
-    if not root.is_dir():
-        raise ProjectError(f"Profile directory not found: {root}")
-    profile_path = root / profile_key
-    if not profile_path.is_dir():
-        raise ProjectError(f"Profile not found: {profile_key}")
-    if profile_path.is_symlink():
-        raise ProjectError(f"Profile is a symbolic link and cannot be deleted: {profile_key}")
-    try:
-        shutil.rmtree(profile_path)
-    except OSError as error:
-        raise ProjectError(f"Cannot delete profile {profile_key}: {error}") from error
+    path = _profile_path(project, profile_key)
+    if len(list_profiles(project)) <= 1:
+        raise ProjectError("A project must keep at least one profile.")
+    if project_metadata(project)["default_profile"].casefold() == profile_key.casefold():
+        raise ProjectError("Choose another default profile before deleting this one.")
+    _delete_tree(path)
 
 
 def delete_project(root: Path, project_key: str) -> None:
     """Delete an entire project and all its profiles."""
-    project_path = root / project_key
-    if not project_path.is_dir():
-        raise ProjectError(f"Project not found: {project_key}")
-    if project_path.is_symlink():
-        raise ProjectError(f"Project is a symbolic link and cannot be deleted: {project_key}")
-    try:
-        shutil.rmtree(project_path)
-    except OSError as error:
-        raise ProjectError(f"Cannot delete project {project_key}: {error}") from error
+    path = _existing_child(root, project_key)
+    if project_metadata(path)["short_name"] != path.name:
+        raise ProjectError("Project metadata does not match the workspace directory.")
+    _delete_tree(path)

@@ -11,7 +11,7 @@
     "MINE", "TRANS", "AIR", "SUB", "STATIC", "HEAVY", "SUPER", "COMM"
   ];
 
-  function lex(text) {
+  function lex(text, editable = true) {
     const tokens = [];
     let i = 0;
     while (i < text.length) {
@@ -46,12 +46,22 @@
       }
       tokens.push({ value: text.slice(start, i), start: start, end: i });
     }
-    tokens.forEach(function (token, index) {
+    if (editable) tokens.forEach(function (token, index) {
       if (token.value === "#" && (!tokens[index + 1] || tokens[index + 1].value !== "include")) {
         throw Error("Preprocessor directives other than #include are not supported.");
       }
     });
     return tokens;
+  }
+
+  function roleReferences(text) {
+    const tokens = lex(text, false), references = [];
+    for (let i = 0; i + 2 < tokens.length; i++) {
+      if (tokens[i].value === "RT" && tokens[i + 1].value === "::" && /^[A-Za-z_]\w*$/.test(tokens[i + 2].value)) {
+        references.push({name: tokens[i + 2].value, offset: tokens[i].start});
+      }
+    }
+    return references;
   }
 
   function balanced(tokens, start) {
@@ -360,20 +370,36 @@
       if (factory && factory.error) {
         notice("This factory is read-only: " + factory.error + " Its source is preserved; use the source view.");
       } else if (factory) {
+        const weights = [], hints = [];
+        function refreshShares() {
+          const helper = window.StudioEditors;
+          const shares = helper.weightShares(weights.map(function (input) { return input.valueAsNumber; }));
+          hints.forEach(function (hint, index) { hint.textContent = helper.weightPercent(shares[index]); });
+        }
         factory.queues.forEach(function (queue, qi) {
           const panel = element("section", "panel opening-queue");
-          panel.appendChild(element("h3", "", "Queue " + (qi + 1)));
+          const heading = element("h3", "", "Queue " + (qi + 1));
+          const hint = element("span", "weight-share opening-weight-share");
+          hint.id = "opening-share-" + qi;
+          heading.appendChild(hint);
+          panel.appendChild(heading);
           const top = element("div", "row");
           const weight = element("input");
           weight.type = "number"; weight.min = "0"; weight.step = "any";
-          weight.value = queue.weight.value.replace(/[fF]$/, "");
+          const originalWeight = queue.weight.value.replace(/[fF]$/, "").replace(/\.(?=[eE]|$)/, ".0");
+          weight.value = originalWeight;
           weight.disabled = !canChange;
+          weight.setAttribute("aria-describedby", hint.id);
+          weights.push(weight);
+          hints.push(hint);
+          weight.addEventListener("input", refreshShares);
           weight.addEventListener("change", function () {
             const value = weight.value.trim();
             if (!/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value) ||
                 !Number.isFinite(Number(value)) || Number(value) > 3.402823466e38) {
               notice("Enter a non-negative finite float weight.");
-              weight.value = queue.weight.value.replace(/[fF]$/, "");
+              weight.value = originalWeight;
+              refreshShares();
               return;
             }
             patch([{ start: queue.weight.start, end: queue.weight.end,
@@ -459,6 +485,7 @@
           });
           container.appendChild(panel);
         });
+        refreshShares();
         button(container, "Add queue", function () {
           const newline = text.indexOf("\r\n") >= 0 ? "\r\n" : "\n";
           const lineStart = text.lastIndexOf("\n", t[factory.item.first].start - 1) + 1;
@@ -491,5 +518,5 @@
     return { destroy: function () { disposed = true; while (container.firstChild) container.removeChild(container.firstChild); } };
   }
 
-  window.StudioOpenings = { mount: mount };
+  window.StudioOpenings = { mount: mount, roleReferences: roleReferences };
 }());

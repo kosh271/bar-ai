@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.game_sources import GameSourceError, list_game_sources, stock_directory
+from app.game_sources import GameSourceError, _package_entries, list_game_sources, stock_directory
 from app.projects import create_project
 
 TEST_DIR = Path(__file__).resolve().parent
@@ -100,6 +100,23 @@ class GameSourceTests(unittest.TestCase):
             with stock_directory(suggested, projects):
                 pass
         self.assertEqual(list(projects.iterdir()), [])
+
+    def test_manifest_yields_valid_entry_before_reading_later_gzip_members(self):
+        path = self.root / "game.sdp"
+        digest = bytes.fromhex(self.digest)
+        record = b"\x01a" + digest + bytes(4) + struct.pack(">I", 42)
+        path.write_bytes(gzip.compress(record * 4096) + b"invalid gzip member")
+
+        entries = _package_entries(path)
+        self.assertEqual(next(entries), ("a", self.digest, 42))
+        with self.assertRaisesRegex(GameSourceError, "Cannot read game package"):
+            list(entries)
+
+    def test_truncated_manifest_record_is_rejected(self):
+        path = self.root / "game.sdp"
+        path.write_bytes(gzip.compress(b"\x01a" + bytes(23)))
+        with self.assertRaisesRegex(GameSourceError, "Invalid game package manifest"):
+            list(_package_entries(path))
 
     def test_rejects_package_paths_outside_profile_tree(self):
         self.entries["luarules/configs/barb/stable/script/../escape.as"] = b"bad"

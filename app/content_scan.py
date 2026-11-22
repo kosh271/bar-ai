@@ -7,9 +7,10 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
 
-def scan(engine: Path) -> dict:
+def scan(engine: Path, progress: Callable[[int, int], None]) -> dict:
     dll_dir = os.add_dll_directory(str(engine))
     lib = ctypes.CDLL(str(engine / "unitsync.dll"))
     char = ctypes.c_char_p
@@ -59,7 +60,9 @@ def scan(engine: Path) -> dict:
     try:
         maps: dict[str, dict] = {}
         warnings = []
-        for i in range(count(lib.GetMapCount(), "maps")):
+        total = count(lib.GetMapCount(), "maps")
+        for i in range(total):
+            progress(i, total)
             name = text(lib.GetMapName(i))
             if not name or name in maps:
                 continue
@@ -77,6 +80,7 @@ def scan(engine: Path) -> dict:
                     else:
                         height = max(0, lib.GetInfoValueInteger(j))
             maps[name] = {"name": name, "width": width, "height": height}
+        progress(total, total)
         games = []
         for i in range(count(lib.GetPrimaryModCount(), "games")):
             data = info(count(lib.GetPrimaryModInfoCount(i), "game information"))
@@ -112,8 +116,13 @@ def main() -> None:
     engine, data, write, output = map(Path, sys.argv[1:])
     os.environ["SPRING_WRITEDIR"] = str(write)
     os.environ["SPRING_DATADIR"] = str(data)
+    progress_path = write / "scan-progress.txt"
+
+    def progress(checked: int, total: int) -> None:
+        progress_path.write_text(f"{checked} {total}\n", encoding="ascii")
+
     try:
-        result = scan(engine)
+        result = scan(engine, progress)
         output.write_text(json.dumps(result), encoding="utf-8")
     except (OSError, RuntimeError, AttributeError) as error:
         print(f"Content scan failed: {error}", file=sys.stderr)

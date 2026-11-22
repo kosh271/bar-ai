@@ -1,0 +1,32 @@
+# Keep factory routes clear
+
+BARbarIAn can reserve a route from a factory exit toward a lane chosen by the AI. Building placement rules can respect those reservations and leave more room between structures. A narrow valley or bridge elsewhere can still be sealed by construction. Studio has no way to mark a map passage as a no-build zone for stock BARb.
+
+## Include reserved lanes in placement checks
+
+1. Start with a working BARbarIAn Hard profile. In Studio, click **Duplicate profile** and give it a distinct name such as **Lane test** so you can identify each run. The example Hard profile loads `block_map.json`. For a custom profile, run a baseline smoke test and look for the `Load config` line with the placement settings file in the engine log before editing.
+2. In the duplicate, open **Building placement**, select that file under **Settings file to edit**, and choose a group under **Buildings covered by this rule**. The selected group lists the building names and unit IDs. Match the building name you saw in the replay. For example, if an air factory blocks vehicles leaving a ground factory, edit **Air factories**, the group responsible for the obstructing building.
+3. Select **Include reserved lanes** when it appears. For example, the inspected BAR game Hard profile has **Air factories** (`fac_air`) set to keep apart from `convert`, `factory`, and `special`. The action adds `terra`, the category BARb uses to mark its reserved factory routes. The same profile's **Buildings that defend against aircraft** (`def_air`) also omits `terra`.
+4. If Studio says **This land rule includes reserved factory lanes**, leave the list as it is. If it says **This rule ignores reserved factory lanes**, expand **Building types this rule can be close to** and replace `terra` with `none`. For example, `["factory", "terra"]` becomes `["factory", "none"]`, keeping its existing factory exception. Changing `all` to `none` removes every exception and can restrict placement much more. Use a separate test profile for that change. A rule with neither list set checks every category by default.
+5. Select **Review changes** to check the selected file. In the air-factory example, **Building types to keep apart** should now include `terra` alongside `convert`, `factory` and `special`. Click **Save & install**. Studio installs both profiles under the project AI, so the two names remain available in **Test match**.
+
+At sites where a water rule applies, the rule for that building can take priority over the land rule. Expand **All placement settings** and look under **Water building rules** for water-specific values. Studio's quick **Include reserved lanes** control edits the selected land rule.
+
+## Give crowded buildings more room
+
+In **Building placement**, increase **Extra clearance** for a rectangular rule or **Round area radius** for a circular rule. Each step is 16 elmos of in-game distance. In Hard's **Basic land factories**, expand **Extra clearance** and change **Depth of extra clearance** from `30` to `32`. The preview shows two extra steps in total depth, or 32 elmos. For a centered rule that adds one step at each end. **Position adjustment** can shift that area, and its direction follows the building's orientation. The categories and spacing settings of both buildings affect the actual gap.
+
+Larger masks can make valid sites harder to find. The engine's physical footprint stays the same. A metal extractor or geothermal building can be placed directly at its resource spot, and some explicitly positioned factory requests bypass the mask search. The `ally_base` AI option applies to allied-factory areas. The `porcupine.choke` defense configuration is a list of defense unit IDs and does not reserve a movement corridor.
+
+## Verify in a replay
+
+1. In **Test match**, select the same engine, game, map, opponent, factions, start sides, and time limit for both runs. Start with an obstruction directly in front of a ground factory on a map where you have seen it happen. That is a better candidate for exercising a reserved factory route than a pass far from the factory. Select **Record replay** and leave **Skip smoke test** clear.
+2. Select the installed project AI and the original profile for the first run. Select the same AI and the named duplicate for the second. In the engine log, compare the `Load config` paths and check the profile folder immediately before `block_map.json`. The replay shows completed buildings and movement. The standard log does not confirm which specific route cells BARb reserved.
+3. After each match, use **Copy to BAR demos** and view the replay in BAR. Follow the first ground factory and pause when the suspect structure starts. Record the factory and structure unit IDs, the map location, and the game time. Continue until ground units try to pass. Check whether representative wider units can leave the factory and cross the same passage without turning back or getting stuck.
+4. Compare passages blocked by the AI's own structures, factory exits that units used, and whether intended structures still completed. If no comparable building or crossing appeared, the run gives no evidence about that obstruction. Repeat the comparison if the map or openings vary.
+
+## Runtime details
+
+The stock Windows `BARb/stable` DLL inspected for Recoil `2026.09.03` matched the local release archive copy at SHA-256 `ee1e5cdbbd71415a679732e8d1738970a247682f3393189dc9c9392066ddc0fc`. Its option file has no chokepoint setting, and the DLL contains the `MarkBusPath` type information. Stock BARbarIAn Hard passed the smoke test and recorded a five-minute replay on `TitanDuel_V3` with BAR `test-32018-ad135b9`. The match log confirmed that the game loaded Hard's `block_map.json`. The spacing edit was checked in Studio's parser and editor. A replay comparison is needed to measure its effect on any particular route.
+
+In the BARb reference source, `FactoryManager.cpp` requests a route for non-air factories. `TerrainManager.cpp` marks the cells of a successful route as `terra` and checks those cells during mask-based placement. This calculation can fail or finish after other building sites have already been chosen. `TerrainData.cpp` and `GridAnalyzer.cpp` analyze terrain regions and chokepoints. The build-site search does not simulate whether the new structure would disconnect a passage. [BARb reference source](https://github.com/rlcevg/CircuitAI/tree/f4a6ca3ae096631894e194cfa9b4e8e53f4fb78c/src/circuit)

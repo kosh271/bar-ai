@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import tempfile
@@ -85,6 +86,45 @@ class ProjectHistoryTests(unittest.TestCase):
         history.checkpoint(self.project, "Remove file")
         history.restore(self.project, baseline)
         self.assertEqual(self.file.read_bytes(), b"original\r\n")
+
+    def test_diff_checkpoints_and_working_files(self):
+        history.ensure(self.project)
+        baseline = history.list_checkpoints(self.project)[0]["id"]
+        self.file.write_text("edited\n", encoding="utf-8")
+        commit = history.checkpoint(self.project, "Edit metadata")
+        for result in (
+            history.diff(self.project, commit=commit),
+            history.diff(self.project, base=baseline, commit=commit),
+        ):
+            self.assertEqual(result["paths"], ["project.json"])
+            self.assertIn("+edited", result["patch"])
+        (self.project / "new.txt").write_text("untracked\n", encoding="utf-8")
+        working = history.diff(self.project)
+        self.assertEqual(set(working["paths"]), {"project.json", "new.txt"})
+        self.assertIn("+untracked", working["patch"])
+        self.assertIn("+original", history.diff(self.project, commit=baseline)["patch"])
+        self.assertEqual(history.diff(self.project, names_only=True)["patch"], "")
+
+    def test_diff_refuses_unmanaged_invalid_and_large_output(self):
+        with self.assertRaisesRegex(history.HistoryError, "managed"):
+            history.diff(self.project)
+        history.ensure(self.project)
+        for commit in ("HEAD", "0" * 40):
+            with self.assertRaises(history.HistoryError):
+                history.diff(self.project, commit=commit)
+        self.file.write_text("a" * (history.MAX_DIFF_BYTES + 1), encoding="utf-8")
+        with self.assertRaisesRegex(history.HistoryError, "size limit"):
+            history.diff(self.project)
+
+    def test_read_only_history_does_not_refresh_the_git_index(self):
+        history.ensure(self.project)
+        index = self.project / ".git" / "index"
+        before = index.read_bytes()
+        old = self.file.stat().st_mtime
+        os.utime(self.file, (old, old - 5))
+        self.assertEqual(history.diff(self.project, names_only=True)["paths"], [])
+        self.assertFalse(history.status_summary(self.project)["dirty"])
+        self.assertEqual(index.read_bytes(), before)
 
 
 if __name__ == "__main__":
