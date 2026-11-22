@@ -1988,8 +1988,12 @@ function matchView(target) {
             replay.type = "checkbox"; replay.checked = m.recordDemo === true;
             replay.addEventListener("change", () => { m.recordDemo = replay.checked; });
             replayLabel.append(replay);
+            const extra = element("input"), extraLabel = element("label", "field", "Extra Units Pack");
+            extra.type = "checkbox"; extra.checked = m.extraUnits === true;
+            extra.addEventListener("change", () => { m.extraUnits = extra.checked; });
+            extraLabel.append(extra);
             const startLabel = (m.seriesGames || 1) > 1 ? `Start ${m.seriesGames}-game series` : "Start match";
-            settings.append(minuteLabel, skipLabel, replayLabel, button(startLabel, async () => {
+            settings.append(minuteLabel, skipLabel, replayLabel, extraLabel, button(startLabel, async () => {
                 try {
                     if (dirty().length) throw Error("Save and install profile changes before testing.");
                     if (!minutes.reportValidity()) return;
@@ -2009,6 +2013,7 @@ function matchView(target) {
                         minutes: m.minutes,
                         skip_smoke: m.skip,
                         record_demo: m.recordDemo === true,
+                        extra_units: m.extraUnits === true,
                     };
                     if ((m.seriesGames || 1) > 1) {
                         const selectedMaps = m.seriesMaps.length ? m.seriesMaps : [m.map];

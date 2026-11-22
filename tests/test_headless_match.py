@@ -55,6 +55,27 @@ class HeadlessMatchTests(unittest.TestCase):
             self.assertEqual(details["telemetry"]["end_frame"], 1800)
         self.assertEqual(popen.call_count, 2)
 
+    @patch("app.headless.subprocess.Popen")
+    def test_extra_units_pack_applies_to_smoke_and_match(self, popen):
+        def launch(command, **kwargs):
+            run = Path(command[-1]).parent
+            self.assertIn("experimentalextraunits=1;", (run / "script.txt").read_text(encoding="utf-8"))
+            (run / "infolog.txt").write_text(
+                "Skirmish AI <AI-1>: Load script: script/hard/main.as\n"
+                "[f=0001800] Executing debugcommand, quitforce\n", encoding="utf-8"
+            )
+            return process
+
+        process = unittest.mock.Mock()
+        process.poll.return_value = process.wait.return_value = 0
+        popen.side_effect = launch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "spring-headless.exe").touch()
+            self.assertNotIn("experimentalextraunits=", headless.build_script("Map", "Game", self.players, 1))
+            run_match(root, root, root, "Map", "Game", self.players, 1, self.stop, extra_units=True)
+        self.assertEqual(popen.call_count, 2)
+
     def test_match_telemetry_associates_startup_and_explicit_team_events(self):
         log = r"""
 [t=00:00:08.800001][f=-000001] Skirmish AI <AI-1>: Load script: LuaRules\Configs\BARb\stable\script\hard\main.as

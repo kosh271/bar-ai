@@ -199,9 +199,12 @@ def _section(name: str, values: dict[str, str | int | dict]) -> str:
     return "\n".join([*lines, "}"])
 
 
-def build_script(map_name: str, game: str, players: list[Player], minutes: int, record_demo: bool = False) -> str:
+def build_script(map_name: str, game: str, players: list[Player], minutes: int, record_demo: bool = False, *,
+                 extra_units: bool = False) -> str:
     if type(record_demo) is not bool:
         raise MatchError("record_demo must be a boolean.")
+    if type(extra_units) is not bool:
+        raise MatchError("extra_units must be a boolean.")
     if not 0 < minutes <= 2147483647 // 1800 or not players or {p.ally for p in players} != {0, 1}:
         raise MatchError("Enter a positive time limit and at least one AI on each side.")
     lines = [
@@ -225,10 +228,13 @@ def build_script(map_name: str, game: str, players: list[Player], minutes: int, 
         }))
     for ally in (0, 1):
         lines.append(_section(f"ALLYTEAM{ally}", {"NumAllies": 0}))
-    lines.append(_section("MODOPTIONS", {
+    options = {
         "MinSpeed": 20, "MaxSpeed": 20, "experimentallegionfaction": 1,
         "debugcommands": f"{minutes * 60 * 30}:quitforce",
-    }))
+    }
+    if extra_units:
+        options["experimentalextraunits"] = 1
+    lines.append(_section("MODOPTIONS", options))
     return "\n".join([*lines, "}", ""])
 
 
@@ -540,9 +546,9 @@ def _smoke_load_errors(text: str, players: list[Player]) -> list[str]:
 def _run_smoke(
     engine: Path, data: Path, local_data: Path, map_name: str, game: str,
     players: list[Player], stop: threading.Event, *,
-    process_started: Callable[[subprocess.Popen], None] | None = None,
+    process_started: Callable[[subprocess.Popen], None] | None = None, extra_units: bool = False,
 ) -> tuple[bool, str, Path]:
-    script = build_script(map_name, game, players, SMOKE_MINUTES)
+    script = build_script(map_name, game, players, SMOKE_MINUTES, extra_units=extra_units)
     if not (engine / "spring-headless.exe").is_file():
         raise MatchError(f"Headless engine not found: {engine}")
     runs = local_data / "matches"
@@ -631,8 +637,9 @@ def _run_match(
     engine: Path, data: Path, local_data: Path, map_name: str, game: str,
     players: list[Player], minutes: int, stop: threading.Event, *, archive_cache: Path,
     process_started: Callable[[subprocess.Popen], None] | None = None, record_demo: bool = False,
+    extra_units: bool = False,
 ) -> tuple[str, Path]:
-    script = build_script(map_name, game, players, minutes, record_demo)
+    script = build_script(map_name, game, players, minutes, record_demo, extra_units=extra_units)
     if not (engine / "spring-headless.exe").is_file():
         raise MatchError(f"Headless engine not found: {engine}")
     runs = local_data / "matches"
@@ -764,8 +771,9 @@ def run_match(
     players: list[Player], minutes: int, stop: threading.Event,
     progress: Callable[[MatchProgress], None] | None = None, *, skip_smoke: bool = False,
     process_started: Callable[[subprocess.Popen], None] | None = None, record_demo: bool = False,
+    extra_units: bool = False,
 ) -> tuple[str, Path]:
-    build_script(map_name, game, players, minutes, record_demo)
+    build_script(map_name, game, players, minutes, record_demo, extra_units=extra_units)
     if stop.is_set():
         raise MatchError("Stopped before the match started.")
     if skip_smoke:
@@ -778,6 +786,7 @@ def run_match(
         try:
             passed, summary, smoke_path = _run_smoke(
                 engine, data, local_data, map_name, game, players, stop, process_started=process_started,
+                extra_units=extra_units,
             )
         except (MatchError, OSError, ValueError) as error:
             if progress is not None:
@@ -802,7 +811,8 @@ def run_match(
     started = time.monotonic()
     try:
         result, match_path = _run_match(engine, data, local_data, map_name, game, players, minutes, stop,
-                                        archive_cache=cache, process_started=process_started, record_demo=record_demo)
+                                        archive_cache=cache, process_started=process_started, record_demo=record_demo,
+                                        extra_units=extra_units)
     except (MatchError, OSError, ValueError) as error:
         if progress is not None:
             progress(MatchProgress("match", "Stopped" if stop.is_set() else "Failed",

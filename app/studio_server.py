@@ -456,6 +456,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 record_demo = payload.get("record_demo", False)
                 if type(record_demo) is not bool:
                     raise ValueError("record_demo must be a boolean.")
+                extra_units = payload.get("extra_units", False)
+                if type(extra_units) is not bool:
+                    raise ValueError("extra_units must be a boolean.")
                 return self._json(200, self.server.match_service.start(
                     payload["bar_root"],
                     payload["engine"],
@@ -464,7 +467,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     payload["players"],
                     payload["minutes"],
                     payload["skip_smoke"],
-                    series=payload.get("series"), record_demo=record_demo,
+                    series=payload.get("series"), record_demo=record_demo, extra_units=extra_units,
                 ))
             if parsed.path == "/api/match/replay/copy":
                 self._require_fields(payload, ("run_id", "path"))

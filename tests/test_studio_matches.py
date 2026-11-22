@@ -136,15 +136,17 @@ class MatchServiceTests(unittest.TestCase):
     def test_scan_and_match_report_serializable_progress_and_logs(self):
         self.assertEqual(self.scan()["result"]["content"], CONTENT)
 
-        def run(engine, data, local, map_name, game, players, minutes, stop, progress, *, skip_smoke, process_started, record_demo):
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
+                skip_smoke, process_started, record_demo, extra_units):
             self.assertTrue(skip_smoke)
+            self.assertTrue(extra_units)
             self.assertEqual(players[0].name, "Display")
             progress(MatchProgress("smoke", "Skipped"))
             progress(MatchProgress("match", "Winner: side 1.", 4, "Done"))
             return "Smoke skipped\nWinner: side 1.", self.root / "match"
 
         with patch("app.studio_matches.headless.run_match", side_effect=run):
-            self.service.start("bar", "engine", "Game", "Map", PLAYERS, 30, True)
+            self.service.start("bar", "engine", "Game", "Map", PLAYERS, 30, True, extra_units=True)
             status = self.wait()
         self.assertEqual(status["state"], "completed")
         self.assertEqual(status["phase"], "match")
@@ -235,7 +237,8 @@ class MatchServiceTests(unittest.TestCase):
         smoke.poll.return_value = None
         match.poll.return_value = None
 
-        def run(engine, data, local, map_name, game, players, minutes, stop, progress, *, skip_smoke, process_started, record_demo):
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
+                skip_smoke, process_started, record_demo, extra_units):
             process_started(smoke)
             smoke_ready.set()
             advance.wait(2)
@@ -312,7 +315,8 @@ class MatchServiceTests(unittest.TestCase):
         self.assertEqual(status["state"], "failed")
         self.assertIn("Profile", status["error"])
 
-        def run(engine, data, local, map_name, game, players, minutes, stop, progress, *, skip_smoke, process_started, record_demo):
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
+                skip_smoke, process_started, record_demo, extra_units):
             progress(MatchProgress("smoke", "Failed", 1, "Smoke logs: smoke"))
             return "Smoke test failed", self.root / "smoke"
 
@@ -340,7 +344,8 @@ class MatchServiceTests(unittest.TestCase):
         self.assertEqual(status["state"], "completed")
         self.assertEqual(status["result"]["catalog"], catalog)
         self.assertEqual(self.service.latest_catalog(), catalog)
-        def fail_smoke(engine, data, local, map_name, game, players, minutes, stop, progress, *, skip_smoke, process_started, record_demo):
+        def fail_smoke(engine, data, local, map_name, game, players, minutes, stop, progress, *,
+                       skip_smoke, process_started, record_demo, extra_units):
             progress(MatchProgress("smoke", "Failed"))
             return "Smoke test failed", self.root
         with patch("app.studio_matches.headless.run_match", side_effect=fail_smoke):
@@ -451,7 +456,8 @@ class MatchServiceTests(unittest.TestCase):
             def cancel(self):
                 pass
 
-        def run(engine, data, local, map_name, game, players, minutes, stop, progress, *, skip_smoke, process_started, record_demo):
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
+                skip_smoke, process_started, record_demo, extra_units):
             self.assertTrue(stop.is_set())
             raise MatchError("Stopped")
 

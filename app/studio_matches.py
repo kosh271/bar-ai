@@ -905,7 +905,7 @@ class MatchService:
 
     def _run_game(
         self, engine_dir: Path, data: Path, map_name: str, game: str, players: list[headless.Player],
-        minutes: int, *, skip_smoke: bool, record_demo: bool = False, label: str = "",
+        minutes: int, *, skip_smoke: bool, record_demo: bool = False, extra_units: bool = False, label: str = "",
         real_time_deadline: float | None = None,
     ) -> tuple[str, Path, bool, bool, list[dict]]:
         game_stop = threading.Event()
@@ -951,6 +951,7 @@ class MatchService:
             summary, path = headless.run_match(
                 engine_dir, data, self.local_data, map_name, game, players, minutes, game_stop,
                 progress, skip_smoke=skip_smoke, process_started=process_started, record_demo=record_demo,
+                extra_units=extra_units,
             )
         except Exception as error:
             if timed_out.is_set():
@@ -1283,7 +1284,7 @@ class MatchService:
     def start(
         self, bar_root: str | Path, engine: str, game: str, map_name: str,
         players: list[dict], minutes: int, skip_smoke: bool = False,
-        series: dict | None = None, *, record_demo: bool = False,
+        series: dict | None = None, *, record_demo: bool = False, extra_units: bool = False,
     ) -> dict:
         """Start a match or benchmark series from the last successful scan.
 
@@ -1292,6 +1293,8 @@ class MatchService:
         """
         if type(record_demo) is not bool:
             raise headless.MatchError("record_demo must be a boolean.")
+        if type(extra_units) is not bool:
+            raise headless.MatchError("extra_units must be a boolean.")
         players = copy.deepcopy(players)
         series = copy.deepcopy(series)
 
@@ -1326,7 +1329,7 @@ class MatchService:
             ) -> tuple[str, Path | None, bool, bool, list[dict]]:
                 return self._run_game(
                     engine_dir, selected.data, game_map, game, game_players, minutes,
-                    skip_smoke=skip_smoke, record_demo=record_demo, label=label_prefix,
+                    skip_smoke=skip_smoke, record_demo=record_demo, extra_units=extra_units, label=label_prefix,
                 )
 
             def record_single_history(
