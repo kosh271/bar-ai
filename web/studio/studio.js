@@ -11,7 +11,8 @@ const state = {
         content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "",
         first: "", second: "", faction1: "Armada", faction2: "Cortex",
         side1: [], side2: [], seriesGames: 1, swapSides: false, seriesMaps: [], factionPairs: [],
-        minutes: 120, skip: false, snapshot: null, statusError: ""
+        minutes: 120, skip: false, snapshot: null, statusError: "",
+        history: [], historyFilters: {project: "", profile: "", map: "", checkpoint: ""}, historyError: ""
     }
 };
 const pages = {
@@ -1424,6 +1425,90 @@ function renderSeriesScoreboard(container, series) {
     }
     container.replaceChildren(...nodes);
 }
+function renderMatchHistory(container) {
+    if (!container) return;
+    if (state.match.historyError) {
+        container.replaceChildren(notice("Cannot load match history: " + state.match.historyError, true));
+        return;
+    }
+    const entries = state.match.history || [];
+    if (!entries.length) {
+        container.replaceChildren(element("p", "muted", "No recorded matches or benchmark series match the current filters."));
+        return;
+    }
+    const wrap = element("div", "table-wrap"), table = element("table"), head = element("tr");
+    for (const label of ["When", "Run", "Map(s)", "Matchup", "Outcome", "Duration", "Checkpoint & Sync", "Logs"]) {
+        head.append(element("th", "", label));
+    }
+    table.append(head);
+    for (const entry of entries) {
+        const tr = element("tr");
+        const when = entry.timestamp ? entry.timestamp.replace("T", " ").replace("+00:00", " UTC") : "—";
+        const kindLabel = entry.kind === "series" ? `Series (${entry.state})` : `Match (${entry.state})`;
+        const mapLabel = (Array.isArray(entry.maps) && entry.maps.length) ? entry.maps.join(", ") : (entry.map || "—");
+        const players = Array.isArray(entry.players) ? entry.players : [];
+        const side1 = players.filter(p => p.ally === 0).map(p => `${p.short_name}${p.profile ? `/${p.profile}` : ""} (${p.faction})`).join(" + ") || "—";
+        const side2 = players.filter(p => p.ally === 1).map(p => `${p.short_name}${p.profile ? `/${p.profile}` : ""} (${p.faction})`).join(" + ") || "—";
+        const syncCell = element("td");
+        const projects = Array.isArray(entry.projects) ? entry.projects : [];
+        if (!projects.length) {
+            syncCell.append(element("span", "muted", "Stock / unlinked"));
+        } else {
+            for (const proj of projects) {
+                const shortCommit = proj.checkpoint ? proj.checkpoint.slice(0, 8) : "none";
+                if (proj.clean) {
+                    syncCell.append(element("span", "badge-clean", `${proj.project}: Clean · ${shortCommit}`));
+                } else {
+                    const flags = [];
+                    if (!proj.checkpoint) flags.push("No checkpoint");
+                    if (proj.uncheckpointed_changes) flags.push("Uncheckpointed");
+                    if (proj.install_drift) flags.push(`Install: ${proj.install_status || "drift"}`);
+                    syncCell.append(element("span", "badge-dirty", `${proj.project}: ${shortCommit} · ${flags.join(", ") || "Dirty"}`));
+                }
+            }
+        }
+        const logs = element("td");
+        if (Array.isArray(entry.series?.games) && entry.series.games.length) {
+            const details = element("details");
+            details.append(element("summary", "", "Game logs"));
+            for (const game of entry.series.games) {
+                details.append(matchLogButton(game.run_dir, `Game ${game.game_index}`));
+            }
+            logs.append(details);
+        } else {
+            logs.append(matchLogButton(entry.run_dir));
+        }
+        const matchup = element("td", "", `${side1} vs ${side2}`);
+        tr.append(
+            element("td", "", when),
+            element("td", "", kindLabel),
+            element("td", "", mapLabel),
+            matchup,
+            element("td", "", entry.outcome || "—"),
+            element("td", "", typeof entry.elapsed_seconds === "number" ? `${entry.elapsed_seconds.toFixed(1)}s` : "—"),
+            syncCell, logs
+        );
+        table.append(tr);
+    }
+    wrap.append(table);
+    container.replaceChildren(wrap);
+}
+async function loadMatchHistory() {
+    const filters = state.match.historyFilters || {};
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+        if (value && value.trim()) params.set(key, value.trim());
+    }
+    const query = params.toString();
+    try {
+        const result = await api("/api/match/history" + (query ? "?" + query : ""));
+        state.match.history = result.history || [];
+        state.match.historyError = "";
+    } catch (error) {
+        state.match.historyError = errorText(error);
+    }
+    renderMatchHistory($("match-history-body"));
+}
 function matchView(target) {
     const m = state.match, panel = element("div", "panel");
     const info = state.settings;
@@ -1695,7 +1780,35 @@ function matchView(target) {
             if (content.warnings.length) panel.append(notice("Scan warnings: " + content.warnings.join("; "), true));
         }
     }
-    target.append(panel);
+    const historyPanel = element("div", "panel");
+    historyPanel.id = "match-history-panel";
+    historyPanel.append(element("h2", "", "Match history"),
+        element("p", "muted", "Persisted outcomes linked to participating project checkpoints and install status."));
+    const filterRow = element("div", "history-filters");
+    const [projFilterLbl, projFilterInput] = textInput("Project", m.historyFilters.project, "e.g. MyAI");
+    const [profFilterLbl, profFilterInput] = textInput("Profile", m.historyFilters.profile, "e.g. hard");
+    const [mapFilterLbl, mapFilterInput] = textInput("Map", m.historyFilters.map, "Map name");
+    const [ckptFilterLbl, ckptFilterInput] = textInput("Checkpoint", m.historyFilters.checkpoint, "Commit prefix");
+    const syncFilters = () => {
+        m.historyFilters = {
+            project: projFilterInput.value,
+            profile: profFilterInput.value,
+            map: mapFilterInput.value,
+            checkpoint: ckptFilterInput.value,
+        };
+    };
+    filterRow.append(projFilterLbl, profFilterLbl, mapFilterLbl, ckptFilterLbl,
+        button("Apply filters", () => { syncFilters(); loadMatchHistory(); }),
+        button("Clear", () => {
+            m.historyFilters = {project: "", profile: "", map: "", checkpoint: ""};
+            projFilterInput.value = profFilterInput.value = mapFilterInput.value = ckptFilterInput.value = "";
+            loadMatchHistory();
+        }));
+    const historyBody = element("div");
+    historyBody.id = "match-history-body";
+    renderMatchHistory(historyBody);
+    historyPanel.append(filterRow, historyBody);
+    target.append(panel, historyPanel);
 }
 function matchActivity(snapshot, error) {
     if (error) return "Status unavailable — cannot verify engine. Retrying…";
@@ -1772,6 +1885,8 @@ async function pollMatch() {
                         if (state.match.scanSettingsKey === matchSettingsKey(state.settings)) state.match.cacheKey = "";
                         await loadCachedMatchContent();
                     }
+                } else if (snapshot.operation === "match") {
+                    await loadMatchHistory();
                 }
                 if (state.page === "match") render();
                 break;
@@ -1780,7 +1895,11 @@ async function pollMatch() {
         }
     } finally { matchPoll = null; }
 }
-function navigate(page) { state.page = page; render(); }
+function navigate(page) {
+    state.page = page;
+    render();
+    if (page === "match") loadMatchHistory();
+}
 function render() {
     $("breadcrumb").textContent = pages[state.page][0];
     document.querySelectorAll("#navigation button").forEach(b => {

@@ -85,7 +85,6 @@ class StudioServerTests(unittest.TestCase):
             "/api/state", headers={"Origin": "http://attacker.example"},
         )
         self.assertEqual(status, 403)
-
         status, _, _ = self._request("/api/state", headers={"Host": "attacker.example"})
         self.assertEqual(status, 403)
         status, state, headers = self._request("/api/state")
@@ -767,6 +766,71 @@ class StudioInstallSeriesHistoryTests(unittest.TestCase):
         installed_main.write_text("external", encoding="utf-8")
         status, info = self._request("/api/install-status?project=ExampleAI")
         self.assertEqual((status, info["status"]), (200, "modified_externally"))
+
+    def test_match_series_start_and_persistent_history_endpoint(self):
+        self.assertEqual(self._request("/api/match/history", token=False)[0], 401)
+        self.assertEqual(self._request("/api/match/history?unknown=1")[0], 400)
+        self.assertEqual(self._request("/api/match/history?limit=0")[0], 400)
+
+        bar_root, data, engine = self._setup_bar()
+        scan_content_data = {
+            "maps": [{"name": "Map", "width": 512, "height": 512}, {"name": "Map2", "width": 512, "height": 512}],
+            "games": ["Game"],
+            "ais": [{"short_name": "ExampleAI", "version": "1", "name": "Example AI",
+                     "profiles": [{"key": "hard", "name": "Hard"}]}],
+            "warnings": [],
+        }
+        with patch("app.studio_matches.headless.scan_content", return_value=scan_content_data):
+            self._request("/api/match/scan", method="POST", body={"bar_root": str(bar_root), "engine": engine})
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if self._request("/api/match/status")[1]["state"] == "completed":
+                    break
+                time.sleep(0.01)
+
+        with patch("app.studio_matches.headless.run_match", return_value=("Winner: side 1.", self.root / "m")):
+            status, started = self._request("/api/match/start", method="POST", body={
+                "bar_root": str(bar_root),
+                "engine": engine,
+                "game": "Game",
+                "map_name": "Map",
+                "players": [
+                    {"short_name": "ExampleAI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+                    {"short_name": "ExampleAI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+                    {"short_name": "ExampleAI", "version": "1", "profile": "hard", "faction": "Cortex", "ally": 1},
+                ],
+                "minutes": 15,
+                "skip_smoke": True,
+                "series": {"games": 2, "swap_sides": True, "maps": ["Map", "Map2"]},
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(started["operation"], "match")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                snapshot = self._request("/api/match/status")[1]
+                if snapshot["state"] not in ("running", "cancelling"):
+                    break
+                time.sleep(0.01)
+        self.assertEqual(snapshot["state"], "completed")
+        self.assertEqual(snapshot["series"]["side1_wins"], 1)
+        self.assertEqual(snapshot["series"]["side2_wins"], 1)
+
+        # Restart a new StudioServer pointing at the same root and verify persisted history
+        server2 = StudioServer(
+            ("127.0.0.1", 0),
+            projects_root=self.projects,
+            settings_path=self.settings,
+            studio_root=self.studio,
+        )
+        self.addCleanup(server2.server_close)
+        server2.match_service = MatchService(self.root, projects_root=self.projects)
+        self.assertEqual(len(server2.match_service.history()), 1)
+
+        status, hist = self._request("/api/match/history?project=ExampleAI&map=Map2")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(hist["history"]), 1)
+        self.assertEqual(hist["history"][0]["kind"], "series")
+
 
 if __name__ == "__main__":
     unittest.main()

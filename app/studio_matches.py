@@ -20,11 +20,12 @@ import threading
 import time
 import uuid
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from shutil import copyfileobj
 from typing import Callable
 
-from . import discovery, headless, installation, settings
+from . import discovery, headless, installation, project_history, settings
 from .unit_catalog import valid_catalog
 
 
@@ -61,6 +62,7 @@ class MatchService:
         )
         self.local_data = self.root / "data" / "studio-matches"
         self._lock = threading.Lock()
+        self._history_lock = threading.Lock()
         self._stop = threading.Event()
         self._game_stop: threading.Event | None = None
         self._state: dict = self._empty_state()
@@ -554,6 +556,43 @@ class MatchService:
                 faction_pairs.append([pair[0], pair[1]])
         return {"games": games, "swap_sides": swap_sides, "maps": maps, "faction_pairs": faction_pairs}
 
+    def _capture_project_snapshots(
+        self, players: list[headless.Player], data: Path, engine: str,
+    ) -> list[dict]:
+        snapshots: list[dict] = []
+        seen: set[str] = set()
+        for player in players:
+            key = player.short_name
+            if key in seen:
+                continue
+            seen.add(key)
+            project_dir = self.projects_root / key
+            try:
+                if (installation._link(project_dir) or not project_dir.is_dir()
+                        or not (project_dir / "project.json").is_file()):
+                    continue
+            except OSError:
+                continue
+            hist = project_history.status_summary(project_dir)
+            try:
+                inst = installation.inspect_status(project_dir, data, engine)
+            except (installation.InstallationError, OSError) as error:
+                inst = {"status": "error", "message": str(error)}
+            checkpoint = hist.get("checkpoint")
+            dirty = hist.get("dirty")
+            install_status = inst.get("status")
+            snapshots.append({
+                "project": key,
+                "checkpoint": checkpoint,
+                "checkpoint_description": hist.get("checkpoint_description"),
+                "uncheckpointed_changes": dirty,
+                "history_error": hist.get("error"),
+                "install_status": install_status,
+                "install_drift": install_status != "up_to_date",
+                "clean": bool(checkpoint) and (dirty is False) and (install_status == "up_to_date"),
+            })
+        return snapshots
+
     def _matches_dir(self) -> Path:
         matches_dir = self.local_data / "matches"
         installation._check_links(self.root, self.local_data)
@@ -575,6 +614,231 @@ class MatchService:
             return relative.as_posix()
         except (OSError, ValueError, installation.InstallationError):
             return None
+
+    def _enrich_result_json(self, path: Path | None, metadata: dict) -> None:
+        if path is None:
+            return
+        rel = self._relative_run_dir(path)
+        if rel is None:
+            return
+        result_file = path / "result.json"
+        if installation._link(result_file) or not result_file.is_file():
+            return
+        try:
+            existing = json.loads(result_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        if not isinstance(existing, dict):
+            return
+        existing.update(metadata)
+        descriptor, temp_name = tempfile.mkstemp(prefix=".result-", dir=path)
+        temporary = Path(temp_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                json.dump(existing, output, indent=2, ensure_ascii=False)
+                output.write("\n")
+            os.replace(temporary, result_file)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _load_history_entries_unlocked(self) -> list[dict]:
+        matches_dir = self._matches_dir()
+        history_path = matches_dir / "history.json"
+        installation._check_links(self.root, history_path)
+        if not history_path.exists():
+            return []
+        try:
+            data = json.loads(history_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise headless.MatchError(f"Cannot read match history {history_path}: {error}") from error
+        if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+            raise headless.MatchError(f"Invalid match history format in {history_path}.")
+        return [entry for entry in data["entries"] if isinstance(entry, dict)]
+
+    def _append_history(self, entry: dict) -> None:
+        with self._history_lock:
+            matches_dir = self._matches_dir()
+            self.local_data.mkdir(parents=True, exist_ok=True)
+            matches_dir.mkdir(exist_ok=True)
+            history_path = matches_dir / "history.json"
+            try:
+                entries = self._load_history_entries_unlocked()
+            except headless.MatchError:
+                entries = []
+            entries.insert(0, entry)
+            descriptor, temp_name = tempfile.mkstemp(prefix=".history-", dir=matches_dir)
+            temporary = Path(temp_name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                    json.dump({"version": 1, "entries": entries}, output, indent=2, ensure_ascii=False)
+                    output.write("\n")
+                os.replace(temporary, history_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _parse_legacy_script(script_path: Path) -> tuple[str, str, list[dict]]:
+        if installation._link(script_path) or not script_path.is_file():
+            return "", "", []
+        try:
+            text = script_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return "", "", []
+        map_match = re.search(r"(?m)^\s*MapName=([^;\r\n]+);", text)
+        game_match = re.search(r"(?m)^\s*GameType=([^;\r\n]+);", text)
+        map_name = map_match.group(1).strip() if map_match else ""
+        game_name = game_match.group(1).strip() if game_match else ""
+        ais: dict[int, dict] = {}
+        teams: dict[int, dict] = {}
+        for match in re.finditer(r"\[(AI|TEAM)(\d+)\]\s*\{(.*?)\n\}", text, re.DOTALL):
+            kind, idx, body = match.group(1), int(match.group(2)), match.group(3)
+            if kind == "AI":
+                short_m = re.search(r"(?m)^\s*ShortName=([^;\r\n]+);", body)
+                ver_m = re.search(r"(?m)^\s*Version=([^;\r\n]+);", body)
+                prof_m = re.search(r"(?m)^\s*profile=([^;\r\n]+);", body)
+                team_m = re.search(r"(?m)^\s*Team=(\d+);", body)
+                ais[idx] = {
+                    "short_name": short_m.group(1).strip() if short_m else "",
+                    "version": ver_m.group(1).strip() if ver_m else "",
+                    "profile": prof_m.group(1).strip() if prof_m else "",
+                    "team": int(team_m.group(1)) if team_m else idx,
+                }
+            else:
+                ally_m = re.search(r"(?m)^\s*AllyTeam=(\d+);", body)
+                side_m = re.search(r"(?m)^\s*Side=([^;\r\n]+);", body)
+                teams[idx] = {
+                    "ally": int(ally_m.group(1)) if ally_m else 0,
+                    "faction": side_m.group(1).strip() if side_m else "",
+                }
+        players = []
+        for idx in sorted(ais):
+            ai = ais[idx]
+            team = teams.get(ai["team"], {})
+            players.append({
+                "short_name": ai["short_name"],
+                "version": ai["version"],
+                "profile": ai["profile"],
+                "faction": team.get("faction", ""),
+                "ally": team.get("ally", 0),
+                "name": ai["short_name"],
+            })
+        return map_name, game_name, players
+
+    def _legacy_entry_from_dir(self, directory: Path) -> dict | None:
+        result_file = directory / "result.json"
+        if installation._link(result_file) or not result_file.is_file():
+            return None
+        try:
+            payload = json.loads(result_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        script_map, script_game, script_players = self._parse_legacy_script(directory / "script.txt")
+        mtime = datetime.fromtimestamp(result_file.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+        timestamp = payload.get("timestamp") if isinstance(payload.get("timestamp"), str) else mtime
+        game_name = payload.get("game") if isinstance(payload.get("game"), str) else script_game
+        map_name = payload.get("map") if isinstance(payload.get("map"), str) else script_map
+        players = payload.get("players") if isinstance(payload.get("players"), list) else script_players
+        projects = payload.get("projects") if isinstance(payload.get("projects"), list) else []
+        elapsed = payload.get("elapsed_seconds") if isinstance(payload.get("elapsed_seconds"), (int, float)) else None
+        engine = payload.get("engine") if isinstance(payload.get("engine"), str) else ""
+        if "smoke_passed" in payload:
+            passed = bool(payload.get("smoke_passed"))
+            outcome = payload.get("outcome") or ("Smoke test passed." if passed else "Smoke test failed.")
+            state = "completed" if passed else "failed"
+            summary = "\n".join(payload.get("failures", [])) or outcome
+        else:
+            summary = str(payload.get("result", ""))
+            first_line = summary.splitlines()[0] if summary else ""
+            outcome = payload.get("outcome") or first_line or "Unknown"
+            if "Stopped by user" in summary:
+                state = "cancelled"
+            elif any(marker in summary for marker in _FAILURE_MARKERS):
+                state = "failed"
+            else:
+                state = "completed"
+        return {
+            "id": directory.name,
+            "kind": "match",
+            "timestamp": timestamp,
+            "state": state,
+            "engine": engine,
+            "game": game_name,
+            "map": map_name,
+            "maps": [map_name] if map_name else [],
+            "minutes": None,
+            "skip_smoke": directory.name.startswith("match-"),
+            "outcome": outcome,
+            "elapsed_seconds": elapsed,
+            "summary": summary,
+            "run_dir": directory.name,
+            "players": players,
+            "projects": projects,
+            "series": None,
+        }
+
+    def history(
+        self, *, project: str | None = None, profile: str | None = None,
+        map_name: str | None = None, checkpoint: str | None = None, limit: int = 100,
+    ) -> list[dict]:
+        """Return persistent match and series history entries, safely bounded within local_data."""
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise headless.MatchError("History limit must be an integer between 1 and 500.")
+        with self._history_lock:
+            entries = self._load_history_entries_unlocked()
+            matches_dir = self._matches_dir()
+            indexed_dirs: set[str] = set()
+            for entry in entries:
+                if isinstance(entry.get("run_dir"), str) and entry["run_dir"]:
+                    indexed_dirs.add(entry["run_dir"])
+                series_info = entry.get("series")
+                if isinstance(series_info, dict):
+                    for game_item in series_info.get("games", []):
+                        if isinstance(game_item, dict) and isinstance(game_item.get("run_dir"), str):
+                            indexed_dirs.add(game_item["run_dir"])
+            if matches_dir.is_dir():
+                resolved_matches = matches_dir.resolve()
+                for child in sorted(matches_dir.iterdir()):
+                    if child.name in indexed_dirs or not child.name.startswith(("match-", "smoke-")):
+                        continue
+                    installation._check_links(matches_dir, child)
+                    if not child.is_dir() or not child.resolve().is_relative_to(resolved_matches):
+                        continue
+                    legacy = self._legacy_entry_from_dir(child)
+                    if legacy is not None:
+                        entries.append(legacy)
+
+        filtered = []
+        for entry in entries:
+            entry_players = [p for p in entry.get("players", []) if isinstance(p, dict)]
+            entry_projects = [p for p in entry.get("projects", []) if isinstance(p, dict)]
+            entry_maps = [m for m in entry.get("maps", []) if isinstance(m, str) and m]
+            if not entry_maps and isinstance(entry.get("map"), str) and entry["map"]:
+                entry_maps = [entry["map"]]
+            if project:
+                target = project.casefold()
+                if not (
+                    any(str(p.get("short_name", "")).casefold() == target for p in entry_players)
+                    or any(str(p.get("project", "")).casefold() == target for p in entry_projects)
+                ):
+                    continue
+            if profile:
+                target = profile.casefold()
+                if not any(str(p.get("profile", "")).casefold() == target for p in entry_players):
+                    continue
+            if map_name:
+                target = map_name.casefold()
+                if not any(item.casefold() == target for item in entry_maps):
+                    continue
+            if checkpoint:
+                target = checkpoint.casefold()
+                if not any(str(p.get("checkpoint") or "").casefold().startswith(target) for p in entry_projects):
+                    continue
+            filtered.append(entry)
+
+        filtered.sort(key=lambda item: str(item.get("timestamp", "")), reverse=True)
+        return copy.deepcopy(filtered[:limit])
 
     def _classify_game_outcome(
         self, summary: str, path: Path | None, timed_out: bool,
@@ -711,8 +975,10 @@ class MatchService:
             series_cfg = self._validate_series(series, map_name, content)
             headless.build_script(map_name, game, match_players, minutes)
             self._prepare_storage(engine_dir, selected.data)
+            project_snapshots = self._capture_project_snapshots(match_players, selected.data, engine)
             with self._lock:
                 op_id = self._state["id"] or uuid.uuid4().hex
+                run_started_mono = self._state.get("_started") or time.monotonic()
 
             def run_single_game(
                 game_map: str, game_players: list[headless.Player], label_prefix: str = "",
@@ -722,19 +988,79 @@ class MatchService:
                     skip_smoke=skip_smoke, record_demo=record_demo, label=label_prefix,
                 )
 
+            def record_single_history(
+                state_name: str, summary_text: str, outcome_label: str, path: Path | None,
+                duration: float, *, game_map: str = map_name,
+            ) -> None:
+                timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                rel_dir = self._relative_run_dir(path)
+                player_dicts = [asdict(player) for player in match_players]
+                self._enrich_result_json(path, {
+                    "timestamp": timestamp,
+                    "engine": engine,
+                    "game": game,
+                    "map": game_map,
+                    "players": player_dicts,
+                    "outcome": outcome_label,
+                    "elapsed_seconds": round(duration, 2),
+                    "projects": project_snapshots,
+                })
+                self._append_history({
+                    "id": op_id,
+                    "kind": "match",
+                    "timestamp": timestamp,
+                    "state": state_name,
+                    "engine": engine,
+                    "game": game,
+                    "map": game_map,
+                    "maps": [game_map],
+                    "minutes": minutes,
+                    "skip_smoke": skip_smoke,
+                    "outcome": outcome_label,
+                    "elapsed_seconds": round(duration, 2),
+                    "summary": summary_text,
+                    "run_dir": rel_dir,
+                    "players": player_dicts,
+                    "projects": project_snapshots,
+                    "series": None,
+                })
+
             if series_cfg is None:
-                summary, path, was_timed_out, cancelled, events = run_single_game(map_name, match_players)
+                try:
+                    summary, path, was_timed_out, cancelled, events = run_single_game(map_name, match_players)
+                except Exception as error:
+                    duration = max(0.0, time.monotonic() - run_started_mono)
+                    with self._lock:
+                        cancelled = self._stop.is_set() and self._state["cancel_requested"]
+                    outcome_label = (
+                        "Cancelled" if cancelled
+                        else "Timeout" if "real-time deadline" in str(error)
+                        else "Failed"
+                    )
+                    record_single_history(
+                        "cancelled" if cancelled else "failed",
+                        str(error),
+                        outcome_label,
+                        None,
+                        duration,
+                    )
+                    raise
                 logs, telemetry = self._run_artifacts(path, events)
                 result = {"summary": summary, "path": str(path)}
                 if telemetry is not None:
                     result["telemetry"] = telemetry
+                duration = max(0.0, time.monotonic() - run_started_mono)
                 if was_timed_out:
                     result["summary"] += "\nMatch exceeded its real-time deadline."
+                    record_single_history("failed", result["summary"], "Timeout", path, duration)
                     return result, logs, "failed"
                 if cancelled:
                     record_single_history("cancelled", result["summary"], "Cancelled", path, duration)
+                    return result, logs, "cancelled"
                 outcome_code, failed = self._classify_game_outcome(summary, path, False, False, False, events)
                 final_state = "failed" if failed else "completed"
+                outcome_label = summary.splitlines()[0] if summary else outcome_code
+                record_single_history(final_state, result["summary"], outcome_label, path, duration)
                 return result, logs, final_state
 
             # Sequential benchmark series
@@ -837,7 +1163,21 @@ class MatchService:
                     series_state["completed_games"] += 1
 
                 game_player_dicts = [asdict(player) for player in game_players]
-                rel_dir = last_logs.get("run_id") if game_path is not None else None
+                rel_dir = self._relative_run_dir(game_path)
+                game_timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                self._enrich_result_json(game_path, {
+                    "timestamp": game_timestamp,
+                    "engine": engine,
+                    "game": game,
+                    "map": game_map,
+                    "players": game_player_dicts,
+                    "outcome": game_outcome,
+                    "elapsed_seconds": game_elapsed,
+                    "projects": project_snapshots,
+                    "series_id": op_id,
+                    "game_index": idx + 1,
+                    "swapped": swapped,
+                })
                 series_state["games"].append({
                     "game_index": idx + 1,
                     "map": game_map,
@@ -880,6 +1220,27 @@ class MatchService:
                     f"{g['outcome']} ({g['elapsed_seconds']:.1f}s)"
                 )
             series_summary_text = "\n".join(lines)
+            duration = round(max(0.0, time.monotonic() - run_started_mono), 2)
+            series_timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._append_history({
+                "id": op_id,
+                "kind": "series",
+                "timestamp": series_timestamp,
+                "state": overall_state,
+                "engine": engine,
+                "game": game,
+                "map": ", ".join(dict.fromkeys(series_maps)),
+                "maps": list(series_maps),
+                "minutes": minutes,
+                "skip_smoke": skip_smoke,
+                "outcome": tally,
+                "elapsed_seconds": duration,
+                "summary": series_summary_text,
+                "run_dir": self._relative_run_dir(last_path),
+                "players": [asdict(player) for player in match_players],
+                "projects": project_snapshots,
+                "series": copy.deepcopy(series_state),
+            })
             result = {
                 "summary": series_summary_text,
                 "path": str(last_path) if last_path is not None else "",

@@ -668,6 +668,76 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(status["series"]["side1_wins"], 1)
         self.assertEqual(status["series"]["cancelled"], 1)
+        history = self.service.history()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["state"], "cancelled")
+
+    @unittest.skipUnless(os.name != "invalid" and __import__("shutil").which("git"), "Git required")
+    def test_persistent_history_checkpoint_drift_legacy_and_filtering(self):
+        from app import installation, project_history
+        from app.projects import create_project
+
+        source = self.root / "stock-src"
+        (source / "config" / "hard").mkdir(parents=True)
+        (source / "script" / "hard").mkdir(parents=True)
+        (source / "config" / "hard" / "settings.json").write_text("{}", encoding="utf-8")
+        (source / "script" / "hard" / "init.as").write_text("init", encoding="utf-8")
+        (source / "script" / "hard" / "main.as").write_text("main", encoding="utf-8")
+        project = create_project(self.projects, "AI", source)
+        project_history.ensure(project)
+        head = project_history.list_checkpoints(project)[0]["id"]
+        installation.install(project, self.data, self.engine, lambda _m: True)
+
+        self.scan()
+        matches_dir = self.service.local_data / "matches"
+        matches_dir.mkdir(parents=True, exist_ok=True)
+        run1 = matches_dir / "match-run1"
+        run1.mkdir()
+        (run1 / "result.json").write_text(json.dumps({"result": "Winner: side 1."}), encoding="utf-8")
+
+        players = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+        ]
+        with patch("app.studio_matches.headless.run_match", return_value=("Winner: side 1.", run1)):
+            self.service.start(self.bar_root, self.engine, "Game", "Map", players, 30, True)
+            self.assertEqual(self.wait()["state"], "completed")
+
+        enriched = json.loads((run1 / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(enriched["projects"][0]["checkpoint"], head)
+        self.assertTrue(enriched["projects"][0]["clean"])
+
+        # Dirty project and install drift for run 2 (with external path never leaked)
+        (project / "profiles" / "hard" / "script" / "main.as").write_text("edited", encoding="utf-8")
+        external_dir = self.root / "outside"
+        external_dir.mkdir()
+        with patch("app.studio_matches.headless.run_match", return_value=("Engine failed (exit 1)", external_dir)):
+            self.service.start(self.bar_root, self.engine, "Game", "Map2", players, 30, True)
+            self.assertEqual(self.wait()["state"], "failed")
+
+        # Legacy unindexed result.json with script.txt
+        legacy_dir = matches_dir / "match-legacy"
+        legacy_dir.mkdir()
+        (legacy_dir / "result.json").write_text(json.dumps({"result": "Draw."}), encoding="utf-8")
+        (legacy_dir / "script.txt").write_text(
+            "[GAME]\n{\nMapName=LegacyMap;\nGameType=Game;\n"
+            "[AI0]\n{\nShortName=BARb;\nVersion=stable;\nTeam=0;\n[OPTIONS]\n{\nprofile=hard;\n}\n}\n"
+            "[TEAM0]\n{\nAllyTeam=0;\nSide=Armada;\n}\n}\n",
+            encoding="utf-8",
+        )
+
+        restarted = MatchService(self.root, projects_root=self.projects)
+        all_entries = restarted.history()
+        self.assertEqual(len(all_entries), 3)
+        self.assertEqual(len(restarted.history(project="AI")), 2)
+        self.assertEqual(len(restarted.history(map_name="LegacyMap")), 1)
+        self.assertEqual(len(restarted.history(checkpoint=head[:10])), 2)
+        dirty_entry = next(e for e in all_entries if e["state"] == "failed")
+        self.assertIsNone(dirty_entry["run_dir"])
+        self.assertTrue(dirty_entry["projects"][0]["uncheckpointed_changes"])
+        self.assertTrue(dirty_entry["projects"][0]["install_drift"])
+        self.assertFalse(dirty_entry["projects"][0]["clean"])
+
     def test_sync_installed_ai_updates_cached_profiles_without_rescan(self):
         self.scan()
         updated = self.service.sync_installed_ai(

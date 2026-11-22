@@ -191,6 +191,30 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, result)
                 except Exception as error:
                     return self._handle_error(error)
+            if parsed.path == "/api/match/history":
+                try:
+                    query = (
+                        urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+                        if parsed.query else {}
+                    )
+                    allowed = {"project", "profile", "map", "checkpoint", "limit"}
+                    if not set(query) <= allowed or any(len(values) != 1 for values in query.values()):
+                        raise ValueError("Unsupported or duplicate history query parameter.")
+                    limit = 100
+                    if "limit" in query:
+                        raw_limit = query["limit"][0]
+                        if not raw_limit.isdecimal():
+                            raise ValueError("limit must be a positive integer.")
+                        limit = int(raw_limit)
+                    return self._json(200, {"history": self.server.match_service.history(
+                        project=query["project"][0] or None if "project" in query else None,
+                        profile=query["profile"][0] or None if "profile" in query else None,
+                        map_name=query["map"][0] or None if "map" in query else None,
+                        checkpoint=query["checkpoint"][0] or None if "checkpoint" in query else None,
+                        limit=limit,
+                    )})
+                except Exception as error:
+                    return self._handle_error(error)
             if parsed.path == "/api/install-status":
                 try:
                     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
