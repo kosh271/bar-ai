@@ -491,6 +491,7 @@ function overview(target) {
         button("Test match", () => navigate("match"))
     );
     info.append(actions);
+    actions.append(button("Validate profile", () => showValidation(C.validateProfile(state.files, state.catalog))));
     if (selectedProject()?.history_error) info.append(notice("Project history unavailable: " + selectedProject().history_error, true));
     info.append(notice("Compatibility is not verified against the selected DLL. Settings and scripts can behave differently between AI versions."));
     target.append(info);
@@ -2132,21 +2133,73 @@ function render() {
             : "Cannot display this file: " + errorText(error) + ". Use All files to inspect the source.", true));
     }
 }
-async function save() {
-    if (state.saving) return;
-    try {
-        const warnings = [];
-        for (const file of dirty()) {
-            if (!file.path.endsWith(".json")) continue;
-            const issues = validateConfig(file);
-            let originalIssues = [];
-            try { originalIssues = validateConfig({path: file.path, text: file.original}); } catch (_) { /* Original invalid syntax is not a new edit. */ }
-            const introduced = issues.filter(issue => !originalIssues.includes(issue));
-            if (introduced.length) throw Error(introduced.join("\n"));
-            warnings.push(...issues);
+function showValidation({errors, warnings}, title = "Validate profile", next = null) {
+    const box = element("div");
+    if (!errors.length && !warnings.length) box.append(notice("No static issues found."));
+    for (const [heading, findings] of [["Blocking errors", errors], ["Advisory warnings", warnings]]) {
+        if (!findings.length) continue;
+        box.append(element("h3", "", `${heading} (${findings.length})`));
+        const list = element("ul");
+        for (const item of findings) {
+            const row = element("li");
+            row.append(button(`${item.path}:${item.line}`, () => {
+                state.file = item.path;
+                $("dialog").close();
+                navigate("advanced");
+                const textarea = document.querySelector("textarea[data-source]");
+                if (textarea) {
+                    const offset = textarea.value.split("\n").slice(0, item.line - 1)
+                        .reduce((total, line) => total + line.length + 1, 0);
+                    textarea.focus();
+                    textarea.setSelectionRange(offset, offset);
+                }
+            }), element("p", "", item.location ? `${item.location} · ${item.message}` : item.message));
+            list.append(row);
         }
-        const submitted = dirty().map(f => ({path: f.path, text: f.text, sha256: f.sha256}));
+        box.append(list);
+    }
+    if (!state.catalog) box.append(element("p", "muted", "Load a unit catalog to check unit IDs and factory build options."));
+    if (next) box.append(button("Save with warnings", next, "button primary"));
+    showDialog(title, box);
+}
+
+function confirmValidation(report) {
+    return new Promise(resolve => {
+        const dialog = $("dialog");
+        function finish(accepted) {
+            dialog.removeEventListener("close", cancel);
+            resolve(accepted);
+        }
+        function cancel() { if (!dialog.open) finish(false); }
+        dialog.addEventListener("close", cancel);
+        showValidation(report, "Review profile warnings", () => {
+            finish(true);
+            dialog.close();
+        });
+    });
+}
+
+async function save() {
+    if (state.saving) return false;
+    try {
+        const changed = dirty();
+        if (!changed.length) return true;
+        const changedPaths = new Set(changed.map(file => file.path));
+        const current = C.validateProfile(state.files, state.catalog);
+        const previous = C.validateProfile(state.files.map(file => ({...file, text: file.original})), state.catalog);
+        const findingKey = item => JSON.stringify([item.path, item.code, item.location, item.message]);
+        const priorErrors = new Set(previous.errors.map(findingKey));
+        const priorWarnings = new Set(previous.warnings.map(findingKey));
+        const errors = current.errors.filter(item => !priorErrors.has(findingKey(item)) ||
+            (item.code === "json-syntax" && changedPaths.has(item.path)));
+        const warnings = current.warnings.filter(item => !priorWarnings.has(findingKey(item)));
+        if (errors.length) {
+            showValidation({errors, warnings}, "Fix errors before saving");
+            return false;
+        }
         state.saving = true; status();
+        if (warnings.length && !await confirmValidation({errors, warnings})) return false;
+        const submitted = changed.map(f => ({path: f.path, text: f.text, sha256: f.sha256}));
         const result = await api("/api/save", {project: state.project, profile: state.profile, files: submitted});
         for (const saved of result.files) {
             const file = find(saved.path);
@@ -2157,50 +2210,10 @@ async function save() {
         await loadInstallStatus();
         render();
         message("Profile changes saved. Install the AI before testing in BAR." +
-            (warnings.length ? "\nExisting configuration warnings:\n" + warnings.join("\n") : ""), warnings.length > 0);
-    } catch (error) { message("Save failed: " + errorText(error), true); }
+            (warnings.length ? ` Saved with ${warnings.length} advisory ${warnings.length === 1 ? "warning" : "warnings"}.` : ""), warnings.length > 0);
+        return true;
+    } catch (error) { message("Save failed: " + errorText(error), true); return false; }
     finally { state.saving = false; status(); }
-}
-function validateConfig(file) {
-    const root = parse(file), issues = [];
-    const factories = C.at(root, ["factory"]);
-    if (factories?.kind === "object") {
-        for (const fac of factories.children) {
-            const units = C.at(fac.node, ["unit"]);
-            if (!units || units.kind !== "array") continue;
-            for (const situation of ["land", "water", "air"]) {
-                const group = C.at(fac.node, [situation]);
-                if (group?.kind !== "object") continue;
-                for (const tier of group.children) {
-                    if (/^tier\d+$/.test(tier.key) && tier.node.kind === "array" && tier.node.children.length !== units.children.length) {
-                        issues.push(`${file.path}: ${fac.key} ${situation} ${tier.key} has ${tier.node.children.length} weights for ${units.children.length} units.`);
-                    }
-                }
-            }
-        }
-    }
-    const response = C.at(root, ["response"]);
-    if (response?.kind === "object") {
-        for (const role of response.children) {
-            const lists = ["vs", "ratio", "importance"].map(key => C.at(role.node, [key]));
-            if (lists.every(list => list?.kind === "array") && lists.some(list => list.children.length !== lists[0].children.length)) {
-                issues.push(`${file.path}: ${role.key} response list lengths are ${lists.map(list => list.children.length).join(", ")}.`);
-            }
-        }
-    }
-    for (const surface of ["land", "water"]) {
-        const generators = C.at(root, ["economy", "energy", surface]);
-        if (generators?.kind !== "object") continue;
-        for (const generator of generators.children) {
-            const values = generator.node.children;
-            if (generator.node.kind === "array" && values?.length >= 2 &&
-                values[0].node.kind === "number" && values[1].node.kind === "number" &&
-                (!Number.isInteger(values[0].node.value) || !Number.isInteger(values[1].node.value) || values[1].node.value < values[0].node.value)) {
-                issues.push(`${file.path}: ${generator.key} generator count bounds ${values[0].node.value}, ${values[1].node.value} must be whole numbers with upper ≥ lower.`);
-            }
-        }
-    }
-    return issues;
 }
 async function installActiveProject() {
     if (!state.project) throw Error("Select an AI project first.");
@@ -2231,7 +2244,7 @@ async function saveAndInstall({thenTest = false} = {}) {
     if (state.saving) return;
     try {
         if (dirty().length) {
-            await save();
+            if (!await save()) return;
             if (dirty().length) return;
         }
         if (!state.settings) {

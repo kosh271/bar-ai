@@ -63,8 +63,13 @@ window.StudioConfig = (() => {
                 while (clean[pos] !== (object ? "}" : "]")) {
                     let key;
                     if (object) {
+                        const offset = pos;
                         key = string();
-                        if (keys.has(key)) throw Error("Duplicate key: " + path.concat(key).join("."));
+                        if (keys.has(key)) {
+                            const error = Error("Duplicate key: " + path.concat(key).join("."));
+                            error.offset = offset;
+                            throw error;
+                        }
                         keys.add(key); space(); pos++;
                     } else key = children.length;
                     children.push({key, node: read(path.concat(key))});
@@ -228,5 +233,195 @@ window.StudioConfig = (() => {
         }
         return {root, ignored};
     }
-    return {parse, at, patch, scalar, editArrays, appendArray, changeFactoryUnit, previewLayers};
+    const builtInRoles = new Map(Object.entries({
+        BUILDER: "builder", BUILDER2: "builderT2", SCOUT: "scout", RAIDER: "raider", RIOT: "riot",
+        ASSAULT: "assault", SKIRM: "skirmish", ARTY: "artillery", AA: "anti_air", AS: "anti_sub",
+        AH: "anti_heavy", AHA: "anti_heavy_ass", BOMBER: "bomber", SUPPORT: "support", MINE: "mine",
+        TRANS: "transport", AIR: "air", SUB: "sub", STATIC: "static", HEAVY: "heavy", SUPER: "super",
+        COMM: "commander", REZZER: "rezzer"
+    }));
+
+    function validateProfile(files, catalog = null) {
+        const scripts = window.StudioScripts;
+        const errors = [], warnings = [], configs = [];
+        const unitCatalog = catalog && (catalog.byId || new Map(catalog.units.map(unit => [unit.id.toLowerCase(), unit])));
+        const knownRoles = new Set(builtInRoles.values());
+        const roleSymbols = new Set(builtInRoles.keys());
+        const assignedRoles = new Set(), roleReferences = [];
+        function finding(target, code, file, node, message) {
+            const offset = node?.start ?? 0;
+            target.push({code, path: file.path, location: node?.path?.join(" / ") || "",
+                line: file.text.slice(0, offset).split("\n").length, message});
+        }
+        const children = node => node?.children || [];
+        const entries = node => node?.kind === "object" ? node.children : [];
+        function unit(file, node, id = node?.value) {
+            if (unitCatalog && typeof id === "string" && !/^_.+_$/.test(id) && !unitCatalog.has(id.toLowerCase())) {
+                finding(warnings, "unknown-unit", file, node, `Unit "${id}" is absent from the loaded catalog.`);
+            }
+        }
+        function role(file, node, id = node.value) {
+            if (typeof id === "string" && !id.startsWith("_")) roleReferences.push({file, node, id});
+        }
+        function field(file, node, kind, itemKind) {
+            if (!node) return false;
+            if (node.kind === kind && (!itemKind || node.children.every(item => item.node.kind === itemKind))) return true;
+            finding(errors, "config-shape", file, node, `Expected ${itemKind ? "an array of " + itemKind + " values" : "an " + kind}.`);
+            return false;
+        }
+
+        for (const file of files) {
+            if (!/\.json$/i.test(file.path)) continue;
+            const path = file.path.replace(/\\/g, "/");
+            try {
+                const root = parse(file.text);
+                if (path.startsWith("config/")) field(file, root, "object");
+                configs.push({file, root, path});
+            } catch (error) {
+                const offset = error.offset ?? Number(error.message.match(/\bposition (\d+)/)?.[1] ?? 0);
+                finding(errors, "json-syntax", file, {start: offset}, error.message);
+            }
+        }
+
+        const graph = scripts.resolve(files, undefined, {all: true});
+        warnings.push(...graph.issues);
+        for (const file of graph.files) {
+            try {
+                const clean = scripts.mask(file.text);
+                const withStrings = scripts.mask(file.text, true);
+                const pattern = /\bTypeMask\s+(\w+)\s*=\s*(?:AiAddRole|aiRoleMasker\s*\.\s*GetTypeMask)\s*\(\s*"([^"\\]+)"/g;
+                for (const match of withStrings.matchAll(pattern)) {
+                    if (!clean.slice(match.index, match.index + match[0].length).trimStart().startsWith("TypeMask")) continue;
+                    roleSymbols.add(match[1]);
+                    knownRoles.add(match[2]);
+                }
+                for (const match of clean.matchAll(/\bType\s+(\w+)\s*=\s*Unit\s*::\s*Role\s*::\s*\w+\s*\.\s*type\b/g)) {
+                    roleSymbols.add(match[1]);
+                }
+            } catch (_) { /* The include scan already reported unreadable source. */ }
+        }
+        const checkedCommanderFiles = new Set();
+        for (const file of graph.files.filter(file => /(?:^|[\\/])commander\.as$/i.test(file.path))) {
+            const path = file.path.replace(/\\/g, "/");
+            const related = scripts.resolve(files, path, {all: true}).files;
+            for (const script of related) {
+                if (checkedCommanderFiles.has(script.path)) continue;
+                checkedCommanderFiles.add(script.path);
+                try {
+                    for (const {name, offset} of window.StudioOpenings.roleReferences(script.text)) {
+                        if (!roleSymbols.has(name)) {
+                            finding(warnings, "unknown-script-role", script, {start: offset, path: []},
+                                `RT::${name} has no known role declaration.`);
+                        }
+                    }
+                } catch (error) {
+                    finding(warnings, "script-role-scan", script, null, error.message);
+                }
+            }
+        }
+
+        for (const {file, root, path} of configs) {
+            const family = path.split("/").pop();
+            const factories = at(root, ["factory"]);
+            if (/^factory(?:_.*)?\.json$/i.test(family) && field(file, factories, "object")) {
+                const basePath = path.replace(/factory(?:_.*)?\.json$/i, "factory.json");
+                const base = basePath !== path && configs.find(item => item.path === basePath)?.root;
+                for (const fac of entries(factories)) {
+                    unit(file, fac.node, fac.key);
+                    if (!field(file, fac.node, "object")) continue;
+                    const units = at(fac.node, ["unit"]);
+                    if (field(file, units, "array", "string")) {
+                        const builds = unitCatalog?.get(fac.key.toLowerCase())?.builds;
+                        const buildOptions = Array.isArray(builds) && new Set(builds.map(id => id.toLowerCase()));
+                        for (const entry of units.children) {
+                            unit(file, entry.node);
+                            const id = entry.node.value;
+                            if (buildOptions && unitCatalog.has(id.toLowerCase()) && !buildOptions.has(id.toLowerCase())) {
+                                finding(warnings, "factory-build-option", file, entry.node, `"${id}" is absent from ${fac.key}'s catalog build options.`);
+                            }
+                        }
+                    }
+                    const inherited = !units && base && at(base, ["factory", fac.key, "unit"]);
+                    const expected = units?.kind === "array" ? units : inherited?.kind === "array" ? inherited : null;
+                    for (const situation of ["land", "water", "air"]) {
+                        const group = at(fac.node, [situation]);
+                        if (!field(file, group, "object")) continue;
+                        for (const tier of entries(group).filter(tier => /^tier\d+$/.test(tier.key))) {
+                            if (field(file, tier.node, "array", "number") && expected && tier.node.children.length !== expected.children.length) {
+                                finding(inherited ? warnings : errors, inherited ? "factory-inherited-alignment" : "factory-alignment",
+                                    file, tier.node, `${tier.node.children.length} weights for ${expected.children.length} ${inherited ? "candidate base-layer " : ""}units.`);
+                            }
+                        }
+                    }
+                }
+            }
+            if (/^response(?:_.*)?\.json$/i.test(family)) {
+                const response = at(root, ["response"]);
+                if (field(file, response, "object")) for (const entry of entries(response)) {
+                    if (entry.key.startsWith("_")) continue;
+                    if (!field(file, entry.node, "object")) continue;
+                    role(file, entry.node, entry.key);
+                    const lists = ["vs", "ratio", "importance"].map(key => at(entry.node, [key]));
+                    const valid = lists.map((list, index) => field(file, list, "array", index === 0 ? "string" : "number"));
+                    if (valid[0]) for (const item of children(lists[0])) role(file, item.node);
+                    if (valid.every(Boolean) && lists.some(list => list.children.length !== lists[0].children.length)) {
+                        finding(errors, "response-alignment", file, entry.node, `Response list lengths are ${lists.map(list => list.children.length).join(", ")}.`);
+                    }
+                }
+            }
+            if (/^behaviour(?:_.*)?\.json$/i.test(family)) {
+                const behaviour = at(root, ["behaviour"]);
+                if (field(file, behaviour, "object")) for (const entry of entries(behaviour)) {
+                    unit(file, entry.node, entry.key);
+                    const roles = at(entry.node, ["role"]);
+                    if (field(file, roles, "array", "string")) for (const item of roles.children) {
+                        role(file, item.node);
+                        assignedRoles.add(item.node.value);
+                    }
+                }
+            }
+            if (/^block_map(?:_.*)?\.json$/i.test(family)) {
+                unit(file, at(root, ["terrain", "analyze"]));
+                for (const entry of entries(at(root, ["building", "instance"]))) unit(file, entry.node, entry.key);
+            }
+            if (/^build_chain(?:_.*)?\.json$/i.test(family)) {
+                for (const category of entries(at(root, ["build_chain"]))) {
+                    for (const trigger of entries(category.node)) {
+                        unit(file, trigger.node, trigger.key);
+                        for (const chain of children(at(trigger.node, ["hub"]))) {
+                            for (const step of children(chain.node)) unit(file, at(step.node, ["unit"]));
+                        }
+                    }
+                }
+                for (const group of [["unit"], ["superweapon", "unit"], ["wall"], ["choke"], ["default"]]) {
+                    for (const faction of entries(at(root, ["porcupine", ...group]))) {
+                        if (faction.node.kind === "array") for (const entry of faction.node.children) unit(file, entry.node);
+                        else unit(file, faction.node);
+                    }
+                }
+            }
+            for (const surface of ["land", "water"]) {
+                for (const generator of entries(at(root, ["economy", "energy", surface]))) {
+                    const bounds = children(generator.node).slice(0, 2).map(entry => entry.node.value);
+                    if (generator.node.kind === "array" && bounds.length === 2 && bounds.every(value => typeof value === "number") &&
+                        (!bounds.every(Number.isInteger) || bounds[1] < bounds[0])) {
+                        finding(errors, "generator-bounds", file, generator.node,
+                            `Generator count bounds ${bounds.join(", ")} must be whole numbers with upper ≥ lower.`);
+                    }
+                }
+            }
+        }
+        for (const {file, node, id} of roleReferences) {
+            if (!knownRoles.has(id)) {
+                finding(warnings, "unknown-role", file, node, `Role "${id}" has no known declaration.`);
+            } else if (!assignedRoles.has(id) && node.path[0] === "response" && node.path[2] === "vs" &&
+                configs.some(config => at(config.root, ["behaviour"])?.kind === "object")) {
+                finding(warnings, "unassigned-role", file, node, `Role "${id}" has no assignment in this profile's behavior layers.`);
+            }
+        }
+        errors.sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
+        warnings.sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
+        return {errors, warnings};
+    }
+    return {parse, at, patch, scalar, editArrays, appendArray, changeFactoryUnit, previewLayers, validateProfile};
 })();

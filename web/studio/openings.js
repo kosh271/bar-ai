@@ -11,7 +11,7 @@
     "MINE", "TRANS", "AIR", "SUB", "STATIC", "HEAVY", "SUPER", "COMM"
   ];
 
-  function lex(text) {
+  function lex(text, editable = true) {
     const tokens = [];
     let i = 0;
     while (i < text.length) {
@@ -46,12 +46,22 @@
       }
       tokens.push({ value: text.slice(start, i), start: start, end: i });
     }
-    tokens.forEach(function (token, index) {
+    if (editable) tokens.forEach(function (token, index) {
       if (token.value === "#" && (!tokens[index + 1] || tokens[index + 1].value !== "include")) {
         throw Error("Preprocessor directives other than #include are not supported.");
       }
     });
     return tokens;
+  }
+
+  function roleReferences(text) {
+    const tokens = lex(text, false), references = [];
+    for (let i = 0; i + 2 < tokens.length; i++) {
+      if (tokens[i].value === "RT" && tokens[i + 1].value === "::" && /^[A-Za-z_]\w*$/.test(tokens[i + 2].value)) {
+        references.push({name: tokens[i + 2].value, offset: tokens[i].start});
+      }
+    }
+    return references;
   }
 
   function balanced(tokens, start) {
@@ -508,5 +518,5 @@
     return { destroy: function () { disposed = true; while (container.firstChild) container.removeChild(container.firstChild); } };
   }
 
-  window.StudioOpenings = { mount: mount };
+  window.StudioOpenings = { mount: mount, roleReferences: roleReferences };
 }());
