@@ -21,6 +21,17 @@ test("production row changes retain the exact spelling of existing weights", () 
     assert.match(window.StudioConfig.changeFactoryUnit(added, "armfac", "", 1), /\[1\.2500\]/);
 });
 
+test("unit picker combines friendly name or ID queries with faction and role filters", () => {
+    const entries = [
+        {id: "armtest", name: "Rock Thrower", faction: "arm", role: "artillery"},
+        {id: "cortest", name: "Rock Thrower", faction: "cor", role: "assault"},
+        {id: "custom", name: "Constructor", faction: "other", role: ""},
+    ];
+    assert.deepEqual(editors.filterUnits(entries, " THROWER ", "arm", "artillery"), [entries[0]]);
+    assert.deepEqual(editors.filterUnits(entries, "cortest", "", ""), [entries[1]]);
+    assert.deepEqual(editors.filterUnits(entries, "", "other", ""), [entries[2]]);
+});
+
 test("profile comparison distinguishes semantic edits from JSONC formatting and lists file changes", () => {
     const oldFiles = [
         {path: "same.json", text: '{"a":0, "b":[1.0,2,],}'},

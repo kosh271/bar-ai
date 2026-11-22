@@ -15,6 +15,12 @@ window.StudioEditors = (() => {
         return percent.format(share / 100);
     }
 
+    function filterUnits(entries, query, faction, role) {
+        const search = query.trim().toLowerCase();
+        return entries.filter(entry => (!faction || entry.faction === faction) && (!role || entry.role === role) &&
+            (entry.id.toLowerCase().includes(search) || entry.name.toLowerCase().includes(search)));
+    }
+
     function compareFiles(before, after) {
         const left = new Map(before.map(file => [file.path, file.text]));
         const right = new Map(after.map(file => [file.path, file.text]));
@@ -120,5 +126,5 @@ window.StudioEditors = (() => {
         return visible;
     }
 
-    return {weightShares, weightPercent, compareFiles, lineDiff};
+    return {weightShares, weightPercent, filterUnits, compareFiles, lineDiff};
 })();

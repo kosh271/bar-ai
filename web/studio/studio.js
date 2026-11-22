@@ -522,6 +522,152 @@ function unitLabel(id) {
     const name = friendlyUnitName(id);
     return name ? `${name} · ${id}` : id;
 }
+function primaryUnitRoles(preferred) {
+    const roles = new Map();
+    const files = state.files.filter(file => /(?:^|\/)behaviour(?:_[^/]+)?\.json$/i.test(file.path));
+    const roots = preferred ? [preferred] : [];
+    for (const file of files) {
+        try { roots.push(parse(file)); }
+        catch { /* Other editor layers are optional role metadata. */ }
+    }
+    for (const root of roots) {
+        for (const entry of C.at(root, ["behaviour"])?.children || []) {
+            const role = C.at(entry.node, ["role", 0]), id = String(entry.key).toLowerCase();
+            if (role?.kind === "string" && role.value && !roles.has(id)) roles.set(id, role.value);
+        }
+    }
+    return roles;
+}
+let unitPickerSequence = 0;
+function unitPicker(label, ids, selected, onSelect, preferredRoles) {
+    const control = element("div", "field unit-picker"), title = element("span", "", label);
+    const id = `unit-picker-${++unitPickerSequence}`;
+    title.id = id + "-title";
+    const trigger = button("", () => panel.hidden ? open() : close(), "action unit-picker-trigger");
+    trigger.dataset.unitPickerLabel = label;
+    trigger.setAttribute("aria-label", `${label}: ${unitLabel(selected)}`);
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.setAttribute("aria-controls", id);
+    const triggerText = element("span", "", unitLabel(selected));
+    trigger.append(triggerText, element("span", "unit-picker-indicator", "▾"));
+    const panel = element("div", "unit-picker-panel"), filters = element("div", "unit-picker-filters");
+    panel.id = id; panel.hidden = true;
+    const search = element("input"), list = element("div", "unit-picker-results"), count = element("div", "unit-picker-count muted");
+    list.id = id + "-list";
+    search.type = "search"; search.placeholder = "Search by unit name or ID";
+    search.setAttribute("role", "combobox");
+    search.setAttribute("aria-label", `Search ${label.toLowerCase()}`);
+    search.setAttribute("aria-controls", list.id);
+    search.setAttribute("aria-autocomplete", "list");
+    search.setAttribute("aria-expanded", "true");
+    list.setAttribute("role", "listbox"); list.setAttribute("aria-labelledby", title.id);
+    count.setAttribute("role", "status");
+    const factions = [["", "All factions"], ["arm", "Armada"], ["cor", "Cortex"], ["leg", "Legion"], ["other", "Other"]];
+    let role = "", faction = "", choices = [], matching = [], nodes = [], active = -1, iconObserver;
+    let rolesLoaded = false;
+    filters.append(dropdown("Faction", factions, "", value => { faction = value; refresh(); }));
+    panel.append(search, filters, count, list);
+    control.append(title, trigger, panel);
+    function open() {
+        if (!rolesLoaded) {
+            const roles = primaryUnitRoles(preferredRoles);
+            choices = ids.map(id => {
+                const key = id.toLowerCase(), prefix = key.slice(0, 3);
+                return {id, name: friendlyUnitName(id), faction: ["arm", "cor", "leg"].includes(prefix) ? prefix : "other",
+                    role: roles.get(key) || catalogUnit(id)?.role || ""};
+            });
+            const options = [...new Set(choices.map(entry => entry.role).filter(Boolean))].sort();
+            if (options.length) {
+                filters.append(dropdown("Primary role", [["", "All roles"], ...options.map(name => [name, name])], "",
+                    value => { role = value; refresh(); }));
+            }
+            rolesLoaded = true;
+        }
+        panel.hidden = false;
+        trigger.setAttribute("aria-expanded", "true");
+        refresh(); search.focus();
+    }
+    function close(returnFocus = true) {
+        if (panel.hidden) return;
+        iconObserver?.disconnect();
+        panel.hidden = true;
+        trigger.setAttribute("aria-expanded", "false");
+        if (returnFocus) trigger.focus();
+    }
+    function choose(entry) {
+        selected = entry.id;
+        triggerText.textContent = unitLabel(selected);
+        trigger.setAttribute("aria-label", `${label}: ${triggerText.textContent}`);
+        close(); onSelect(selected);
+        if (!trigger.isConnected) {
+            const replacement = [...document.querySelectorAll("[data-unit-picker-label]")]
+                .find(node => node.dataset.unitPickerLabel === label);
+            replacement?.focus();
+        }
+    }
+    function highlight(index, scroll) {
+        nodes[active]?.classList.remove("active");
+        active = index;
+        if (active < 0) { search.removeAttribute("aria-activedescendant"); return; }
+        const node = nodes[active];
+        node.classList.add("active");
+        search.setAttribute("aria-activedescendant", node.id);
+        if (scroll) node.scrollIntoView({block: "nearest"});
+    }
+    function refresh() {
+        iconObserver?.disconnect();
+        matching = window.StudioEditors.filterUnits(choices, search.value, faction, role);
+        count.textContent = matching.length ? `${matching.length} ${matching.length === 1 ? "unit" : "units"}` : "No matching units.";
+        if (state.icons.available && typeof IntersectionObserver === "function") {
+            iconObserver = new IntersectionObserver((entries, observer) => {
+                for (const {target, isIntersecting} of entries) {
+                    if (!isIntersecting || observer !== iconObserver || panel.hidden) continue;
+                    target.prepend(unitIcon(target.dataset.unitId));
+                    observer.unobserve(target);
+                }
+            }, {root: list});
+        }
+        active = -1;
+        nodes = matching.map((entry, index) => {
+            const option = element("div", "unit-picker-option"), name = element("span", "", entry.name || entry.id);
+            option.id = `${list.id}-${index}`;
+            option.dataset.unitId = entry.id;
+            option.setAttribute("role", "option");
+            option.setAttribute("aria-selected", String(entry.id === selected));
+            if (entry.name) name.append(element("small", "muted", entry.id));
+            option.append(name);
+            if (entry.role) option.append(element("span", "muted", entry.role));
+            if (iconObserver) iconObserver.observe(option);
+            else if (state.icons.available) option.prepend(unitIcon(entry.id));
+            option.addEventListener("mousedown", event => event.preventDefault());
+            option.addEventListener("click", () => choose(entry));
+            return option;
+        });
+        list.replaceChildren(...nodes);
+        list.scrollTop = 0;
+        highlight(matching.length ? 0 : -1, false);
+    }
+    search.addEventListener("input", refresh);
+    search.addEventListener("keydown", event => {
+        const offset = event.key === "ArrowDown" ? 1 : event.key === "ArrowUp" ? -1 : 0;
+        if (offset && matching.length) {
+            event.preventDefault();
+            highlight((active + offset + matching.length) % matching.length, true);
+        } else if (event.key === "Enter" && active >= 0) {
+            event.preventDefault(); choose(matching[active]);
+        }
+    });
+    trigger.addEventListener("keydown", event => {
+        if (event.key === "ArrowDown" && panel.hidden) { event.preventDefault(); open(); }
+    });
+    control.addEventListener("keydown", event => {
+        if (event.key === "Escape" && !panel.hidden) {
+            event.preventDefault(); event.stopPropagation(); close();
+        }
+    });
+    control.addEventListener("focusout", event => { if (!control.contains(event.relatedTarget)) close(false); });
+    return control;
+}
 async function loadIconStatus() {
     for (const promise of state.icons.cache.values()) {
         promise.then(url => { if (url) URL.revokeObjectURL(url); });
@@ -651,7 +797,7 @@ function production(target, selected) {
     }
     if (!factories.children.some(e => e.key === state.factory)) state.factory = factories.children[0].key;
     const row = element("div", "row");
-    row.append(dropdown("Factory", factories.children.map(e => [e.key, unitLabel(e.key)]), state.factory, value => { state.factory = value; render(); }),
+    row.append(unitPicker("Factory", factories.children.map(e => e.key), state.factory, value => { state.factory = value; render(); }),
         dropdown("Situation", [["land", "Land"], ["water", "Water"], ["air", "Enemy air"]], state.situation, value => { state.situation = value; render(); }));
     row.append(unitIcon(state.factory));
     panel.append(row);
@@ -729,12 +875,11 @@ function production(target, selected) {
     else if (factoryEntry?.builds) {
         const available = factoryEntry.builds.filter(id => !units.children.some(item => String(item.node.value).toLowerCase() === id.toLowerCase()));
         if (available.length) {
-            const picker = element("select"), choiceLabel = element("label", "field", "Catalog build option"), add = element("div", "row");
-            selectOptions(picker, available.map(id => [id, unitLabel(id)]), available[0]);
-            choiceLabel.append(picker);
-            add.append(choiceLabel, button("Add catalog unit", () => {
+            let choice = available[0];
+            const add = element("div", "row");
+            add.append(unitPicker("Catalog build option", available, choice, value => { choice = value; }), button("Add catalog unit", () => {
                 try {
-                    assign(file, C.changeFactoryUnit(file.text, state.factory, picker.value, null));
+                    assign(file, C.changeFactoryUnit(file.text, state.factory, choice, null));
                     message("Unit added with zero weights. Confirm its availability for your match."); render();
                 } catch (error) { message(errorText(error), true); }
             }));
@@ -843,7 +988,7 @@ function unitsView(panel, file, root) {
     let selected = state.unit;
     if (!units.children.some(e => e.key === selected)) selected = units.children[0].key;
     state.unit = selected;
-    panel.append(dropdown("Unit ID", units.children.map(e => [e.key, unitLabel(e.key)]), selected, value => { state.unit = value; render(); }));
+    panel.append(unitPicker("Unit ID", units.children.map(e => e.key), selected, value => { state.unit = value; render(); }, root));
     panel.append(unitIcon(selected));
     const unit = C.at(units, [selected]);
     if (!unit || unit.kind !== "object") return;
@@ -891,7 +1036,7 @@ function defenseView(panel, file, root) {
     const controls = element("div", "row");
     controls.append(dropdown("Completed building category", categories.map(e => [e.key, e.key]), state.chainCategory,
         value => {state.chainCategory = value; state.chainUnit = ""; render();}),
-        dropdown("Completed building ID", buildings.map(e => [e.key, unitLabel(e.key)]), state.chainUnit,
+        unitPicker("Completed building ID", buildings.map(e => e.key), state.chainUnit,
             value => {state.chainUnit = value; render();}));
     controls.append(unitIcon(state.chainUnit));
     panel.append(element("h3", "", "On building completed"), controls);
