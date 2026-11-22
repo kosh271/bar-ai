@@ -1183,6 +1183,35 @@ function advanced(target) {
     panel.append(label, element("div", "source-bar", "Changes are saved to this profile only. Unknown content is not rewritten."));
     target.append(panel);
 }
+function matchTelemetryView(telemetry, series) {
+    const card = element("section", "panel");
+    card.append(element("h3", "", series ? "Last game telemetry" : "Match telemetry"));
+    const frame = telemetry.end_frame;
+    const timeLabel = telemetry.end_frame_source === "last_log_frame" ? "Last logged game time" : "Game time";
+    const clock = frame == null ? "Game time unavailable" : `${timeLabel} ${telemetry.duration} · frame ${frame}`;
+    card.append(element("p", "muted", `${clock} · AI script errors ${telemetry.ai_script_errors}`));
+    for (const team of [...(telemetry.teams || []), telemetry.unassigned_ai].filter(Boolean)) {
+        const items = [
+            ["Profile loaded", team.profile_loaded], ["Script", team.script_path], ["Factory", team.factory],
+            ["Opener", team.opener], ["Factory switches", team.factory_switches?.join(", ")],
+            ["AI script errors", team.ai_script_errors || null],
+            ["AI script warnings", team.ai_script_warnings || null],
+            ...Object.entries(team.stats || {}).map(([name, amount]) =>
+                [name.replaceAll("_", " ").replace(/^./, char => char.toUpperCase()), amount]),
+        ].filter(([, value]) => value !== null && value !== undefined && value !== "");
+        const details = element("details"), body = element("div", "tree-body");
+        if (team.team === undefined && !items.length) continue;
+        const title = team.team === undefined ? "AI events without a team" :
+            `Side ${team.side} · Team ${team.team} · ${team.ai} · ${team.faction}`;
+        details.append(element("summary", "", title));
+        for (const [label, value] of items) body.append(element("p", "", `${label} · ${value}`));
+        if (!items.length) body.append(element("p", "muted", "This team emitted no recognized telemetry."));
+        details.append(body);
+        card.append(details);
+    }
+    return card;
+}
+
 function matchView(target) {
     const m = state.match, panel = element("div", "panel");
     const info = state.settings;
@@ -1227,6 +1256,7 @@ function matchView(target) {
     if (m.snapshot?.error) panel.append(notice(m.snapshot.error, true));
     if (m.snapshot?.result && m.snapshot.operation === "match") {
         panel.append(element("pre", "", m.snapshot.result.summary || ""));
+        if (m.snapshot.result.telemetry) panel.append(matchTelemetryView(m.snapshot.result.telemetry, m.snapshot.result.series));
     }
     if (m.snapshot?.operation === "match") {
         const logs = m.snapshot.logs || {};

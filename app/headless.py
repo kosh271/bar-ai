@@ -317,6 +317,199 @@ def _diagnostic_preview(diagnostics: list[str], limit: int) -> str:
     return "\n".join((errors + warnings)[:limit])
 
 
+_AI_TAG = re.compile(r"Skirmish AI <([^>]+)>:\s*(.*)", re.IGNORECASE)
+_AI_COMPILE_ERROR = re.compile(r"\(\d+,\s*\d+\)\s*:\s*ERR\b|fix compilation errors|"
+                              r"script: unable to add section", re.IGNORECASE)
+_AI_SCRIPT_WARNING = re.compile(r"\(\d+,\s*\d+\)\s*:\s*WARN\b|(?:angel\s*script|script)\b.*\bwarn\w*\b",
+                                re.IGNORECASE)
+_AI_RUNTIME_ERROR = re.compile(
+    r"\b(?:angel\s*script|script)\b.*\b(?:error|exception|failed|missing)\b|"
+    r"\b(?:exception|runtime error)\b", re.IGNORECASE,
+)
+_ENGINE_NOISE = re.compile(r"\b(?:yardmap|weapondefs?|shader)\b.*\b(?:error|warn\w*|invalid|missing|incorrect|failed)\b|"
+                           r"\b(?:error|warning)\b.*\b(?:yardmap|weapondefs?|shader)\b", re.IGNORECASE)
+
+
+def diagnostic_category(line: str) -> str:
+    message = _diagnostic_message(line)
+    if message in _IGNORED_DIAGNOSTICS or _IGNORED_FEATURE.fullmatch(message) or _ENGINE_NOISE.search(message):
+        return "engine_warning"
+    if (_AI_TAG.search(message) or _AI_COMPILE_ERROR.search(message) or _AI_SCRIPT_WARNING.search(message)
+            or re.search(r"skirmish\s*ai|angel\s*script", message, re.IGNORECASE)):
+        return "ai_script"
+    if re.search(r"\b(?:warning|deprecated):", message, re.IGNORECASE):
+        return "engine_warning"
+    return "engine_error" if _errors(message) else "other"
+
+
+_FRAMED_LINE = re.compile(r"^(?:\[t=[^\]]+\]\s*)?\[f=(\d{1,10})\]")
+_END_GAME = re.compile(r"\bgame\s*over\b|\bgame ended\b|\bexecuting debugcommand\s*,?\s+quitforce\b",
+                       re.IGNORECASE)
+_DEFEAT = re.compile(r"\bteam\s+\d+\b.{0,32}\bdefeated\b", re.IGNORECASE)
+_TEAM_FIELD = re.compile(r"^\[?team(?:\s+|[:=]\s*)(\d{1,4})(?:\]|:)?\s*", re.IGNORECASE)
+_AI_INITIALIZED = re.compile(r"\((\d{1,4})\)\s+initialized!\s*$", re.IGNORECASE)
+_FACTORY = re.compile(r"^(?:selected factory|factory selected|initial factory)\s*[:=]\s*(.+)", re.IGNORECASE)
+_FACTORY_SWITCH = re.compile(r"^(?:switch(?:ed|ing)? factory|factory switch(?:ed)?)\s*[:=]\s*(.+)", re.IGNORECASE)
+_OPENER = re.compile(r"^(?:selected opener|opener(?: queue| chosen)?)\s*[:=]\s*(.+)", re.IGNORECASE)
+_TEAM_STATS = re.compile(r"^team\s+(\d{1,4})\s+stats\s*:\s*(.*)", re.IGNORECASE)
+_STAT_FIELDS = {
+    "metalproduced": "metal_produced", "energyproduced": "energy_produced", "metalused": "metal_used",
+    "energyused": "energy_used", "metalexcess": "metal_excess", "energyexcess": "energy_excess",
+    "unitsproduced": "units_produced", "unitskilled": "units_killed", "unitsdied": "units_died",
+    "unitslost": "units_died", "unitcount": "unit_count", "damagedealt": "damage_dealt",
+    "damagereceived": "damage_received", "metal": "metal", "energy": "energy",
+}
+
+
+def _stats_sample(value: dict) -> dict:
+    stats = {}
+    for key, amount in value.items():
+        field = _STAT_FIELDS.get(str(key).replace("_", "").replace(" ", "").casefold())
+        if field and type(amount) in (int, float) and -1e18 <= amount <= 1e18:
+            stats[field] = amount
+    return stats
+
+
+def _end_stats(run: Path) -> dict[int, dict]:
+    try:
+        with open_artifact(run, "LuaUI", "Config", "teamstats.json") as stream:
+            data = json.loads(stream.read(2 * 1024 * 1024))
+    except (OSError, ValueError, RecursionError, MatchError):
+        return {}
+    if isinstance(data, dict):
+        data = data.get("teams", data)
+    if not isinstance(data, (list, dict)):
+        return {}
+    teams = data.items() if isinstance(data, dict) else enumerate(data)
+    result = {}
+    for index, samples in teams:
+        if isinstance(samples, dict):
+            index = samples.get("team_id", samples.get("team", index))
+            samples = samples.get("samples", samples)
+        if not re.fullmatch(r"[0-9]{1,4}", str(index)):
+            continue
+        if isinstance(samples, list):
+            samples = next((sample for sample in reversed(samples) if isinstance(sample, dict)), {})
+        if isinstance(samples, dict):
+            result[int(index)] = _stats_sample(samples)
+    return result
+
+
+def _ai_telemetry() -> dict:
+    return {"script_path": None, "profile_loaded": None, "factory": None, "opener": None,
+            "factory_switches": [], "ai_script_errors": 0, "ai_script_warnings": 0}
+
+
+def _count_script_diagnostic(team: dict, message: str) -> None:
+    if _AI_COMPILE_ERROR.search(message) or _AI_RUNTIME_ERROR.search(message):
+        team["ai_script_errors"] += 1
+    elif _AI_SCRIPT_WARNING.search(message):
+        team["ai_script_warnings"] += 1
+
+
+def _ai_event(team: dict, message: str) -> None:
+    if message.casefold().startswith("load script:"):
+        script = message.split(":", 1)[1].strip().replace("\\", "/")[:1000]
+        team["script_path"] = script
+        parts = script.split("/")
+        if len(parts) >= 2:
+            team["profile_loaded"] = parts[-2]
+    elif factory := _FACTORY.match(message):
+        team["factory"] = factory[1][:500]
+    elif opener := _OPENER.match(message):
+        team["opener"] = opener[1][:500]
+    elif factory_switch := _FACTORY_SWITCH.match(message):
+        if len(team["factory_switches"]) < 100:
+            team["factory_switches"].append(factory_switch[1][:500])
+    _count_script_diagnostic(team, message)
+
+
+def match_telemetry(run: Path, players: list[Player], log: str, output: str) -> dict:
+    teams = [
+        {**_ai_telemetry(), "team": index, "side": player.ally + 1, "ai": player.name or player.short_name,
+         "profile_requested": player.profile, "faction": player.faction, "stats": {}}
+        for index, player in enumerate(players)
+    ]
+    identities: dict[str, set[int]] = {}
+    for index, player in enumerate(players):
+        tag = f"{player.name or player.short_name}-{player.version}".casefold()
+        identities.setdefault(tag, set()).add(index)
+    unassigned = _ai_telemetry()
+    pending: dict[str, dict] = {}
+    terminal = defeated = last = None
+    end_stats = _end_stats(run)
+    timestamp = re.compile(r"^\[t=[^\]]+\]\s*")
+    logged = Counter(timestamp.sub("", line.strip()) for line in log.splitlines())
+    for source, text in enumerate((log, output)):
+        source_started = False
+        for line in text.splitlines():
+            message = _diagnostic_message(line)
+            key = timestamp.sub("", line.strip())
+            if source and logged[key]:
+                logged[key] -= 1
+                # Duplicate framed lines still provide end-frame evidence below.
+                duplicate = True
+            else:
+                duplicate = False
+            if frame_text := _FRAMED_LINE.match(line):
+                frame = int(frame_text[1])
+                source_started = True
+                last = frame if last is None else max(last, frame)
+                if _END_GAME.search(message):
+                    terminal = frame if terminal is None else min(terminal, frame)
+                if _DEFEAT.search(message):
+                    defeated = frame if defeated is None else max(defeated, frame)
+            if duplicate:
+                continue
+            if stats_line := _TEAM_STATS.match(message):
+                fields = dict(re.findall(r"([\w ]+?)\s*[:=]\s*(-?\d+(?:\.\d+)?)", stats_line[2]))
+                team_id = int(stats_line[1])
+                if team_id < len(teams):
+                    teams[team_id]["stats"].update(_stats_sample({k: float(v) for k, v in fields.items()}))
+            tagged = _AI_TAG.search(message)
+            if not tagged:
+                if _AI_COMPILE_ERROR.search(message) or _AI_SCRIPT_WARNING.search(message) or (
+                    _AI_RUNTIME_ERROR.search(message) and diagnostic_category(line) == "ai_script"
+                ):
+                    _count_script_diagnostic(unassigned, message)
+                continue
+            tag, detail = tagged[1].casefold(), tagged[2].strip()
+            if explicit := _TEAM_FIELD.match(detail):
+                team_id = int(explicit[1])
+                _ai_event(teams[team_id] if team_id < len(teams) else unassigned, detail[explicit.end():])
+            elif initialized := _AI_INITIALIZED.search(detail):
+                team_id = int(initialized[1])
+                events = pending.pop(tag, {})
+                if events:
+                    team = teams[team_id] if team_id < len(teams) else unassigned
+                    errors = team["ai_script_errors"] + events["ai_script_errors"]
+                    warnings = team["ai_script_warnings"] + events["ai_script_warnings"]
+                    team.update(events, ai_script_errors=errors, ai_script_warnings=warnings)
+            elif (candidates := identities.get(tag, set())) and len(candidates) == 1:
+                _ai_event(teams[next(iter(candidates))], detail)
+            else:
+                if detail.casefold().startswith("load script:") and not source_started:
+                    pending.setdefault(tag, _ai_telemetry())
+                _ai_event(pending.get(tag, unassigned), detail)
+    for events in pending.values():
+        unassigned["ai_script_errors"] += events["ai_script_errors"]
+        unassigned["ai_script_warnings"] += events["ai_script_warnings"]
+        if not unassigned["script_path"]:
+            unassigned.update(script_path=events["script_path"], profile_loaded=events["profile_loaded"])
+    for team in teams:
+        team["stats"].update(end_stats.get(team["team"], {}))
+    end_frame = next((frame for frame in (terminal, defeated, last) if frame is not None), None)
+    duration = None
+    if end_frame is not None:
+        minutes, seconds = divmod(end_frame // 30, 60)
+        duration = f"{minutes:02d}:{seconds:02d}" if minutes < 60 else f"{minutes // 60:02d}:{minutes % 60:02d}:{seconds:02d}"
+    end_frame_source = "game_end" if terminal is not None else "team_defeat" if defeated is not None else "last_log_frame"
+    return {"end_frame": end_frame, "end_frame_source": end_frame_source if end_frame is not None else None,
+            "duration": duration, "teams": teams, "unassigned_ai": unassigned,
+            "ai_script_errors": sum(team["ai_script_errors"] for team in [*teams, unassigned]),
+            "ai_script_warnings": sum(team["ai_script_warnings"] for team in [*teams, unassigned])}
+
+
 def _smoke_load_errors(text: str, players: list[Player]) -> list[str]:
     tags: dict[str, set[str]] = {}
     expected: set[tuple[str, str]] = set()
@@ -428,7 +621,7 @@ def _run_smoke(
         summary += "\n" + warning
     (run / "result.json").write_text(json.dumps({
         "smoke_passed": passed, "engine_exit": code, "failures": failures,
-        "engine_diagnostics": diagnostics,
+        "engine_diagnostics": diagnostics, "telemetry": match_telemetry(run, players, log, output),
     }, indent=2) + "\n", encoding="utf-8")
     return passed, summary, run
 
@@ -559,6 +752,7 @@ def _run_match(
         result += "\nThe engine did not shut down gracefully and was terminated."
     (run / "result.json").write_text(json.dumps({
         "result": result, "engine_exit": code, "winning_sides": winner, "errors": errors,
+        "telemetry": match_telemetry(run, players, log, output),
         "replays": replay_files(run) if record_demo else [],
     }, indent=2) + "\n", encoding="utf-8")
     return result, run
