@@ -33,6 +33,16 @@ test("keeps sequence comments and trailing commas through structural edits", () 
     assert.match(removed, /\/\* late-game defense \*\/\r\n/);
 });
 
+test("moves a defense directly to its destination while keeping comments and slot spellings", () => {
+    const original = '{"porcupine":{"land":[1e1, /* first */ 3, 12, 3,],"water":[1]}}';
+    const down = config.editDefenseSequence(original, "land", 0, {moveTo: 3});
+    assert.equal(down, '{"porcupine":{"land":[3, /* first */ 12, 3, 1e1,],"water":[1]}}');
+    assert.equal(config.editDefenseSequence(down, "land", 3, {moveTo: 0}), original);
+    assert.equal(config.editDefenseSequence(original, "land", 2, {moveTo: 2}), original);
+    assert.throws(() => config.editDefenseSequence(original, "land", 2, {moveTo: 4}), /move/);
+    assert.throws(() => config.editDefenseSequence(original, "land", null, {moveTo: 0}), /move/);
+});
+
 test("supports removing the last slot and adding to an explicitly empty order", () => {
     const original = '{"porcupine":{"land":[0 /* keep */]}}';
     const removed = config.editDefenseSequence(original, "land", 0, null);

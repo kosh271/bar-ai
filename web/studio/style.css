@@ -160,3 +160,35 @@
 @media (max-width: 640px) {
     .defense-slot-option .defense-slot-unit { white-space: normal; overflow-wrap: anywhere; }
 }
+
+.cluster-defense-actions, .cluster-defense-order { width: 1%; }
+.cluster-defense-order { font-variant-numeric: tabular-nums; }
+.cluster-defense-row-controls { display: flex; align-items: center; gap: 4px; }
+.cluster-defense-drag-handle {
+    flex: 0 0 24px;
+    display: grid;
+    place-items: center;
+    height: 32px;
+    border-radius: 5px;
+    color: #8fa3b5;
+    cursor: grab;
+}
+.cluster-defense-drag-handle::before {
+    content: "";
+    width: 10px;
+    height: 24px;
+    background: radial-gradient(circle, currentColor 1px, transparent 1.5px) 0 0 / 5px 4px;
+    pointer-events: none;
+}
+.cluster-defense-drag-handle:hover { background: #273441; color: var(--text); }
+.cluster-defense-drag-handle:active { cursor: grabbing; }
+.panel button.cluster-defense-row-button {
+    width: 28px;
+    height: 30px;
+    padding: 0;
+    font-size: 16px;
+    line-height: 1;
+}
+.cluster-defense-table tr.dragging { opacity: .45; }
+.cluster-defense-table tr[data-drop-edge="before"] > td { box-shadow: inset 0 3px var(--orange); }
+.cluster-defense-table tr[data-drop-edge="after"] > td { box-shadow: inset 0 -3px var(--orange); }

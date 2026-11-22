@@ -1389,26 +1389,92 @@ function clusterDefenseView(panel, file, root) {
             if (focusId) $(focusId)?.focus();
         } catch (error) { message(errorText(error), true); }
     }
-    const wrap = element("div", "table-wrap"), table = element("table");
+    const wrap = element("div", "table-wrap"), table = element("table", "cluster-defense-table");
     const head = element("thead"), header = element("tr"), body = element("tbody");
-    for (const title of ["Order", "Defense slot", "Actions"]) header.append(element("th", "", title));
+    for (const title of ["Actions", "Order", "Defense slot"]) header.append(element("th", "", title));
     head.append(header);
     table.append(head, body); wrap.append(table);
+
+    let draggedRow, markedRow;
+    function clearDropMarker() {
+        markedRow?.removeAttribute("data-drop-edge");
+        markedRow = null;
+    }
+    function finishDrag() {
+        clearDropMarker();
+        draggedRow?.classList.remove("dragging");
+        draggedRow = null;
+    }
+    function dropLocation(event) {
+        const row = event.target.closest("tr");
+        if (!row || row.parentElement !== body) return null;
+        const bounds = row.getBoundingClientRect();
+        const after = event.clientY >= bounds.top + bounds.height / 2;
+        const source = draggedRow.sectionRowIndex;
+        const boundary = row.sectionRowIndex + Number(after);
+        const destination = boundary > source ? boundary - 1 : boundary;
+        return {row, after, source, destination};
+    }
+    body.addEventListener("dragover", event => {
+        if (!draggedRow) return;
+        clearDropMarker();
+        const location = dropLocation(event);
+        if (!location || location.source === location.destination) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        markedRow = location.row;
+        markedRow.dataset.dropEdge = location.after ? "after" : "before";
+    });
+    body.addEventListener("dragleave", event => {
+        if (!body.contains(event.relatedTarget)) clearDropMarker();
+    });
+    body.addEventListener("drop", event => {
+        if (!draggedRow) return;
+        event.preventDefault();
+        const location = dropLocation(event);
+        finishDrag();
+        if (location && location.source !== location.destination) {
+            const {source, destination} = location;
+            edit(source, {moveTo: destination}, `cluster-defense-slot-${destination}`);
+        }
+    });
+
     for (const {key: index, node} of sequence.children) {
-        const row = element("tr"), order = element("td", "", String(index + 1));
-        const slot = element("td"), actions = element("td"), buttons = element("div", "row");
+        const row = element("tr"), order = element("td", "cluster-defense-order", String(index + 1));
+        const slot = element("td"), actions = element("td", "cluster-defense-actions");
+        const buttons = element("div", "cluster-defense-row-controls");
         const pickerId = `cluster-defense-slot-${index}`;
         slot.append(defenseSlotPicker(`Defense slot at position ${index + 1}`, choices, node.value,
             value => edit(index, value, pickerId), {id: pickerId}));
-        for (const [label, action, next] of [["Move up", "up", index - 1], ["Move down", "down", index + 1], ["Remove", null, index]]) {
-            const control = button(label, () => edit(index, action,
-                next < sequence.children.length - (action === null ? 1 : 0) ? `cluster-defense-slot-${next}` : "cluster-defense-add"));
-            control.setAttribute("aria-label", `${label} defense at position ${index + 1}`);
+
+        const handle = element("span", "cluster-defense-drag-handle");
+        handle.draggable = true;
+        handle.title = "Drag to reorder";
+        handle.setAttribute("aria-hidden", "true");
+        handle.addEventListener("dragstart", event => {
+            draggedRow = row;
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("application/x-studio-defense-row", "");
+            const bounds = row.getBoundingClientRect();
+            event.dataTransfer.setDragImage(row, event.clientX - bounds.left, event.clientY - bounds.top);
+            row.classList.add("dragging");
+        });
+        handle.addEventListener("dragend", finishDrag);
+        buttons.append(handle);
+        for (const [icon, label, action, next] of [
+            ["↑", "Move up", "up", index - 1], ["↓", "Move down", "down", index + 1], ["×", "Remove", null, index]
+        ]) {
+            const description = `${label} defense at position ${index + 1}`;
+            const control = button(icon, () => edit(index, action,
+                next < sequence.children.length - (action === null ? 1 : 0) ? `cluster-defense-slot-${next}` : "cluster-defense-add"),
+                "cluster-defense-row-button");
+            control.setAttribute("aria-label", description);
+            control.title = label;
             control.disabled = next < 0 || (action === "down" && next >= sequence.children.length);
             buttons.append(control);
         }
         actions.append(buttons);
-        row.append(order, slot, actions);
+        row.append(actions, order, slot);
         body.append(row);
     }
     if (sequence.children.length) panel.append(wrap);

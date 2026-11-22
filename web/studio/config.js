@@ -157,13 +157,19 @@ window.StudioConfig = (() => {
         }
         const row = at(list, [index]);
         if (index !== null && !row) throw Error("This defense sequence row is unavailable");
-        if (action === "up" || action === "down") {
-            const neighbor = row && at(list, [index + (action === "up" ? -1 : 1)]);
-            if (!neighbor) throw Error("This defense cannot move in that direction");
-            return patch(text, [
-                {start: row.start, end: row.end, text: text.slice(neighbor.start, neighbor.end)},
-                {start: neighbor.start, end: neighbor.end, text: text.slice(row.start, row.end)}
-            ]);
+        const step = action === "up" ? -1 : action === "down" ? 1 : 0;
+        if (step || (action && typeof action === "object")) {
+            const destination = step ? index + step : action.moveTo;
+            if (!row || !Number.isInteger(destination) || destination < 0 || destination >= list.children.length) {
+                throw Error("This defense cannot move to that position");
+            }
+            if (index === destination) return text;
+            const first = Math.min(index, destination), last = Math.max(index, destination);
+            const rows = list.children.slice(first, last + 1).map(({node}) => node);
+            const literals = rows.map(node => text.slice(node.start, node.end));
+            const [moved] = literals.splice(index - first, 1);
+            literals.splice(destination - first, 0, moved);
+            return patch(text, rows.map(({start, end}, offset) => ({start, end, text: literals[offset]})));
         }
         if (action === null) {
             if (!row) throw Error("Choose a defense sequence row to remove");
