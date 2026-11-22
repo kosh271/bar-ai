@@ -8,6 +8,7 @@ worker errors are reported in the status.  All snapshots are JSON-serializable.
 
 from __future__ import annotations
 
+import codecs
 import copy
 import hashlib
 import json
@@ -30,7 +31,10 @@ from .unit_catalog import valid_catalog
 _operation_lock = threading.Lock()
 _MAX_MATCH_SECONDS = 6 * 60 * 60
 # The raw-byte and row limits keep even a fully JSON-escaped page below 256 KiB.
+_LOG_PAGE_BYTES = 32 * 1024
+_LOG_PAGE_LINES = 512
 _RESULT_METADATA_BYTES = 8 * 1024 * 1024
+_LOG_FILES = {"infolog.txt", "stdout.txt", "result.json"}
 _RUN_ID = re.compile(r"(?:match|smoke)-[a-zA-Z0-9_-]{1,64}")
 _REPLAY_PATH = re.compile(r"demos/([^/\\:\x00-\x1f]+\.sdfz)", re.IGNORECASE)
 
@@ -229,6 +233,36 @@ class MatchService:
         if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
             raise headless.MatchError("Invalid match or smoke run ID.")
         return run_id
+
+    def read_log(self, run_id: str, filename: str, offset: int = 0) -> dict:
+        run_id = self._run_id(run_id)
+        if (not isinstance(filename, str) or filename not in _LOG_FILES
+                or type(offset) is not int or not 0 <= offset <= 2**63 - 1):
+            raise headless.MatchError("Invalid log file or byte offset.")
+        try:
+            with headless.open_artifact(self.root, "data", "studio-matches", "matches", run_id, filename) as stream:
+                stream.seek(offset)
+                raw = stream.read(_LOG_PAGE_BYTES + 1)
+        except FileNotFoundError:
+            return {"offset": offset, "next_offset": None, "lines": [], "missing": True}
+        has_next = len(raw) > _LOG_PAGE_BYTES
+        chunk = raw[:_LOG_PAGE_BYTES]
+        split = chunk.split(b"\n", _LOG_PAGE_LINES)
+        if len(split) > _LOG_PAGE_LINES and split[-1]:
+            chunk = chunk[:-len(split[-1])]
+            has_next = True
+        if has_next and (last_newline := chunk.rfind(b"\n")) >= 0:
+            chunk = chunk[:last_newline + 1]
+        decoded, consumed = codecs.utf_8_decode(chunk, "replace", not has_next)
+        lines = decoded.split("\n")
+        if lines[-1] == "":
+            lines.pop()
+        lines = [line.removesuffix("\r") for line in lines]
+        return {
+            "offset": offset, "next_offset": offset + consumed if has_next else None,
+            "ends_with_newline": chunk.endswith(b"\n"),
+            "lines": [{"text": line, "category": headless.diagnostic_category(line)} for line in lines],
+        }
 
     def _artifact_metadata(self, run_id: str) -> dict:
         try:
@@ -496,6 +530,9 @@ class MatchService:
                         self._change_phase(event.phase)
                     self._state["progress"].append(asdict(event))
                     self._state["progress"] = self._state["progress"][-64:]
+                    if event.run_id and _RUN_ID.fullmatch(event.run_id):
+                        key = "smoke_run_id" if event.phase == "smoke" else "run_id"
+                        self._state["logs"][key] = event.run_id
                     if event.message and not self._state["cancel_requested"]:
                         self._state["message"] = event.message
 

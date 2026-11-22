@@ -116,6 +116,57 @@ class StudioServerTests(unittest.TestCase):
                                                body={**payload, "record_demo": invalid})[0], 400)
             self.assertEqual(start.call_count, 2)
 
+    def test_match_log_endpoint_pages_bounded_raw_artifacts(self):
+        url = "/api/match/logs?run_id=match-logs&file="
+        run = self.server.match_service.local_data / "matches" / "match-logs"
+        run.mkdir(parents=True)
+        (run / "infolog.txt").write_bytes(b"Skirmish AI <BARb>: Load script: main.as\n" +
+                                         b"Warning: shader setup\n" * 9000)
+        for name in ("stdout.txt", "result.json"):
+            (run / name).write_bytes(b"{}\n")
+            self.assertEqual(self._request(url + name)[1]["lines"][0]["text"], "{}")
+        status, _, _ = self._request(url + "infolog.txt", token=False)
+        self.assertEqual(status, 401)
+        status, page, _ = self._request(url + "infolog.txt")
+        self.assertEqual(status, 200)
+        self.assertEqual(page["lines"][0]["category"], "ai_script")
+        self.assertLessEqual(page["next_offset"], 64 * 1024)
+        status, next_page, _ = self._request(url + f"infolog.txt&offset={page['next_offset']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(next_page["lines"][0]["text"], "Warning: shader setup")
+        self.assertEqual(next_page["lines"][0]["category"], "engine_warning")
+        raw = "\x00" * 32767 + "é\n"
+        (run / "stdout.txt").write_bytes(raw.encode("utf-8"))
+        _, before, headers = self._request(url + "stdout.txt")
+        self.assertLess(int(headers["Content-Length"]), 256 * 1024)
+        self.assertFalse(before["ends_with_newline"])
+        _, after, _ = self._request(url + f"stdout.txt&offset={before['next_offset']}")
+        self.assertEqual(before["lines"][0]["text"] + after["lines"][0]["text"], raw.rstrip("\n"))
+
+    def test_match_log_endpoint_rejects_paths_and_links(self):
+        prefix = "/api/match/logs?"
+        matches = self.server.match_service.local_data / "matches"
+        run = matches / "match-logs"
+        run.mkdir(parents=True)
+        private = matches.parent / "private.txt"
+        private.write_text("private", encoding="utf-8")
+        for query in (
+            "run_id=..%2F..&file=infolog.txt",
+            "run_id=match-logs&file=..%2Fprivate.txt",
+            "run_id=match-logs&file=stdout.txt&offset=-1",
+            "run_id=match-logs&file=stdout.txt&file=infolog.txt",
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(self._request(prefix + query)[0], 400)
+        try:
+            (run / "infolog.txt").symlink_to(private)
+            (matches / "smoke-other").symlink_to(run, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"Cannot create symlinks: {error}")
+        for run_id in ("match-logs", "smoke-other"):
+            with self.subTest(run_id=run_id):
+                self.assertEqual(self._request(prefix + f"run_id={run_id}&file=infolog.txt")[0], 400)
+
     @unittest.skipUnless(shutil.which("git"), "Git is required for project history")
     def test_checkpoint_diff_endpoint_auth_and_revision_validation(self):
         endpoint = "/api/history/diff"

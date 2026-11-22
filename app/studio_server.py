@@ -177,6 +177,20 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, self.server.match_service.status())
                 except Exception as error:
                     return self._handle_error(error)
+            if parsed.path == "/api/match/logs":
+                try:
+                    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True,
+                                                  strict_parsing=True, max_num_fields=3)
+                    if (not {"run_id", "file"} <= set(query) <= {"run_id", "file", "offset"}
+                            or any(len(values) != 1 for values in query.values())):
+                        raise ValueError("Provide a run ID, a log file, and an optional byte offset.")
+                    offset = query.get("offset", ["0"])[0]
+                    if not re.fullmatch(r"[0-9]{1,19}", offset):
+                        raise ValueError("Invalid log byte offset.")
+                    result = self.server.match_service.read_log(query["run_id"][0], query["file"][0], int(offset))
+                    return self._json(200, result)
+                except Exception as error:
+                    return self._handle_error(error)
             if parsed.path == "/api/catalog/latest" and not parsed.query:
                 try:
                     return self._json(200, {"catalog": self.server.match_service.latest_catalog()})

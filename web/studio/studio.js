@@ -1183,6 +1183,101 @@ function advanced(target) {
     panel.append(label, element("div", "source-bar", "Changes are saved to this profile only. Unknown content is not rewritten."));
     target.append(panel);
 }
+function showMatchLogs(runId) {
+    const content = element("div"), sources = [
+        ["infolog.txt", "Engine log"], ["stdout.txt", "Console output"], ["result.json", "Result JSON"]
+    ];
+    const filters = [["all", "All lines"], ["ai_script", "AI / AngelScript"], ["engine_error", "Engine Errors"],
+        ["engine_warning", "Engine Warnings"], ["other", "Other"]];
+    const searchRow = element("div", "row"), filterRow = element("div", "row"), navigation = element("div", "row");
+    const [searchField, search] = textInput("Search log", "", "Enter text");
+    const statusLine = element("p", "muted"), output = element("pre");
+    statusLine.setAttribute("role", "status");
+    const controller = new AbortController();
+    let filename = sources[0][0], category = "all", busy = false, page = null, firstLine = 1;
+    let history = [], displayed = [];
+    const load = offset => api("/api/match/logs?" + new URLSearchParams({run_id: runId, file: filename, offset}),
+        undefined, controller.signal);
+    const matches = line => (category === "all" || line.category === category) &&
+        line.text.toLowerCase().includes(search.value.trim().toLowerCase());
+
+    function update() {
+        displayed = (page?.lines || []).flatMap((line, index) => matches(line)
+            ? [`${firstLine + index}  ${line.text}`] : []);
+        output.textContent = displayed.join("\n");
+        copy.disabled = busy || !displayed.length;
+        previous.disabled = busy || !history.length;
+        next.disabled = busy || page?.next_offset == null;
+        find.disabled = next.disabled;
+        for (const [kind, pill] of pills) {
+            pill.setAttribute("aria-pressed", String(kind === category));
+            pill.classList.toggle("primary", kind === category);
+        }
+        statusLine.textContent = busy ? "Reading log…" : page?.missing ? "This file was not generated."
+            : page ? `Showing ${displayed.length} of ${page.lines.length} lines on this page.` : "";
+    }
+
+    async function navigateLog(delegate) {
+        if (busy) return;
+        busy = true;
+        source.disabled = true;
+        search.disabled = true;
+        for (const [, pill] of pills) pill.disabled = true;
+        update();
+        let failure = "";
+        try { await delegate(); }
+        catch (error) { if (!controller.signal.aborted) failure = errorText(error); }
+        finally {
+            busy = false;
+            source.disabled = false;
+            search.disabled = false;
+            for (const [, pill] of pills) pill.disabled = false;
+            update();
+            if (failure) statusLine.textContent = failure;
+        }
+    }
+
+    async function advance() {
+        const following = await load(page.next_offset);
+        history.push({offset: page.offset, firstLine});
+        firstLine += page.lines.length - (page.ends_with_newline ? 0 : 1);
+        page = following;
+    }
+
+    const sourceField = dropdown("Log file", sources, filename, value => navigateLog(async () => {
+        filename = value;
+        history = [];
+        firstLine = 1;
+        page = null;
+        page = await load(0);
+    }));
+    const source = sourceField.querySelector("select");
+    const pills = filters.map(([kind, label]) => [kind, button(label, () => { category = kind; update(); }, "button")]);
+    const previous = button("Previous page", () => navigateLog(async () => {
+        const entry = history[history.length - 1];
+        page = await load(entry.offset);
+        firstLine = entry.firstLine;
+        history.pop();
+    }));
+    const next = button("Next page", () => navigateLog(advance));
+    const find = button("Find next page with matches", () => navigateLog(async () => {
+        do { await advance(); }
+        while (page.next_offset != null && !page.lines.some(matches));
+    }));
+    const copy = button("Copy visible lines", async () => {
+        try { await navigator.clipboard.writeText(displayed.join("\n")); statusLine.textContent = "Copied visible lines."; }
+        catch (error) { statusLine.textContent = errorText(error); }
+    });
+    search.addEventListener("input", update);
+    searchRow.append(sourceField, searchField);
+    filterRow.append(...pills.map(([, pill]) => pill));
+    navigation.append(previous, next, find, copy);
+    content.append(searchRow, filterRow, statusLine, navigation, output);
+    showDialog(`Logs · ${runId}`, content);
+    $("dialog").addEventListener("close", () => controller.abort(), {once: true});
+    navigateLog(async () => { page = await load(0); });
+}
+
 function matchTelemetryView(telemetry, series) {
     const card = element("section", "panel");
     card.append(element("h3", "", series ? "Last game telemetry" : "Match telemetry"));
@@ -1210,6 +1305,26 @@ function matchTelemetryView(telemetry, series) {
         card.append(details);
     }
     return card;
+}
+
+function setMatchLogActions(actions, snapshot) {
+    if (!actions) return;
+    const logs = snapshot?.operation === "match" && snapshot.logs;
+    const match = logs?.run_id?.startsWith("match-") ? logs.run_id : "";
+    const smoke = logs?.smoke_run_id || (logs?.run_id?.startsWith("smoke-") ? logs.run_id : "");
+    if (actions.dataset.runIds === `${match},${smoke}`) return;
+    actions.dataset.runIds = `${match},${smoke}`;
+    actions.replaceChildren();
+    actions.hidden = !match && !smoke;
+    if (match) actions.append(button("View match logs", () => showMatchLogs(match)));
+    if (smoke) actions.append(button("View smoke logs", () => showMatchLogs(smoke)));
+}
+
+function matchLogButton(runId, label = "View logs") {
+    if (typeof runId === "string" && /^(?:match|smoke)-[A-Za-z0-9_-]+$/.test(runId)) {
+        return button(label, () => showMatchLogs(runId));
+    }
+    return element("span", "muted", "—");
 }
 
 function matchView(target) {
@@ -1258,6 +1373,10 @@ function matchView(target) {
         panel.append(element("pre", "", m.snapshot.result.summary || ""));
         if (m.snapshot.result.telemetry) panel.append(matchTelemetryView(m.snapshot.result.telemetry, m.snapshot.result.series));
     }
+    const logActions = element("div", "row");
+    logActions.id = "match-log-actions";
+    setMatchLogActions(logActions, m.snapshot);
+    panel.append(logActions);
     if (m.snapshot?.operation === "match") {
         const logs = m.snapshot.logs || {};
         if (logs.directory) panel.append(element("p", "path", "Logs: " + logs.directory));
@@ -1379,6 +1498,7 @@ function updateMatchStatus() {
     if (statusBox) statusBox.textContent = matchStatusText(m.snapshot, m.statusError, m.cacheError);
     if (scanProgress) scanProgress.hidden = !isScanActive(m.snapshot);
     if (activity) setMatchActivity(activity, m.snapshot, m.statusError);
+    setMatchLogActions($("match-log-actions"), m.snapshot);
 }
 let matchPoll = null;
 async function pollMatch() {

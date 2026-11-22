@@ -49,6 +49,7 @@ class MatchProgress:
     summary: str
     seconds: float | None = None
     message: str = ""
+    run_id: str | None = None
 
 
 def artifact_stat(base: Path, *parts: str, directory: bool = False) -> os.stat_result:
@@ -786,7 +787,7 @@ def run_match(
         summary += f"\nSmoke logs: {smoke_path}"
         if progress is not None:
             outcome = "Passed" if passed else "Stopped" if stop.is_set() else "Failed"
-            progress(MatchProgress("smoke", outcome, time.monotonic() - started, summary))
+            progress(MatchProgress("smoke", outcome, time.monotonic() - started, summary, smoke_path.name))
         if not passed:
             return summary, smoke_path
         cache = smoke_path / "cache"
@@ -812,5 +813,5 @@ def run_match(
         outcome = lines[0]
         if len(lines) > 1 and lines[1].startswith("Engine failed"):
             outcome += " (engine failed; see log)"
-        progress(MatchProgress("match", outcome, time.monotonic() - started, f"{summary}\n{result}"))
+        progress(MatchProgress("match", outcome, time.monotonic() - started, f"{summary}\n{result}", match_path.name))
     return f"{summary}\n{result}", match_path
