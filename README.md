@@ -46,6 +46,10 @@ The defense and placement walkthroughs use a BARbarIAn Hard profile.
 - [Shield groups of heavy defenses](docs/cluster-shields.md)
 - [Keep factory routes clear](docs/keeping-chokepoints-open.md)
 
+For air production and interception, see [fighter sweeps](docs/fighter-swarms.md),
+[bomber waves](docs/bomber-swarms.md), [fighter quick-reaction forces](docs/fighter-reserve.md),
+and [late-game bomber reserves](docs/bomber-qrf.md).
+
 During a test, the indicator beside **Start match** shows the current stage
 and its elapsed real time. Running status is checked against the engine process;
 an exited engine or an unavailable status connection is reported instead.

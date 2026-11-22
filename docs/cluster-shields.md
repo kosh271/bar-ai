@@ -4,11 +4,11 @@ BARbarIAn's built-in configuration can request a shield after a particular defen
 
 ## Pick the heavy defense and its shield
 
-| Faction | Heavy defense | Land shield | Configuration layer |
-| --- | --- | --- | --- |
-| Armada | Pulsar (`armanni`) | Keeper (`armgate`) | `build_chain.json` |
-| Cortex | Bulwark (`cordoom`) | Overseer (`corgate`) | `build_chain.json` |
-| Legion | Bastion (`legbastion`) | Soteria (`legdeflector`) | `build_chain_leg.json` when the Legion Faction game option is enabled |
+| Faction | Heavy defense          | Land shield              | Configuration layer                                                   |
+| ------- | ---------------------- | ------------------------ | --------------------------------------------------------------------- |
+| Armada  | Pulsar (`armanni`)     | Keeper (`armgate`)       | `build_chain.json`                                                    |
+| Cortex  | Bulwark (`cordoom`)    | Overseer (`corgate`)     | `build_chain.json`                                                    |
+| Legion  | Bastion (`legbastion`) | Soteria (`legdeflector`) | `build_chain_leg.json` when the Legion Faction game option is enabled |
 
 The BAR definitions inspected for all three shields give a 550-elmo radius. Elmos are units of in-game distance. Coverage depends on the shield's eventual site and the distance to each tower.
 
