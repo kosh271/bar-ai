@@ -130,10 +130,13 @@
     color: var(--text);
     box-shadow: 0 10px 28px #0008;
 }
-.defense-slot-header {
+.defense-slot-filters {
     position: sticky;
     z-index: 1;
     top: 0;
+    background: #101821;
+}
+.defense-slot-header {
     padding: 6px 10px;
     border-bottom: 1px solid #40505e;
     background: var(--panel2);
@@ -156,6 +159,8 @@
 .panel button.defense-slot-option:focus-visible { background: #273a4a; filter: none; }
 .defense-slot-option:focus-visible { outline-offset: -2px; }
 .defense-slot-option[aria-selected="true"] { box-shadow: inset 3px 0 var(--mint); }
+.panel button.defense-slot-option[hidden] { display: none; }
+.defense-slot-search { width: calc(100% - 16px); margin: 8px; }
 
 @media (max-width: 640px) {
     .defense-slot-option .defense-slot-unit { white-space: normal; overflow-wrap: anywhere; }
@@ -164,7 +169,7 @@
 .cluster-defense-actions, .cluster-defense-order { width: 1%; }
 .cluster-defense-order { font-variant-numeric: tabular-nums; }
 .cluster-defense-row-controls { display: flex; align-items: center; gap: 4px; }
-.cluster-defense-drag-handle {
+.build-order-drag-handle {
     flex: 0 0 24px;
     display: grid;
     place-items: center;
@@ -173,15 +178,15 @@
     color: #8fa3b5;
     cursor: grab;
 }
-.cluster-defense-drag-handle::before {
+.build-order-drag-handle::before {
     content: "";
     width: 10px;
     height: 24px;
     background: radial-gradient(circle, currentColor 1px, transparent 1.5px) 0 0 / 5px 4px;
     pointer-events: none;
 }
-.cluster-defense-drag-handle:hover { background: #273441; color: var(--text); }
-.cluster-defense-drag-handle:active { cursor: grabbing; }
+.build-order-drag-handle:hover { background: #273441; color: var(--text); }
+.build-order-drag-handle:active { cursor: grabbing; }
 .panel button.cluster-defense-row-button {
     width: 28px;
     height: 30px;
@@ -189,9 +194,9 @@
     font-size: 16px;
     line-height: 1;
 }
-.cluster-defense-table tr.dragging { opacity: .45; }
-.cluster-defense-table tr[data-drop-edge="before"] > td { box-shadow: inset 0 3px var(--orange); }
-.cluster-defense-table tr[data-drop-edge="after"] > td { box-shadow: inset 0 -3px var(--orange); }
+.build-order-row.dragging { opacity: .45; }
+.build-order-row[data-drop-edge="before"] > td { box-shadow: inset 0 3px var(--orange); }
+.build-order-row[data-drop-edge="after"] > td { box-shadow: inset 0 -3px var(--orange); }
 
 .guide-actions { margin-top: 12px; }
 .section-guide { line-height: 1.6; overflow-wrap: anywhere; }

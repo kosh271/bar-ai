@@ -660,11 +660,10 @@ function unitPicker(label, ids, selected, onSelect, preferredRoles) {
     trigger.append(triggerText, element("span", "unit-picker-indicator", "▾"));
     const panel = element("div", "unit-picker-panel"), filters = element("div", "unit-picker-filters");
     panel.id = id; panel.hidden = true;
-    const search = element("input"), list = element("div", "unit-picker-results"), count = element("div", "unit-picker-count muted");
+    const search = window.StudioEditors.unitSearchInput(label);
+    const list = element("div", "unit-picker-results"), count = element("div", "unit-picker-count muted");
     list.id = id + "-list";
-    search.type = "search"; search.placeholder = "Search by unit name or ID";
     search.setAttribute("role", "combobox");
-    search.setAttribute("aria-label", `Search ${label.toLowerCase()}`);
     search.setAttribute("aria-controls", list.id);
     search.setAttribute("aria-autocomplete", "list");
     search.setAttribute("aria-expanded", "true");
@@ -1212,6 +1211,13 @@ function defenseSlotPicker(label, slots, selected, change, {id, placeholder, unk
     popup.popover = "auto";
     trigger.popoverTargetElement = popup;
     picker.append(trigger, popup);
+    const search = window.StudioEditors.unitSearchInput(label);
+    search.className = "defense-slot-search";
+    search.autofocus = true;
+    const count = element("div", "unit-picker-count muted");
+    count.setAttribute("role", "status");
+    const filters = element("div", "defense-slot-filters");
+    filters.append(search, count);
 
     function cells(row, slot, units, showFactions) {
         row.append(element("span", "defense-slot-number", String(slot)));
@@ -1256,7 +1262,15 @@ function defenseSlotPicker(label, slots, selected, change, {id, placeholder, unk
         popup.style.top = openAbove ? "auto" : `${anchor.bottom + 4}px`;
         popup.style.bottom = openAbove ? `${height - anchor.top + 4}px` : "auto";
     }
-    let options, positionEvents;
+    let options, visibleOptions, positionEvents;
+    function filterOptions() {
+        visibleOptions = window.StudioEditors.filterUnits(options, search.value, "", "");
+        const visible = new Set(visibleOptions);
+        for (const entry of options) entry.option.hidden = !visible.has(entry);
+        count.textContent = visibleOptions.length ? "" : "No matching units.";
+        count.hidden = visibleOptions.length > 0;
+    }
+    search.addEventListener("input", filterOptions);
     popup.addEventListener("beforetoggle", event => {
         if (event.newState !== "open") {
             positionEvents?.abort();
@@ -1290,15 +1304,16 @@ function defenseSlotPicker(label, slots, selected, change, {id, placeholder, unk
                     cells(option, slot, units, false);
                     option.setAttribute("aria-label", describeSlot(slot, units));
                 } else option.textContent = `${unknown} ${slot}`;
-                return {slot, option};
+                return {slot, option, id: String(slot), name: units ? describeSlot(slot, units) : option.textContent};
             });
             list.append(...options.map(({option}) => option));
-            popup.append(header, list);
+            filters.append(header);
+            popup.append(filters, list);
         }
-        const current = options.find(({slot}) => slot === selected) || options[0];
+        search.value = "";
+        filterOptions();
         for (const {slot, option} of options) {
             option.setAttribute("aria-selected", String(slot === selected));
-            option.toggleAttribute("autofocus", option === current.option);
         }
         positionPopup();
         positionEvents = new AbortController();
@@ -1317,7 +1332,7 @@ function defenseSlotPicker(label, slots, selected, change, {id, placeholder, unk
     });
     popup.addEventListener("toggle", event => {
         if (event.newState === "open") {
-            popup.querySelector("[autofocus]")?.scrollIntoView({block: "nearest"});
+            options.find(({slot}) => slot === selected)?.option.scrollIntoView({block: "nearest"});
         }
     });
     trigger.addEventListener("keydown", event => {
@@ -1326,23 +1341,31 @@ function defenseSlotPicker(label, slots, selected, change, {id, placeholder, unk
         popup.showPopover({source: trigger});
     });
     popup.addEventListener("keydown", event => {
-        if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            event.target.click();
-            return;
-        }
-        if (event.key === "Escape" || event.key === "Tab") {
+        if (event.key === "Escape" || (event.key === "Tab" && event.target !== search)) {
             popup.hidePopover();
             trigger.focus();
             if (event.key === "Escape") event.preventDefault();
             return;
         }
-        const index = options.findIndex(({option}) => option === event.target);
-        const last = options.length - 1;
-        const next = {ArrowUp: Math.max(0, index - 1), ArrowDown: Math.min(last, index + 1), Home: 0, End: last}[event.key];
+        if (event.target === search) {
+            const entry = event.key === "ArrowUp" ? visibleOptions.at(-1) : visibleOptions[0];
+            if (!entry || !["ArrowUp", "ArrowDown", "Enter"].includes(event.key)) return;
+            event.preventDefault();
+            if (event.key === "Enter") entry.option.click();
+            else entry.option.focus();
+            return;
+        }
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            event.target.click();
+            return;
+        }
+        const index = visibleOptions.findIndex(({option}) => option === event.target);
+        const last = visibleOptions.length - 1;
+        const next = {ArrowUp: index - 1, ArrowDown: Math.min(last, index + 1), Home: 0, End: last}[event.key];
         if (next === undefined) return;
         event.preventDefault();
-        options[next].option.focus();
+        (visibleOptions[next]?.option ?? search).focus();
     });
     return picker;
 }
@@ -1430,48 +1453,8 @@ function clusterDefenseView(panel, file, root) {
     head.append(header);
     table.append(head, body); wrap.append(table);
 
-    let draggedRow, markedRow;
-    function clearDropMarker() {
-        markedRow?.removeAttribute("data-drop-edge");
-        markedRow = null;
-    }
-    function finishDrag() {
-        clearDropMarker();
-        draggedRow?.classList.remove("dragging");
-        draggedRow = null;
-    }
-    function dropLocation(event) {
-        const row = event.target.closest("tr");
-        if (!row || row.parentElement !== body) return null;
-        const bounds = row.getBoundingClientRect();
-        const after = event.clientY >= bounds.top + bounds.height / 2;
-        const source = draggedRow.sectionRowIndex;
-        const boundary = row.sectionRowIndex + Number(after);
-        const destination = boundary > source ? boundary - 1 : boundary;
-        return {row, after, source, destination};
-    }
-    body.addEventListener("dragover", event => {
-        if (!draggedRow) return;
-        clearDropMarker();
-        const location = dropLocation(event);
-        if (!location || location.source === location.destination) return;
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "move";
-        markedRow = location.row;
-        markedRow.dataset.dropEdge = location.after ? "after" : "before";
-    });
-    body.addEventListener("dragleave", event => {
-        if (!body.contains(event.relatedTarget)) clearDropMarker();
-    });
-    body.addEventListener("drop", event => {
-        if (!draggedRow) return;
-        event.preventDefault();
-        const location = dropLocation(event);
-        finishDrag();
-        if (location && location.source !== location.destination) {
-            const {source, destination} = location;
-            edit(source, {moveTo: destination}, `cluster-defense-slot-${destination}`);
-        }
+    const dragHandle = window.StudioEditors.draggableBuildOrder(body, (source, destination) => {
+        edit(source, {moveTo: destination}, `cluster-defense-slot-${destination}`);
     });
 
     for (const {key: index, node} of sequence.children) {
@@ -1482,20 +1465,7 @@ function clusterDefenseView(panel, file, root) {
         slot.append(defenseSlotPicker(`Defense slot at position ${index + 1}`, choices, node.value,
             value => edit(index, value, pickerId), {id: pickerId}));
 
-        const handle = element("span", "cluster-defense-drag-handle");
-        handle.draggable = true;
-        handle.title = "Drag to reorder";
-        handle.setAttribute("aria-hidden", "true");
-        handle.addEventListener("dragstart", event => {
-            draggedRow = row;
-            event.dataTransfer.effectAllowed = "move";
-            event.dataTransfer.setData("application/x-studio-defense-row", "");
-            const bounds = row.getBoundingClientRect();
-            event.dataTransfer.setDragImage(row, event.clientX - bounds.left, event.clientY - bounds.top);
-            row.classList.add("dragging");
-        });
-        handle.addEventListener("dragend", finishDrag);
-        buttons.append(handle);
+        buttons.append(dragHandle(row));
         for (const [icon, label, action, next] of [
             ["↑", "Move up", "up", index - 1], ["↓", "Move down", "down", index + 1], ["×", "Remove", null, index]
         ]) {

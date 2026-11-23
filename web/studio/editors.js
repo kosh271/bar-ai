@@ -21,6 +21,79 @@ window.StudioEditors = (() => {
             (entry.id.toLowerCase().includes(search) || entry.name.toLowerCase().includes(search)));
     }
 
+    function unitSearchInput(label) {
+        const search = document.createElement("input");
+        search.type = "search";
+        search.placeholder = "Search by unit name or ID";
+        search.setAttribute("aria-label", `Search ${label.toLowerCase()}`);
+        return search;
+    }
+
+    function draggableBuildOrder(body, move) {
+        let draggedRow, markedRow;
+        function clearDropMarker() {
+            markedRow?.removeAttribute("data-drop-edge");
+            markedRow = null;
+        }
+        function finishDrag() {
+            clearDropMarker();
+            draggedRow?.classList.remove("dragging");
+            draggedRow = null;
+        }
+        function dropLocation(event) {
+            const row = event.target.closest("tr");
+            if (!row || row.parentElement !== body) return null;
+            const bounds = row.getBoundingClientRect();
+            const after = event.clientY >= bounds.top + bounds.height / 2;
+            const source = draggedRow.sectionRowIndex;
+            const boundary = row.sectionRowIndex + Number(after);
+            const destination = boundary > source ? boundary - 1 : boundary;
+            return {row, after, source, destination};
+        }
+        body.addEventListener("dragover", event => {
+            if (!draggedRow) return;
+            clearDropMarker();
+            const location = dropLocation(event);
+            if (!location || location.source === location.destination) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "move";
+            markedRow = location.row;
+            markedRow.dataset.dropEdge = location.after ? "after" : "before";
+        });
+        body.addEventListener("dragleave", event => {
+            if (!body.contains(event.relatedTarget)) clearDropMarker();
+        });
+        body.addEventListener("drop", event => {
+            if (!draggedRow) return;
+            event.preventDefault();
+            const location = dropLocation(event);
+            finishDrag();
+            if (location && location.source !== location.destination) {
+                const {source, destination} = location;
+                move(source, destination);
+            }
+        });
+
+        return row => {
+            row.classList.add("build-order-row");
+            const handle = document.createElement("span");
+            handle.className = "build-order-drag-handle";
+            handle.draggable = true;
+            handle.title = "Drag to reorder";
+            handle.setAttribute("aria-hidden", "true");
+            handle.addEventListener("dragstart", event => {
+                draggedRow = row;
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("application/x-studio-build-order-row", "");
+                const bounds = row.getBoundingClientRect();
+                event.dataTransfer.setDragImage(row, event.clientX - bounds.left, event.clientY - bounds.top);
+                row.classList.add("dragging");
+            });
+            handle.addEventListener("dragend", finishDrag);
+            return handle;
+        };
+    }
+
     function compareFiles(before, after) {
         const left = new Map(before.map(file => [file.path, file.text]));
         const right = new Map(after.map(file => [file.path, file.text]));
@@ -126,5 +199,5 @@ window.StudioEditors = (() => {
         return visible;
     }
 
-    return {weightShares, weightPercent, filterUnits, compareFiles, lineDiff};
+    return {weightShares, weightPercent, filterUnits, unitSearchInput, draggableBuildOrder, compareFiles, lineDiff};
 })();
