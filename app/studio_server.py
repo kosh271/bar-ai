@@ -22,7 +22,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import discovery, game_sources, installation, project_archive, project_history, projects, unit_icons
+from . import (
+    discovery, game_sources, installation, profile_exchange, project_archive, project_history, projects, unit_icons,
+)
 from .headless import MatchError
 from .settings import (Settings, SettingsError, load_settings, load_studio_preferences, save_settings,
                        save_studio_preferences)
@@ -267,18 +269,24 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     })})
                 except Exception as error:
                     return self._handle_error(error)
-            if parsed.path == "/api/project/export":
+            if parsed.path in {"/api/project/export", "/api/profile/export"}:
                 try:
-                    query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
-                    if set(query) != {"project"} or len(query["project"]) != 1:
-                        raise ValueError("Supply one project to export.")
+                    is_profile = parsed.path == "/api/profile/export"
+                    fields = ("project", "profile") if is_profile else ("project",)
+                    query = self._query_fields(parsed.query, *fields)
                     with tempfile.TemporaryFile() as archive:
                         with self.server.write_lock:
-                            project = self._project(query["project"][0])
-                            project_archive.write(project, archive)
+                            project = self._project(query["project"])
+                            if is_profile:
+                                profile = projects._profile_path(project, query["profile"])
+                                profile_exchange.write_archive(profile, archive)
+                                filename = f"{profile.name}.profile.zip"
+                            else:
+                                project_archive.write(project, archive)
+                                filename = f"{project.name}.zip"
                         size = archive.tell()
                         archive.seek(0)
-                        self._send_headers(200, size, "application/zip", filename=f"{project.name}.zip")
+                        self._send_headers(200, size, "application/zip", filename=filename)
                         shutil.copyfileobj(archive, self.wfile)
                     return
                 except (BrokenPipeError, ConnectionResetError):
@@ -332,12 +340,18 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._error(401, "A valid workshop token is required.")
         parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/api/profile/import":
+            try:
+                return self._json(200, self._import_profile(parsed.query))
+            except Exception as error:
+                return self._handle_error(error)
         if parsed.query or parsed.path not in {
             "/api/client/heartbeat", "/api/client/close",
             "/api/save", "/api/clone", "/api/clone-project", "/api/sources",
             "/api/create-project", "/api/inspect", "/api/history", "/api/history/checkpoint", "/api/history/restore",
             "/api/history/diff",
             "/api/project/manage", "/api/project/import",
+            "/api/profile/merge-preview", "/api/profile/merge",
             "/api/preferences",
             "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
@@ -383,6 +397,13 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/project/manage":
                 with self.server.write_lock:
                     return self._json(200, self._manage_project(payload))
+            if parsed.path in {"/api/profile/merge-preview", "/api/profile/merge"}:
+                try:
+                    with self.server.write_lock:
+                        result = self._merge_profile(payload, save=parsed.path == "/api/profile/merge")
+                except profile_exchange.StalePreview as error:
+                    return self._error(409, str(error))
+                return self._json(200, result)
             if parsed.path == "/api/preferences":
                 with self.server.write_lock:
                     save_studio_preferences(self._preferences_path(), payload)
@@ -772,19 +793,71 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("Unknown project management action.")
         return {"project": project.name, "profile": profile}
 
-    def _import_project(self) -> dict[str, str]:
+    @staticmethod
+    def _query_fields(query: str, *fields: str) -> dict[str, str]:
+        values = urllib.parse.parse_qs(query, strict_parsing=True)
+        if set(values) != set(fields) or any(len(value) != 1 for value in values.values()):
+            raise ValueError(f"Supply one value for each parameter: {', '.join(fields)}.")
+        return {field: values[field][0] for field in fields}
+
+    def _read_archive(self, archive) -> None:
         remaining = self._body_length(project_archive.MAX_ARCHIVE_BYTES)
+        while remaining:
+            chunk = self.rfile.read(min(remaining, 64 * 1024))
+            if not chunk:
+                raise ValueError("Incomplete ZIP upload.")
+            archive.write(chunk)
+            remaining -= len(chunk)
+        archive.seek(0)
+
+    def _import_project(self) -> dict[str, str]:
         with tempfile.TemporaryFile() as archive:
-            while remaining:
-                chunk = self.rfile.read(min(remaining, 64 * 1024))
-                if not chunk:
-                    raise ValueError("Incomplete project upload.")
-                archive.write(chunk)
-                remaining -= len(chunk)
-            archive.seek(0)
+            self._read_archive(archive)
             with self.server.write_lock:
                 project = project_archive.load(self.server.projects_root, archive)
                 return {"project": project.name, "profile": projects.project_metadata(project)["default_profile"]}
+
+    def _import_profile(self, query: str) -> dict[str, str]:
+        fields = self._query_fields(query, "project", "name")
+        with tempfile.TemporaryFile() as archive:
+            self._read_archive(archive)
+            with self.server.write_lock:
+                project = self._project(fields["project"])
+                profile = profile_exchange.load_archive(project, fields["name"], archive)
+        return {"project": project.name, "profile": profile.name}
+
+    def _merge_profile(self, payload: dict[str, Any], *, save: bool) -> dict[str, Any]:
+        required = ("project", "profile", "other_project", "other_profile", "prefer")
+        if save:
+            required += ("name", "revision")
+        self._require_fields(payload, required)
+        fields = {field: self._string(payload[field], field) for field in required}
+        if fields["prefer"] not in {"selected", "other"}:
+            raise ValueError("Choose which profile to prefer on conflict.")
+        if save and not re_full_sha256(fields["revision"]):
+            raise ValueError("A valid merge preview revision is required.")
+        stale = "A source profile changed. Preview the merge again before creating the profile."
+        try:
+            project = self._project(fields["project"])
+            selected = projects._profile_path(project, fields["profile"])
+            other = projects._profile_path(self._project(fields["other_project"]), fields["other_profile"])
+            if selected == other:
+                raise ValueError("Choose two different profiles to merge.")
+            sources = (selected, other) if fields["prefer"] == "selected" else (other, selected)
+            preferred_files, other_files = (profile_exchange.read(source)[1] for source in sources)
+        except (projects.ProjectError, ValueError, OSError) as error:
+            if save:
+                raise profile_exchange.StalePreview(stale) from error
+            raise
+        revision = profile_exchange.source_revision(preferred_files, other_files)
+        if save and fields["revision"] != revision:
+            raise profile_exchange.StalePreview(stale)
+        files, report = profile_exchange.merge(preferred_files, other_files)
+        if not save:
+            return {"files": report, "revision": revision,
+                    "candidate": [{"path": path, "text": data.decode("utf-8")} for path, data in files.items()]}
+        created = profile_exchange.save_merge(project, fields["name"], files)
+        return {"project": project.name, "profile": created.name}
 
     @staticmethod
     def _check_project_tree(root: Path) -> None:

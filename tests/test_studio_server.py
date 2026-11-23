@@ -9,6 +9,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 from contextlib import nullcontext, redirect_stderr
 from types import SimpleNamespace
 from pathlib import Path
@@ -100,6 +101,161 @@ class StudioServerTests(unittest.TestCase):
             "/session.js", token=False, headers={"Sec-Fetch-Site": "cross-site"},
         )
         self.assertEqual(status, 403)
+
+    def test_profile_zip_and_merge_preview_round_trip(self):
+        project = self.projects / "ExampleAI"
+        original = project / "profiles" / "hard"
+        source_text = b'{\r\n  // keep this comment\r\n  "nested": {"shared": [1, 2], "left": true,},\r\n}\r\n'
+        (original / "config" / "settings.json").write_bytes(source_text)
+        query = "project=ExampleAI&profile=hard"
+        headers = {"X-Workshop-Token": self.server.session_token}
+        with urllib.request.urlopen(urllib.request.Request(
+            f"{self.base}/api/profile/export?{query}", headers=headers,
+        )) as response:
+            archive = response.read()
+        other_project = create_project(self.projects, "Other AI", self.projects.parent / "stock")
+        url = f"{self.base}/api/profile/import?project=OtherAI&name=Variant"
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers, data=archive)) as response:
+            self.assertEqual(json.load(response)["profile"], "variant")
+        variant = other_project / "profiles" / "variant"
+        self.assertEqual((variant / "config" / "settings.json").read_bytes(), source_text)
+        with self.assertRaises(urllib.error.HTTPError) as duplicate:
+            urllib.request.urlopen(urllib.request.Request(url, headers=headers, data=archive))
+        self.assertEqual(duplicate.exception.code, 400)
+        invalid = io.BytesIO(archive)
+        with zipfile.ZipFile(invalid, "a") as zipped:
+            zipped.writestr("unexpected/empty/", "")
+        invalid_url = f"{self.base}/api/profile/import?project=OtherAI&name=Invalid"
+        with self.assertRaises(urllib.error.HTTPError) as unexpected:
+            urllib.request.urlopen(urllib.request.Request(invalid_url, headers=headers, data=invalid.getvalue()))
+        self.assertEqual(unexpected.exception.code, 400)
+        self.assertEqual({path.name for path in (other_project / "profiles").iterdir()}, {"hard", "variant"})
+
+        (variant / "config" / "settings.json").write_text(
+            '{"nested":{"shared":[3],"right":true},"extra":17}', encoding="utf-8",
+        )
+        (variant / "script" / "main.as").write_text("variant main", encoding="utf-8")
+        (variant / "script" / "extra.as").write_text("extra", encoding="utf-8")
+        request = {"project": "ExampleAI", "profile": "hard", "other_project": "OtherAI",
+                   "other_profile": "variant", "prefer": "selected"}
+        status, preview, _ = self._request("/api/profile/merge-preview", method="POST", body=request)
+        self.assertEqual(status, 200)
+        self.assertEqual([file["path"] for file in preview["files"] if file["conflicts"]],
+                         ["config/settings.json", "script/main.as"])
+        self.assertEqual(preview["files"][0]["conflicts"][0]["preferred"], "[1, 2]")
+        changed_script = variant / "script" / "extra.as"
+        changed_script.write_text("updated extra", encoding="utf-8")
+        commit = {**request, "name": "Merged", "revision": preview["revision"]}
+        status, _, _ = self._request("/api/profile/merge", method="POST", body=commit)
+        self.assertEqual(status, 409)
+        self.assertFalse((project / "profiles" / "merged").exists())
+
+        status, preview, _ = self._request("/api/profile/merge-preview", method="POST", body=request)
+        self.assertEqual(status, 200)
+        commit = {**request, "name": "Keep Hard", "revision": preview["revision"]}
+        status, result, _ = self._request("/api/profile/merge", method="POST", body=commit)
+        self.assertEqual(status, 200)
+        preferred = project / "profiles" / result["profile"] / "config" / "settings.json"
+        combined = preferred.read_bytes()
+        self.assertIn(b"// keep this comment\r\n", combined)
+        self.assertIn(b'"shared": [1, 2]', combined)
+        self.assertIn(b'"right":true', combined)
+
+        (original / "config" / "Case.json").write_text('{"selected": true}', encoding="utf-8")
+        (variant / "config" / "case.json").write_text('{"other": true}', encoding="utf-8")
+        (original / "config" / "escaped.json").write_text(r'{"\ud800": 1}', encoding="utf-8")
+        (variant / "config" / "escaped.json").write_text(r'{"\ud800": 2}', encoding="utf-8")
+        request["prefer"] = "other"
+        status, preview, _ = self._request("/api/profile/merge-preview", method="POST", body=request)
+        self.assertEqual(status, 200)
+        self.assertEqual([file["path"] for file in preview["files"] if file["action"] == "omitted"],
+                         ["config/Case.json"])
+        escaped = next(file for file in preview["files"] if file["path"] == "config/escaped.json")
+        self.assertEqual(escaped["conflicts"][0]["setting"], r"/\ud800")
+        commit = {**request, "name": "Merged", "revision": preview["revision"]}
+        status, result, _ = self._request("/api/profile/merge", method="POST", body=commit)
+        self.assertEqual(status, 200)
+        merged = project / "profiles" / result["profile"]
+        self.assertEqual(json.loads((merged / "config" / "settings.json").read_text(encoding="utf-8")),
+                         {"nested": {"shared": [3], "left": True, "right": True}, "extra": 17})
+        self.assertEqual((merged / "script" / "main.as").read_text(encoding="utf-8"), "variant main")
+        self.assertEqual((merged / "script" / "extra.as").read_text(encoding="utf-8"), "updated extra")
+        self.assertEqual({path.name for path in (merged / "config").iterdir()},
+                         {"case.json", "escaped.json", "settings.json"})
+        self.assertEqual((original / "config" / "settings.json").read_bytes(), source_text)
+        (variant / "script" / "main.as").unlink()
+        status, error, _ = self._request("/api/profile/merge", method="POST", body={**commit, "name": "Missing source"})
+        self.assertEqual(status, 409)
+        self.assertIn("Preview the merge again", error["error"])
+        self.assertFalse((project / "profiles" / "missing-source").exists())
+
+    def test_merge_preview_keeps_factory_weights_with_their_roster(self):
+        project = self.projects / "ExampleAI"
+        base = project / "profiles" / "hard"
+        other = project / "profiles" / "variant"
+        shutil.copytree(base, other)
+
+        def factory(profile, name, fields):
+            (profile / "config" / name).write_text(
+                json.dumps({"factory": {"armlab": fields}}), encoding="utf-8",
+            )
+
+        factory(base, "factory.json", {"unit": ["armrock", "armham"], "land": {"tier1": [1, 2]}})
+        factory(other, "factory.json", {"unit": ["armham", "armrock"], "land": {"tier2": [3, 4]}})
+        factory(other, "factory_leg.json", {"land": {"tier3": [5, 6]}})
+        for profile, end in ((base, 1), (other, 2)):
+            (profile / "config" / "long.json").write_text(json.dumps({"values": [0] * 90 + [end]}))
+        for profile, value in ((base, 1), (other, "1")):
+            text = json.dumps({"queue": [0] * 90 + [{"rate": value}]})
+            if profile == other:
+                text = text.replace(', 0, {"rate":', ',\t0, {"rate":')
+            (profile / "config" / "nested.json").write_text(text)
+        (base / "config" / "response.json").write_text('{"response":{"riot":{"vs":["raider","skirmish"]}}}')
+        (other / "config" / "response.json").write_text(
+            '{"response":{"riot":{"vs":["skirmish","raider"],"ratio":[3,1]}}}',
+        )
+
+        request = {"project": "ExampleAI", "profile": "hard", "other_project": "ExampleAI",
+                   "other_profile": "variant", "prefer": "selected"}
+        status, preview, _ = self._request("/api/profile/merge-preview", method="POST", body=request)
+        self.assertEqual(status, 200)
+        candidate = {file["path"]: file["text"] for file in preview["candidate"]}
+        self.assertEqual(candidate["config/factory.json"], (base / "config" / "factory.json").read_text())
+        self.assertNotIn("config/factory_leg.json", candidate)
+        self.assertEqual(candidate["config/response.json"], (base / "config" / "response.json").read_text())
+        conflict = next(file for file in preview["files"] if file["path"] == "config/long.json")["conflicts"][0]
+        self.assertEqual(conflict["location"], "Array index 90")
+        self.assertEqual((conflict["preferred"], conflict["other"]), ("1", "2"))
+        nested = next(file for file in preview["files"] if file["path"] == "config/nested.json")["conflicts"][0]
+        self.assertEqual(nested["location"], "Array index 90")
+        self.assertEqual((nested["preferred"], nested["other"]), ('{"rate": 1}', '{"rate": "1"}'))
+
+        request["prefer"] = "other"
+        status, preview, _ = self._request("/api/profile/merge-preview", method="POST", body=request)
+        self.assertEqual(status, 200)
+        candidate = {file["path"]: file["text"] for file in preview["candidate"]}
+        self.assertEqual(candidate["config/factory.json"], (other / "config" / "factory.json").read_text())
+        self.assertIn("config/factory_leg.json", candidate)
+
+        factory(other, "factory.json", {"unit": ["armrock", "armham"], "land": {"tier2": [3, 4]}})
+        for profile in (base, other):
+            factory(profile, "factory_leg.json", {"unit": ["armham", "armrock"]})
+        (base / "script" / "init.as").write_text('@data.profile = @(array<string> = {"factory", "factory_leg"});')
+        (other / "script" / "init.as").write_text('@data.profile = @(array<string> = {"factory_leg", "factory"});')
+        request["prefer"] = "selected"
+        status, preview, _ = self._request("/api/profile/merge-preview", method="POST", body=request)
+        self.assertEqual(status, 200)
+        candidate = {file["path"]: file["text"] for file in preview["candidate"]}
+        self.assertEqual(candidate["config/factory.json"], (base / "config" / "factory.json").read_text())
+
+        for profile in (base, other):
+            (profile / "script" / "init.as").write_text('@data.profile = @(array<string> = {"custom"});')
+        factory(base, "custom.json", {"unit": ["armrock", "armham"]})
+        factory(other, "custom.json", {"unit": ["armham", "armrock"], "land": {"tier2": [9, 1]}})
+        status, preview, _ = self._request("/api/profile/merge-preview", method="POST", body=request)
+        self.assertEqual(status, 200)
+        candidate = {file["path"]: file["text"] for file in preview["candidate"]}
+        self.assertEqual(candidate["config/custom.json"], (base / "config" / "custom.json").read_text())
 
     def test_experiment_endpoints_require_a_token_and_pass_validated_requests(self):
         start_path = "/api/experiment/start"

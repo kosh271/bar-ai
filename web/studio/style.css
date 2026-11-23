@@ -201,3 +201,4 @@
 .section-guide li + li { margin-top: 10px; }
 .section-guide dt { font-weight: 700; }
 .section-guide dd { margin: 0 0 10px; }
+.profile-merge-results{overflow-wrap:anywhere}

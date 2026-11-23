@@ -64,7 +64,7 @@ async function api(url, data, signal) {
         ...(signal ? {signal} : {})
     });
     const result = await response.json();
-    if (!response.ok) throw Error(result.error || `Request failed (${response.status})`);
+    if (!response.ok) throw Object.assign(Error(result.error || `Request failed (${response.status})`), {status: response.status});
     return result;
 }
 function selectedProject() { return state.projects.find(p => p.key === state.project); }
@@ -284,9 +284,16 @@ function showGuide(page, inDepth) {
     $("dialog").querySelector(".dialog-inner").scrollTop = 0;
 }
 function showDialog(title, content) {
-    $("dialog-title").textContent = title;
+    const dialog = $("dialog"), heading = $("dialog-title");
+    heading.textContent = title;
     $("dialog-content").replaceChildren(content);
-    if (!$("dialog").open) $("dialog").showModal();
+    if (dialog.open) {
+        heading.tabIndex = -1;
+        heading.focus({preventScroll: true});
+    } else {
+        dialog.showModal();
+    }
+    dialog.querySelector(".dialog-inner").scrollTop = 0;
 }
 function textInput(label, value = "", placeholder = "") {
     const wrap = element("label", "field", label), input = element("input");
@@ -3272,70 +3279,301 @@ async function projectArchiveRequest(url, file) {
     }
     return response;
 }
+async function downloadArchive(url, filename) {
+    const response = await projectArchiveRequest(url);
+    const link = element("a");
+    link.href = URL.createObjectURL(await response.blob());
+    link.download = filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+function workspaceFeedback() {
+    const feedback = element("p", "muted");
+    feedback.setAttribute("role", "status");
+    return feedback;
+}
+function showWorkspaceFeedback(feedback, text) {
+    feedback.textContent = text;
+    if (feedback.isConnected && $("dialog").open) feedback.scrollIntoView({block: "nearest"});
+}
+async function openUpdatedWorkspace(result, success, feedback) {
+    const profile = result.profile ?? state.profile;
+    const retry = button("Reload workspace", async () => {
+        if (state.saving) return;
+        state.saving = true; status(); retry.disabled = true;
+        try {
+            await open();
+        } finally {
+            retry.disabled = false; state.saving = false; status();
+        }
+    });
+    async function open() {
+        feedback.textContent = `${success} Reloading workspace…`;
+        try {
+            await refreshState(result.project, profile);
+            await loadProfile();
+            if (feedback.isConnected) $("dialog").close();
+            message(success);
+        } catch (error) {
+            const detail = `${success} Workspace reload failed. ${errorText(error)}`;
+            if (feedback.isConnected && $("dialog").open) {
+                feedback.textContent = detail;
+                feedback.after(retry);
+                retry.disabled = false;
+                retry.focus();
+            } else {
+                message(detail, true);
+            }
+        }
+    }
+    await open();
+}
+function mergeProfiles(project, profile) {
+    const selected = JSON.stringify([project.key, profile.key]);
+    const profiles = state.projects.flatMap(target => target.profiles.map(item => ({
+        value: JSON.stringify([target.key, item.key]),
+        label: `${target.name} / ${item.name}`,
+        key: `${target.key} / ${item.key}`
+    })));
+    const labelCounts = new Map();
+    for (const {label} of profiles) labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+    for (const item of profiles) {
+        if (labelCounts.get(item.label) > 1) item.label += ` (${item.key})`;
+    }
+    const choices = profiles.filter(item => item.value !== selected);
+    const box = element("div");
+    if (!choices.length) {
+        box.append(notice("Create or import a second profile before merging."));
+        showDialog("Merge profiles", box);
+        return;
+    }
+    const selectedName = profiles.find(item => item.value === selected).label;
+    const otherLabel = dropdown("Merge with", choices.map(({value, label}) => [value, label]), choices[0].value, updateOther);
+    const preferLabel = dropdown("Prefer on conflict", [], "", clearPreview);
+    const other = otherLabel.querySelector("select"), prefer = preferLabel.querySelector("select");
+    const [nameLabel, name] = textInput("New profile name", `${profile.name} merged`);
+    const feedback = workspaceFeedback(), results = element("div", "profile-merge-results");
+    let request = 0;
+    let reviewed = null;
+    const preview = button("Preview merge", previewMerge);
+    const save = button("Create merged profile", createMergedProfile, "button primary");
+
+    function clearPreview() {
+        request++;
+        reviewed = null;
+        save.disabled = true;
+        preview.disabled = false;
+        feedback.textContent = "";
+        results.replaceChildren();
+    }
+    function updateOther() {
+        const previous = prefer.value || "selected";
+        selectOptions(prefer, [["selected", selectedName], ["other", other.selectedOptions[0].textContent]], previous);
+        clearPreview();
+    }
+    async function previewMerge() {
+        clearPreview();
+        const version = request;
+        const [other_project, other_profile] = JSON.parse(other.value);
+        const payload = {project: project.key, profile: profile.key, other_project, other_profile, prefer: prefer.value};
+        feedback.textContent = "Preparing merge preview…";
+        preview.disabled = true;
+        try {
+            const result = await api("/api/profile/merge-preview", payload);
+            if (version !== request || !box.isConnected || !$("dialog").open) return;
+            const chosen = prefer.selectedOptions[0].textContent;
+            const {errors, warnings} = C.validateProfile(result.candidate, state.catalog);
+            const count = result.files.reduce((sum, file) => sum + file.conflict_count, 0);
+            feedback.textContent = result.files.length
+                ? `${result.files.length} differing ${result.files.length === 1 ? "file" : "files"} · ${count} ${count === 1 ? "conflict" : "conflicts"}`
+                : "The saved profiles have identical files.";
+            if (errors.length) feedback.textContent += " Fix the validation errors before creating a merged profile.";
+            for (const [label, findings] of [["Validation errors", errors], ["Validation warnings", warnings]]) {
+                if (!findings.length) continue;
+                const details = element("details"), list = element("ul", "tree-body");
+                details.open = findings === errors;
+                for (const item of findings) {
+                    list.append(element("li", "", `${item.path}:${item.line} · ${item.location ? item.location + " · " : ""}${item.message}`));
+                }
+                details.append(element("summary", "", `${label} (${findings.length})`), list);
+                results.append(details);
+            }
+            const actions = {
+                settings: "Combined settings", text: "Kept preferred formatting",
+                preferred: "Kept preferred file", other: "Added from the other profile",
+                omitted: "Skipped conflicting file", layer: "Kept preferred configuration layer"
+            };
+            for (const file of result.files) {
+                const action = file.action === "preferred" && !file.conflict_count ? "Added from preferred profile" : actions[file.action];
+                const description = file.conflict_count
+                    ? `${action} · ${file.conflict_count} ${file.conflict_count === 1 ? "conflict" : "conflicts"}` : action;
+                if (!file.conflict_count) {
+                    results.append(element("p", "muted", `${file.path} · ${description}`));
+                    continue;
+                }
+                const details = element("details"), summary = element("summary", "", `${file.path} · ${description}`);
+                const body = element("div", "tree-body");
+                details.append(summary, body);
+                results.append(details);
+                details.addEventListener("toggle", () => {
+                    if (!details.open || body.childNodes.length) return;
+                    for (const conflict of file.conflicts) {
+                        if (conflict.reason) {
+                            body.append(element("p", "", `${conflict.reason} Using ${chosen}.`));
+                        } else {
+                            const item = element("div");
+                            const location = conflict.setting || "(whole file)";
+                            item.append(element("code", "path", conflict.location ? `${location} · ${conflict.location}` : location),
+                                element("pre", "", `Kept ${conflict.preferred}\nOther value ${conflict.other}`));
+                            body.append(item);
+                        }
+                    }
+                    if (file.conflict_count > file.conflicts.length) {
+                        body.append(element("p", "muted", `Using ${chosen} for all ${file.conflict_count} conflicts.`));
+                    }
+                });
+            }
+            if (!errors.length) reviewed = {...payload, revision: result.revision};
+            save.disabled = !reviewed;
+        } catch (error) {
+            if (version === request) feedback.textContent = errorText(error);
+        } finally {
+            if (version === request) preview.disabled = false;
+        }
+    }
+    async function createMergedProfile() {
+        if (!reviewed || state.saving) return;
+        if (!name.value.trim()) { feedback.textContent = "Enter a name for the merged profile."; return; }
+        if (!confirmDiscard()) return;
+        state.saving = true;
+        status();
+        save.disabled = preview.disabled = other.disabled = prefer.disabled = true;
+        let created = false;
+        try {
+            const result = await api("/api/profile/merge", {...reviewed, name: name.value});
+            created = true;
+            reviewed = null;
+            name.disabled = true;
+            await openUpdatedWorkspace(result, "Merged profile created.", feedback);
+        } catch (error) {
+            if (error.status === 409) clearPreview();
+            feedback.textContent = errorText(error);
+        } finally {
+            save.disabled = !reviewed;
+            preview.disabled = other.disabled = prefer.disabled = created;
+            state.saving = false;
+            status();
+        }
+    }
+    updateOther();
+    box.append(element("p", "muted", `Merge saved files from ${selectedName} into a new profile in ${project.name}.`),
+        otherLabel, preferLabel,
+        element("p", "muted", "The merge combines settings with different keys. Conflicting values, ordered lists, and scripts use the preferred profile. Factory and response layers stay together when their lists or load order may differ."),
+        nameLabel);
+    const actions = element("div", "row");
+    actions.append(preview, save);
+    box.append(actions, feedback, results);
+    showDialog("Merge profiles", box);
+}
 function manageProject() {
     const project = selectedProject(), profile = project?.profiles.find(entry => entry.key === state.profile);
-    const box = element("div"), feedback = element("p", "muted"), archive = element("input");
+    const box = element("div"), projectImportFeedback = workspaceFeedback(), archive = element("input");
     archive.type = "file"; archive.accept = ".zip,application/zip";
     const archiveLabel = element("label", "field", "Project ZIP");
     archiveLabel.append(archive);
 
-    async function mutate(event, submit, success) {
+    async function mutate(event, submit, success, feedback) {
         const control = event.currentTarget;
         if (state.saving || !confirmDiscard()) return;
         state.saving = true; status(); control.disabled = true;
+        let submitted = false;
         try {
             const result = await submit();
-            await refreshState(result.project, result.profile ?? state.profile);
-            await loadProfile(); $("dialog").close(); message(success);
-        } catch (error) { feedback.textContent = errorText(error); }
-        finally { state.saving = false; status(); control.disabled = false; }
+            submitted = true;
+            await openUpdatedWorkspace(result, success, feedback);
+        } catch (error) { showWorkspaceFeedback(feedback, errorText(error)); }
+        finally { state.saving = false; status(); control.disabled = submitted; }
     }
-    const change = (event, action, fields, success) => mutate(event, () => api("/api/project/manage", {
+    const change = (event, action, fields, success, feedback) => mutate(event, () => api("/api/project/manage", {
         project: project.key, profile: profile?.key, action, ...fields
-    }), success);
+    }), success, feedback);
     if (project) {
         const [projectLabel, projectName] = textInput("Project display name", project.name);
+        const projectFeedback = workspaceFeedback();
         box.append(element("h3", "", "Project"), projectLabel,
-            button("Rename project", event => change(event, "rename_project", {name: projectName.value}, "Project renamed.")),
+            button("Rename project", event => change(event, "rename_project", {name: projectName.value}, "Project renamed.", projectFeedback)),
             button("Export project ZIP", async event => {
                 const control = event.currentTarget;
                 control.disabled = true;
                 try {
-                    const response = await projectArchiveRequest(`/api/project/export?project=${encodeURIComponent(project.key)}`);
-                    const link = element("a");
-                    link.href = URL.createObjectURL(await response.blob()); link.download = project.key + ".zip";
-                    link.click();
-                    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
-                    feedback.textContent = "Project ZIP exported.";
-                } catch (error) { feedback.textContent = errorText(error); }
+                    await downloadArchive(`/api/project/export?project=${encodeURIComponent(project.key)}`, project.key + ".zip");
+                    showWorkspaceFeedback(projectFeedback, "Project ZIP exported.");
+                } catch (error) { showWorkspaceFeedback(projectFeedback, errorText(error)); }
                 finally { control.disabled = false; }
             }),
             button("Delete project", event => {
                 if (confirm(`Permanently delete ${project.name}, its profiles, and its checkpoint history?`)) {
-                    change(event, "delete_project", {confirm: true}, "Project deleted.");
+                    change(event, "delete_project", {confirm: true}, "Project deleted.", projectFeedback);
                 }
-            }));
+            }), projectFeedback);
         box.append(element("h3", "", "Profiles"), button("New profile from BAR", () => createProject(project.key)));
         if (profile) {
             const isDefault = project.default_profile === profile.key;
             const [profileLabel, profileName] = textInput("Profile display name", profile.name);
-            const setDefault = button("Make default", event => change(event, "set_default", {}, "Default profile updated. Install the AI to apply its new default in BAR."));
+            const profileFeedback = workspaceFeedback();
+            const setDefault = button("Make default", event => change(event, "set_default", {},
+                "Default profile updated. Install the AI to apply its new default in BAR.", profileFeedback));
             const remove = button("Delete profile", event => {
-                if (confirm(`Delete the ${profile.name} profile?`)) change(event, "delete_profile", {confirm: true}, "Profile deleted.");
+                if (confirm(`Delete the ${profile.name} profile?`)) change(event, "delete_profile", {confirm: true}, "Profile deleted.", profileFeedback);
             });
             setDefault.disabled = isDefault;
             remove.disabled = isDefault || project.profiles.length === 1;
             box.append(profileLabel,
-                button("Rename profile", event => change(event, "rename_profile", {name: profileName.value}, "Profile renamed.")),
-                setDefault, remove);
+                button("Rename profile", event => change(event, "rename_profile", {name: profileName.value}, "Profile renamed.", profileFeedback)),
+                setDefault, remove,
+                button("Export profile ZIP", async event => {
+                    const control = event.currentTarget;
+                    control.disabled = true;
+                    try {
+                        const query = new URLSearchParams({project: project.key, profile: profile.key});
+                        await downloadArchive(`/api/profile/export?${query}`, profile.key + ".profile.zip");
+                        showWorkspaceFeedback(profileFeedback, "Saved profile exported.");
+                    } catch (error) { showWorkspaceFeedback(profileFeedback, errorText(error)); }
+                    finally { control.disabled = false; }
+                }),
+                button("Merge profiles", () => mergeProfiles(project, profile)), profileFeedback);
             if (isDefault) box.append(element("p", "muted", "This is the default profile. Select a different default before deleting it."));
         }
+        const profileArchive = element("input");
+        profileArchive.type = "file"; profileArchive.accept = ".zip,application/zip";
+        const profileArchiveLabel = element("label", "field", "Profile ZIP");
+        const [nameLabel, name] = textInput("New profile name");
+        const profileImportFeedback = workspaceFeedback();
+        let nameEdited = false;
+        name.addEventListener("input", () => { nameEdited = true; });
+        profileArchiveLabel.append(profileArchive);
+        profileArchive.addEventListener("change", () => {
+            if (!nameEdited) {
+                name.value = profileArchive.files[0]?.name.replace(/(?:\.profile)?\.zip$/i, "") || "";
+            }
+            profileImportFeedback.textContent = "";
+        });
+        const importProfile = button("Import profile ZIP", event => {
+            if (!profileArchive.files.length || !name.value.trim()) {
+                showWorkspaceFeedback(profileImportFeedback, "Choose a profile ZIP and enter a name for the new profile.");
+                return;
+            }
+            const query = new URLSearchParams({project: project.key, name: name.value});
+            mutate(event, async () => (await projectArchiveRequest(`/api/profile/import?${query}`, profileArchive.files[0])).json(),
+                "Profile imported.", profileImportFeedback);
+        });
+        box.append(element("h3", "", "Import a profile"), profileArchiveLabel, nameLabel, importProfile, profileImportFeedback);
     }
     box.append(element("h3", "", "Import a project"), archiveLabel, button("Import ZIP", event => {
-        if (!archive.files.length) { feedback.textContent = "Choose a project ZIP."; return; }
+        if (!archive.files.length) { showWorkspaceFeedback(projectImportFeedback, "Choose a project ZIP."); return; }
         mutate(event, async () => (await projectArchiveRequest("/api/project/import", archive.files[0])).json(),
-            "Project imported with a fresh baseline checkpoint.");
-    }), feedback);
+            "Project imported with a fresh baseline checkpoint.", projectImportFeedback);
+    }), projectImportFeedback);
     showDialog("Manage projects and profiles", box);
 }
 function manageAIs(target) {
