@@ -45,6 +45,28 @@ class StudioPreferenceTests(unittest.TestCase):
             self.assertEqual(load_studio_preferences(path), {})
 
 
+    def test_tournament_draft_merges_with_match_and_workspace(self):
+        with tempfile.TemporaryDirectory(dir=TEST_DIR) as temporary:
+            path = Path(temporary) / "studio-preferences.json"
+            workspace = {"project": "ExampleAI", "profile": "hard"}
+            tournament = {
+                "game": "BAR", "maps": ["Map v1", "Map2"], "minutes": 30,
+                "game_limit": 12, "seconds_limit": 1000,
+                "players": [
+                    {"ai": ["ExampleAI", "1", "hard"], "faction": "Rotate"},
+                    {"ai": ["OtherAI", "stable", ""], "faction": "Random"},
+                ],
+            }
+            save_studio_preferences(path, {"workspace": workspace})
+            save_studio_preferences(path, {"tournament": tournament})
+            with self.assertRaises(SettingsError):
+                save_studio_preferences(path, {"tournament": {**tournament, "game_limit": 101}})
+            self.assertEqual(load_studio_preferences(path), {"workspace": workspace, "tournament": tournament})
+            draft = {**tournament, "maps": [], "players": []}
+            save_studio_preferences(path, {"tournament": draft})
+            self.assertEqual(load_studio_preferences(path)["tournament"], draft)
+
+
 class DiscoveryTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(dir=TEST_DIR)

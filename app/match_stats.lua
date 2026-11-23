@@ -13,10 +13,11 @@ local fields = {
     "unitsProduced", "unitsKilled", "unitsDied",
 }
 
-local function report()
-    if Spring.GetGameFrame() <= 0 then
+local function report(frame, logTotals)
+    if frame <= 0 then
         return
     end
+    local lines = {tostring(frame)}
     local gaia = Spring.GetGaiaTeamID()
     for _, team in ipairs(Spring.GetTeamList()) do
         if team ~= gaia then
@@ -30,22 +31,32 @@ local function report()
                         totals[#totals + 1] = string.format("%s=%.6f", field, sample[field])
                     end
                 end
-                Spring.Echo(string.format("Team %d stats: %s", team, table.concat(totals, ", ")))
+                local line = string.format("Team %d stats: %s", team, table.concat(totals, ", "))
+                lines[#lines + 1] = line
+                if logTotals then
+                    Spring.Echo(line)
+                end
             end
         end
+    end
+    local snapshot = io.open("LuaUI/Config/studio_match_live.txt", "wb")
+    if snapshot then
+        lines[#lines + 1] = "end\n"
+        snapshot:write(table.concat(lines, "\n"))
+        snapshot:close()
     end
 end
 
 function widget:GameFrame(frame)
-    if frame > 1 and frame % 900 == 1 then
-        report()
+    if frame % 450 == 1 then
+        report(frame, frame > 1 and frame % 900 == 1)
     end
 end
 
 function widget:GameOver()
-    report()
+    report(Spring.GetGameFrame(), true)
 end
 
 function widget:Shutdown()
-    report()
+    report(Spring.GetGameFrame(), true)
 end

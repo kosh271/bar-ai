@@ -25,6 +25,35 @@ class HeadlessMatchTests(unittest.TestCase):
         return run_match(self.engine, self.data, self.local_data, "Map", "Game", self.players, 30,
                          self.stop, self.events.append, **kwargs)
 
+    def test_live_snapshot_requires_complete_sample_and_uses_engine_side_mapping(self):
+        players = [self.players[1], self.players[0]]
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            config = run / "LuaUI" / "Config"
+            config.mkdir(parents=True)
+            snapshot = config / "studio_match_live.txt"
+            data = ("451\nTeam 0 stats: metalProduced=15, energyProduced=120, damageDealt=8\n"
+                    "Team 1 stats: metalProduced=20, energyProduced=60, damageDealt=0\n")
+            snapshot.write_text(data, encoding="ascii")
+            self.assertIsNone(headless.live_match_sample(run, players))
+            snapshot.write_text(data + "end\n", encoding="ascii")
+            sample = headless.live_match_sample(run, players)
+            self.assertAlmostEqual(sample["simulated_seconds"], 451 / 30)
+            self.assertEqual(sample["side_totals"], [
+                {"resources": 21, "damage": 0}, {"resources": 17, "damage": 8},
+            ])
+
+    def test_live_clock_can_use_recent_complete_engine_log_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            (run / "infolog.txt").write_text(
+                "[f=-000001] loading\n" + "x" * 20000 +
+                "\n[t=00:00:01.000000][f=0000900] simulation started\n[f=0001200",
+                encoding="utf-8",
+            )
+            self.assertIsNone(headless.live_match_sample(run, self.players))
+            self.assertEqual(headless._logged_game_seconds(run), 30)
+
     @patch("app.headless.subprocess.Popen")
     def test_match_collects_team_totals_without_retaining_a_replay(self, popen):
         def launch(command, **kwargs):

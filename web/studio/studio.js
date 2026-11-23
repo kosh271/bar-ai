@@ -7,12 +7,12 @@ const state = {
     projects: [], project: "", profile: "", files: [], page: "overview",
     layer: {}, factory: "", situation: "land", response: "", file: "",
     settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), icons: {available: false, message: "", cache: new Map()}, saving: false, history: [], installStatus: null,
-    experiments: {history: [], selected: "", error: ""},
+    experiments: {history: [], selected: "", error: "", tournament: null},
     match: {
         content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "",
         first: "", second: "", faction1: "Armada", faction2: "Cortex",
         side1: [], side2: [], seriesGames: 1, swapSides: false, seriesMaps: [], factionPairs: [],
-        minutes: 120, skip: false, snapshot: null, statusError: "", parallelGames: null,
+        minutes: 120, skip: false, snapshot: null, statusError: "", capacity: null,
         history: [], historyFilters: {project: "", profile: "", map: "", checkpoint: ""}, historyError: ""
     }
 };
@@ -193,9 +193,11 @@ function rememberMatchPreferences() {
 }
 async function refreshState(project, profile) {
     const data = await api("/api/state");
+    state.match.capacity = data.game_capacity;
     if (project === undefined) {
         project = data.preferences?.workspace?.project ?? "";
         profile = data.preferences?.workspace?.profile ?? "";
+        state.experiments.tournament = data.preferences?.tournament ?? null;
         const match = data.preferences?.match;
         if (match) {
             const teams = match.rosters?.map(team => team.map(slot => ({
@@ -581,6 +583,12 @@ function overview(target) {
         grid.append(card);
     }
     target.append(grid);
+    const layerSection = element("details", "script-inspector");
+    layerSection.append(element("summary", "", "Startup configuration layers (script/init.as)"));
+    const layerBody = element("div", "tree-body");
+    initLayersView(layerBody);
+    layerSection.append(layerBody);
+    target.append(layerSection);
 }
 function opening(target) {
     let resolved;
@@ -1007,8 +1015,11 @@ function production(target, selected) {
     panel.append(element("div", "source-bar", "Editing: " + file.path));
     scriptSettings(panel, "script/manager/factory.as", "Factory switching", [
         ["Switch threshold lower bound", "AiRandom\\s*\\(\\s*", "\\s*,", "integer", 0, null],
-        ["Switch threshold upper bound", "AiRandom\\s*\\(\\s*\\d+\\s*,\\s*", "\\s*\\)\\s*\\*\\s*SECOND", "integer", 0, null]
+        ["Switch threshold upper bound", "AiRandom\\s*\\(\\s*\\d+\\s*,\\s*", "\\s*\\)\\s*\\*\\s*SECOND", "integer", 0, null],
+        ["Switch formula: frame exponent", "pow\\s*\\(\\s*\\(\\s*ai\\.frame\\s*-\\s*lastSwitchFrame\\s*\\)\\s*,\\s*", "\\s*\\)", "float", 0, 5],
+        ["Switch formula: stored-metal multiplier", "aiEconomyMgr\\.metal\\.current\\s*\\*\\s*", "\\s*\\)", "float", 0, null]
     ]);
+    recruitRulesView(panel);
     target.append(panel);
 }
 function responseView(panel, file, root) {
@@ -1967,14 +1978,29 @@ function configPage(target, page, selected) {
         constructionRulesView(panel);
     }
     if (page === "placement") placementView(panel, file, root);
-    if (page === "economy") scriptSettings(panel, "script/manager/economy.as", "Economy script thresholds", [
-        ["Metal empty: fraction of storage", "aiEconomyMgr\\.isMetalEmpty\\s*=\\s*metal\\.current\\s*<\\s*metal\\.storage\\s*\\*\\s*", "\\s*;", "float", 0, 1],
-        ["Metal full: fraction of storage", "aiEconomyMgr\\.isMetalFull\\s*=\\s*metal\\.current\\s*>\\s*metal\\.storage\\s*\\*\\s*", "\\s*;", "float", 0, 1],
-        ["Energy full: fraction of storage", "aiEconomyMgr\\.isEnergyFull\\s*=\\s*energy\\.current\\s*>\\s*energy\\.storage\\s*\\*\\s*", "\\s*;", "float", 0, 1]
-    ]);
+    if (page === "economy") {
+        scriptSettings(panel, "script/manager/economy.as", "Economy script thresholds", [
+            ["Metal empty: fraction of storage", "aiEconomyMgr\\.isMetalEmpty\\s*=\\s*metal\\.current\\s*<\\s*metal\\.storage\\s*\\*\\s*", "\\s*;", "float", 0, 1],
+            ["Metal full: fraction of storage", "aiEconomyMgr\\.isMetalFull\\s*=\\s*metal\\.current\\s*>\\s*metal\\.storage\\s*\\*\\s*", "\\s*;", "float", 0, 1],
+            ["Early-game energy grace period (minutes)", "if\\s*\\(\\s*ai\\.frame\\s*<\\s*", "\\s*\\*\\s*MINUTE", "integer", 0, null],
+            ["Early-game energy stall: fraction of storage", "aiEconomyMgr\\.isEnergyStalling\\s*=\\s*\\(\\s*energy\\.income\\s*<\\s*energy\\.pull\\s*\\)\\s*&&\\s*\\(\\s*energy\\.current\\s*<\\s*energy\\.storage\\s*\\*\\s*", "\\s*\\)", "float", 0, 1],
+            ["Late-game energy empty: fraction of storage", "aiEconomyMgr\\.isEnergyEmpty\\s*=\\s*energy\\.current\\s*<\\s*energy\\.storage\\s*\\*\\s*", "\\s*;", "float", 0, 1],
+            ["Late-game energy stall: fraction of storage", "aiEconomyMgr\\.isEnergyStalling\\s*=\\s*aiEconomyMgr\\.isEnergyEmpty\\s*\\|\\|\\s*\\(\\s*\\(\\s*energy\\.income\\s*<\\s*energy\\.pull\\s*\\)\\s*&&\\s*\\(\\s*energy\\.current\\s*<\\s*energy\\.storage\\s*\\*\\s*", "\\s*\\)\\s*\\)", "float", 0, 1],
+            ["Energy full: fraction of storage", "aiEconomyMgr\\.isEnergyFull\\s*=\\s*energy\\.current\\s*>\\s*energy\\.storage\\s*\\*\\s*", "\\s*;", "float", 0, 1],
+            ["Factory assist required: metal fraction", "aiFactoryMgr\\.isAssistRequired\\s*=\\s*\\(\\s*metal\\.current\\s*>\\s*metal\\.storage\\s*\\*\\s*", "\\s*\\)", "float", 0, 1]
+        ]);
+        scriptSettings(panel, "script/main.as", "Base energy script threshold", [
+            ["Heavy energy base-build metal cost", "cdef\\.costM\\s*>=\\s*", "\\s*&&\\s*!cdef\\.IsMobile\\s*\\(", "float", 0, null]
+        ]);
+        scriptSettings(panel, "script/manager/builder.as", "Base builder script threshold", [
+            ["T1/T2 base builder metal cost split", "if\\s*\\(\\s*cdef\\.costM\\s*<\\s*", "\\s*\\)", "float", 0, null]
+        ]);
+    }
     if (page === "defense") scriptSettings(panel, "script/manager/military.as", "Defense script conditions", [
         ["Defense may start after minutes (or other conditions)", "ai\\.frame\\s*>\\s*", "\\s*\\*\\s*MINUTE", "integer", 0, null],
-        ["Defense may start above metal income (or other conditions)", "aiEconomyMgr\\.metal\\.income\\s*>\\s*", "\\s*\\)", "float", 0, null]
+        ["Defense may start above metal income (or other conditions)", "aiEconomyMgr\\.metal\\.income\\s*>\\s*", "\\s*\\)", "float", 0, null],
+        ["Defense may start above enemy mobile threat (or other conditions)", "aiEnemyMgr\\.mobileThreat\\s*>\\s*", "\\s*\\)", "float", 0, null],
+        ["Air production enemy-AA threat limit (legacy)", "GetEnemyThreat\\s*\\(\\s*Unit::Role::AA\\.type\\s*\\)\\s*<=\\s*", "\\s*;", "float", 0, null]
     ]);
     panel.append(element("h3", "", page === "placement" ? "More placement settings" : "Explore settings"),
         element("p", "muted", page === "placement"
@@ -1985,6 +2011,202 @@ function configPage(target, page, selected) {
     panel.append(tree, element("div", "source-bar", page === "placement"
         ? "Settings file: building placement rules"
         : "Editing: " + file.path)); target.append(panel);
+}
+function recruitRulesView(panel) {
+    const section = element("section", "script-settings");
+    section.append(element("h3", "", "Unit reserve & recruitment rules"));
+    panel.append(section);
+    let model;
+    try { model = S.readRecruitRules(state.files); }
+    catch (error) { section.append(notice(errorText(error))); return; }
+    const {file, rules} = model;
+    section.append(element("p", "muted", "Ask a factory to recruit a unit until its active or queued count reaches a target, optionally gated by start time, cooldown, milestone buildings, or enemy investment."),
+        element("p", "muted", "These rules live in the profile's factory script and apply independently of the selected configuration layer."));
+    const knownIds = [...new Set([...state.unitNames.keys(), ...(state.catalog?.byId.keys() || []),
+        ...rules.flatMap(rule => [rule.factory, rule.unit, ...rule.milestones])])];
+    if (!knownIds.length) {
+        section.append(notice("Load a unit catalog to choose factories and units."));
+        return;
+    }
+
+    function saveRules(updated) {
+        try {
+            assign(file, S.writeRecruitRules(state.files, updated));
+            message("");
+            render();
+        } catch (error) { message(errorText(error), true); }
+    }
+
+    const presets = element("div", "row");
+    const fighterPreset = {
+        factory: "armap", unit: "armfig", target: 30, startMinutes: 2,
+        cooldownSeconds: 0, yieldNormal: false, requireMetal: false,
+        milestones: [], enemyRole: "", enemyCost: 0
+    };
+    const bomberPreset = {
+        factory: "armaap", unit: "armpnix", target: 50, startMinutes: 0,
+        cooldownSeconds: 15, yieldNormal: true, requireMetal: true,
+        milestones: ["armsilo", "armamd"], enemyRole: "", enemyCost: 0
+    };
+    presets.append(
+        button("Preset: Fighter reserve (30)", () => saveRules([...rules, fighterPreset])),
+        button("Preset: Bomber reserve (50)", () => saveRules([...rules, bomberPreset]))
+    );
+    section.append(presets);
+
+    function ruleCard(rule, index) {
+        const card = element("div", "recruit-rule-card");
+        let factory = rule?.factory || "", unit = rule?.unit || "";
+        const [targetLabel, targetInput] = textInput("Target count", rule?.target ?? 10);
+        targetInput.type = "number"; targetInput.min = "1"; targetInput.max = "1000"; targetInput.step = "1";
+        const [startLabel, startInput] = textInput("Start after (min)", rule?.startMinutes ?? 0);
+        startInput.type = "number"; startInput.min = "0"; startInput.max = "1000"; startInput.step = "1";
+        const [cooldownLabel, cooldownInput] = textInput("Cooldown (sec)", rule?.cooldownSeconds ?? 0);
+        cooldownInput.type = "number"; cooldownInput.min = "0"; cooldownInput.max = "3600"; cooldownInput.step = "1";
+        const yieldLabel = element("label", "option-check");
+        const yieldInput = element("input");
+        yieldInput.type = "checkbox"; yieldInput.checked = Boolean(rule?.yieldNormal);
+        yieldLabel.append(yieldInput, document.createTextNode("Yield alternate turns"));
+        const metalLabel = element("label", "option-check");
+        const metalInput = element("input");
+        metalInput.type = "checkbox"; metalInput.checked = Boolean(rule?.requireMetal);
+        metalLabel.append(metalInput, document.createTextNode("Require stored metal"));
+        const [milestonesLabel, milestonesInput] = textInput("Milestone buildings (optional IDs)",
+            rule?.milestones?.join(", ") || "", "e.g. armsilo, armamd");
+        const [enemyRoleLabel, enemyRoleInput] = textInput("Enemy role gate (optional)",
+            rule?.enemyRole || "", "e.g. air");
+        const [enemyCostLabel, enemyCostInput] = textInput("Min enemy metal cost",
+            rule?.enemyCost ?? 0);
+        enemyCostInput.type = "number"; enemyCostInput.min = "0"; enemyCostInput.step = "any";
+        const unitChoices = ["", ...knownIds];
+
+        const top = element("div", "row");
+        top.append(
+            unitPicker("Factory", unitChoices, factory, value => { factory = value; }),
+            unitPicker("Unit to recruit", unitChoices, unit, value => { unit = value; }),
+            targetLabel, startLabel, cooldownLabel
+        );
+        const gates = element("div", "row");
+        gates.append(milestonesLabel, enemyRoleLabel, enemyCostLabel);
+        const checks = element("div", "row");
+        checks.append(yieldLabel, metalLabel);
+        const actions = element("div", "row");
+        actions.append(button(rule ? "Update recruitment rule" : "Add recruitment rule", () => {
+            const milestones = milestonesInput.value.split(/[\s,]+/).map(item => item.trim()).filter(Boolean);
+            const entry = {
+                factory, unit,
+                target: targetInput.valueAsNumber,
+                startMinutes: startInput.valueAsNumber,
+                cooldownSeconds: cooldownInput.valueAsNumber,
+                yieldNormal: yieldInput.checked,
+                requireMetal: metalInput.checked,
+                milestones,
+                enemyRole: enemyRoleInput.value.trim(),
+                enemyCost: enemyRoleInput.value.trim() ? enemyCostInput.valueAsNumber : 0
+            };
+            saveRules(rule ? rules.map((existing, i) => i === index ? entry : existing) : [...rules, entry]);
+        }));
+        if (rule) actions.append(button("Remove recruitment rule", () => saveRules(rules.filter((_, i) => i !== index))));
+        card.append(top, gates, checks, actions);
+        return card;
+    }
+
+    rules.forEach((rule, index) => section.append(ruleCard(rule, index)));
+    section.append(ruleCard());
+}
+function initLayersView(panel) {
+    let model;
+    try { model = S.readInitLayers(state.files); }
+    catch (error) { panel.append(notice(errorText(error))); return; }
+    const availableLayers = state.files
+        .map(f => f.path.replace(/\\/g, "/"))
+        .filter(path => /^config\/.+\.json$/i.test(path))
+        .map(path => path.slice("config/".length, -".json".length))
+        .sort();
+
+    function saveModel(next) {
+        try {
+            assign(model.file, S.writeInitLayers(state.files, next));
+            message("");
+            render();
+        } catch (error) { message(errorText(error), true); }
+    }
+
+    function layerListSection(title, description, items, allowEmpty, onUpdate) {
+        panel.append(element("h3", "", title), element("p", "muted", description));
+        const list = element("ol", "layer-order");
+        if (!items.length) panel.append(element("p", "muted", "No layers in this branch."));
+        items.forEach((name, index) => {
+            const row = element("li", "layer-order-item");
+            row.append(element("span", "grow", `${name} (config/${name}.json)`));
+            const up = button("Move up", () => {
+                const next = [...items];
+                [next[index - 1], next[index]] = [next[index], next[index - 1]];
+                onUpdate(next);
+            });
+            const down = button("Move down", () => {
+                const next = [...items];
+                [next[index + 1], next[index]] = [next[index], next[index + 1]];
+                onUpdate(next);
+            });
+            const remove = button("Remove", () => onUpdate(items.filter((_, i) => i !== index)));
+            up.disabled = index === 0;
+            down.disabled = index === items.length - 1;
+            remove.disabled = !allowEmpty && items.length <= 1;
+            row.append(up, down, remove);
+            list.append(row);
+        });
+        panel.append(list);
+        const candidates = availableLayers.filter(name => !items.includes(name));
+        if (candidates.length) {
+            const row = element("div", "row");
+            const picker = element("select");
+            picker.setAttribute("aria-label", `Layer to add to ${title}`);
+            selectOptions(picker, candidates.map(name => [name, `config/${name}.json`]), candidates[0]);
+            row.append(picker, button("Add layer", () => onUpdate([...items, picker.value])));
+            panel.append(row);
+        }
+    }
+
+    layerListSection(
+        "Base configuration layers",
+        "Loaded in order at startup. Later layers override earlier values.",
+        model.base,
+        false,
+        nextBase => saveModel({base: nextBase, branches: model.branches})
+    );
+    for (const branch of model.branches) {
+        layerListSection(
+            `Conditional branch · ${branch.label}`,
+            `Appended when game option "${branch.option}" is enabled.`,
+            branch.layers,
+            true,
+            nextLayers => saveModel({
+                base: model.base,
+                branches: model.branches.map(item => item.option === branch.option ? {...item, layers: nextLayers} : item)
+            })
+        );
+    }
+    panel.append(element("p", "muted", "Startup script: " + model.file.path));
+}
+function resolveIncludeTarget(currentPath, includeName) {
+    const parts = currentPath.replace(/\\/g, "/").split("/").slice(0, -1);
+    for (const part of includeName.split("/")) {
+        if (!part || part === ".") continue;
+        if (part === "..") {
+            if (!parts.length) return null;
+            parts.pop();
+        } else parts.push(part);
+    }
+    return find(parts.join("/"));
+}
+function focusSourceLine(textarea, line) {
+    const lines = textarea.value.split("\n");
+    const idx = Math.max(0, Math.min(line - 1, lines.length - 1));
+    const offset = lines.slice(0, idx).reduce((total, text) => total + text.length + 1, 0);
+    const end = offset + (lines[idx]?.length || 0);
+    textarea.focus();
+    textarea.setSelectionRange(offset, end);
 }
 function advanced(target) {
     const panel = element("div", "panel");
@@ -1998,105 +2220,132 @@ function advanced(target) {
         try { panel.append(treeNode(file, parse(file), "Visual configuration tree")); }
         catch (error) { panel.append(notice("Cannot show visual tree: " + errorText(error), true)); }
     }
+    let sourceTextarea = null;
+    if (file.path.endsWith(".as")) {
+        try {
+            const resolvedInit = S.resolve(state.files, "script/init.as");
+            if (resolvedInit && resolvedInit.file.path === file.path) {
+                const initDetails = element("details", "script-inspector");
+                initDetails.open = true;
+                initDetails.append(element("summary", "", "Startup configuration layers"));
+                const initBody = element("div", "tree-body");
+                initLayersView(initBody);
+                initDetails.append(initBody);
+                panel.append(initDetails);
+            }
+        } catch (_) { /* Unavailable init.as structure is handled by source editing. */ }
+        try {
+            const inspected = S.inspectScript(file.text);
+            if (inspected.constants.length) {
+                const details = element("details", "script-inspector");
+                details.open = true;
+                details.append(element("summary", "", `Adjustable script constants (${inspected.constants.length})`));
+                const body = element("div", "tree-body");
+                for (const item of inspected.constants) {
+                    const row = element("div", "tree-field"), label = element("label");
+                    const title = item.meta?.label || (item.namespace ? `${item.namespace}::${item.name}` : item.name);
+                    label.append(element("div", "", title));
+                    if (item.meta?.description) label.append(element("div", "muted", item.meta.description));
+                    label.append(element("div", "path", `${item.type}${item.unit ? " × " + item.unit : ""} · line ${item.line}`));
+                    const input = element("input");
+                    const id = "script-const-" + Math.random().toString(36).slice(2);
+                    input.id = id;
+                    label.htmlFor = id;
+                    input.setAttribute("aria-label", title);
+                    if (item.type === "bool") {
+                        input.type = "checkbox";
+                        input.checked = item.value;
+                    } else if (item.type === "string") {
+                        input.type = "text";
+                        input.value = item.value;
+                    } else {
+                        input.type = "number";
+                        input.step = (item.type === "int" || item.type === "uint") ? "1" : "any";
+                        if (item.meta?.min !== undefined) input.min = String(item.meta.min);
+                        else if (item.type === "uint") input.min = "0";
+                        if (item.meta?.max !== undefined) input.max = String(item.meta.max);
+                        input.value = item.value;
+                    }
+                    input.addEventListener("change", () => {
+                        try {
+                            const current = S.inspectScript(file.text).constants.find(candidate =>
+                                candidate.namespace === item.namespace && candidate.name === item.name && candidate.type === item.type);
+                            if (!current) throw Error("This constant is no longer matched in the script.");
+                            const rawValue = item.type === "bool" ? input.checked : input.value;
+                            const next = S.patchScriptLiteral(file.text, current, rawValue);
+                            assign(file, next);
+                            message("");
+                        } catch (error) {
+                            message(errorText(error), true);
+                            try {
+                                const refreshed = S.inspectScript(file.text).constants.find(candidate =>
+                                    candidate.namespace === item.namespace && candidate.name === item.name && candidate.type === item.type);
+                                if (refreshed) {
+                                    if (item.type === "bool") input.checked = refreshed.value;
+                                    else input.value = refreshed.value;
+                                }
+                            } catch (_) { /* Keep current input when script has syntax errors. */ }
+                        }
+                    });
+                    row.append(label, input);
+                    body.append(row);
+                }
+                details.append(body);
+                panel.append(details);
+            }
+            if (inspected.includes.length || inspected.hooks.length) {
+                const structure = element("details", "script-inspector");
+                structure.append(element("summary", "", "Script structure (includes & hooks)"));
+                const body = element("div", "tree-body");
+                if (inspected.includes.length) {
+                    body.append(element("h3", "", "Included scripts"));
+                    const chipList = element("div", "script-chip-list");
+                    for (const inc of inspected.includes) {
+                        const targetFile = resolveIncludeTarget(file.path, inc.name);
+                        chipList.append(button(inc.name, () => {
+                            if (targetFile) { state.file = targetFile.path; render(); }
+                            else if (sourceTextarea) focusSourceLine(sourceTextarea, inc.line);
+                        }));
+                    }
+                    body.append(chipList);
+                }
+                if (inspected.hooks.length) {
+                    body.append(element("h3", "", "BARb callbacks & hooks"));
+                    const hookList = element("div", "script-hook-list");
+                    for (const hook of inspected.hooks) {
+                        const title = `${hook.namespace ? hook.namespace + "::" : ""}${hook.name} · line ${hook.line}`;
+                        hookList.append(button(title, () => {
+                            if (sourceTextarea) focusSourceLine(sourceTextarea, hook.line);
+                        }));
+                    }
+                    body.append(hookList);
+                }
+                structure.append(body);
+                panel.append(structure);
+            }
+        } catch (error) {
+            panel.append(notice("Cannot inspect script structure: " + errorText(error), true));
+        }
+    }
     const label = element("label", "field", "Source"), textarea = element("textarea");
+    sourceTextarea = textarea;
     textarea.value = file.text; textarea.spellcheck = false; textarea.dataset.source = "true";
     textarea.addEventListener("input", () => assign(file, textarea.value)); label.append(textarea);
     panel.append(label, element("div", "source-bar", "Changes are saved to this profile only. Unknown content is not rewritten."));
     target.append(panel);
 }
 function showMatchLogs(runId) {
-    const content = element("div"), sources = [
-        ["infolog.txt", "Engine log"], ["stdout.txt", "Console output"], ["result.json", "Result JSON"]
-    ];
-    const filters = [["all", "All lines"], ["ai_script", "AI / AngelScript"], ["engine_error", "Engine Errors"],
-        ["engine_warning", "Engine Warnings"], ["other", "Other"]];
-    const searchRow = element("div", "row"), filterRow = element("div", "row"), navigation = element("div", "row");
-    const [searchField, search] = textInput("Search log", "", "Enter text");
-    const statusLine = element("p", "muted"), output = element("pre");
-    statusLine.setAttribute("role", "status");
-    const controller = new AbortController();
-    let filename = sources[0][0], category = "all", busy = false, page = null, firstLine = 1;
-    let history = [], displayed = [];
-    const load = offset => api("/api/match/logs?" + new URLSearchParams({run_id: runId, file: filename, offset}),
-        undefined, controller.signal);
-    const matches = line => (category === "all" || line.category === category) &&
-        line.text.toLowerCase().includes(search.value.trim().toLowerCase());
-
-    function update() {
-        displayed = (page?.lines || []).flatMap((line, index) => matches(line)
-            ? [`${firstLine + index}  ${line.text}`] : []);
-        output.textContent = displayed.join("\n");
-        copy.disabled = busy || !displayed.length;
-        previous.disabled = busy || !history.length;
-        next.disabled = busy || page?.next_offset == null;
-        find.disabled = next.disabled;
-        for (const [kind, pill] of pills) {
-            pill.setAttribute("aria-pressed", String(kind === category));
-            pill.classList.toggle("primary", kind === category);
-        }
-        statusLine.textContent = busy ? "Reading log…" : page?.missing ? "This file was not generated."
-            : page ? `Showing ${displayed.length} of ${page.lines.length} lines on this page.` : "";
-    }
-
-    async function navigateLog(delegate) {
-        if (busy) return;
-        busy = true;
-        source.disabled = true;
-        search.disabled = true;
-        for (const [, pill] of pills) pill.disabled = true;
-        update();
-        let failure = "";
-        try { await delegate(); }
-        catch (error) { if (!controller.signal.aborted) failure = errorText(error); }
-        finally {
-            busy = false;
-            source.disabled = false;
-            search.disabled = false;
-            for (const [, pill] of pills) pill.disabled = false;
-            update();
-            if (failure) statusLine.textContent = failure;
-        }
-    }
-
-    async function advance() {
-        const following = await load(page.next_offset);
-        history.push({offset: page.offset, firstLine});
-        firstLine += page.lines.length - (page.ends_with_newline ? 0 : 1);
-        page = following;
-    }
-
-    const sourceField = dropdown("Log file", sources, filename, value => navigateLog(async () => {
-        filename = value;
-        history = [];
-        firstLine = 1;
-        page = null;
-        page = await load(0);
-    }));
-    const source = sourceField.querySelector("select");
-    const pills = filters.map(([kind, label]) => [kind, button(label, () => { category = kind; update(); }, "button")]);
-    const previous = button("Previous page", () => navigateLog(async () => {
-        const entry = history[history.length - 1];
-        page = await load(entry.offset);
-        firstLine = entry.firstLine;
-        history.pop();
-    }));
-    const next = button("Next page", () => navigateLog(advance));
-    const find = button("Find next page with matches", () => navigateLog(async () => {
-        do { await advance(); }
-        while (page.next_offset != null && !page.lines.some(matches));
-    }));
-    const copy = button("Copy visible lines", async () => {
-        try { await navigator.clipboard.writeText(displayed.join("\n")); statusLine.textContent = "Copied visible lines."; }
-        catch (error) { statusLine.textContent = errorText(error); }
+    const sources = [["infolog.txt", "Engine log"], ["stdout.txt", "Console output"], ["result.json", "Result JSON"]];
+    const viewer = window.StudioLogs.createViewer({
+        runId, sources,
+        fetchPage: (file, offset, signal) =>
+            api("/api/match/logs?" + new URLSearchParams({run_id: runId, file, offset}), undefined, signal),
     });
-    search.addEventListener("input", update);
-    searchRow.append(sourceField, searchField);
-    filterRow.append(...pills.map(([, pill]) => pill));
-    navigation.append(previous, next, find, copy);
-    content.append(searchRow, filterRow, statusLine, navigation, output);
-    showDialog(`Logs · ${runId}`, content);
-    $("dialog").addEventListener("close", () => controller.abort(), {once: true});
-    navigateLog(async () => { page = await load(0); });
+    const dialog = $("dialog");
+    showDialog(`Match logs · ${runId}`, viewer.element);
+    dialog.classList.add("viewer");
+    dialog.addEventListener("close", () => { viewer.destroy(); dialog.classList.remove("viewer"); }, {once: true});
+    viewer.start();
 }
 
 function matchTelemetryView(telemetry) {
@@ -2111,15 +2360,22 @@ function matchTelemetryView(telemetry) {
             ["Opener", team.opener], ["Factory switches", team.factory_switches?.join(", ")],
             ["AI script errors", team.ai_script_errors || null],
             ["AI script warnings", team.ai_script_warnings || null],
-            ...Object.entries(team.stats || {}).map(([name, amount]) =>
-                [name.replaceAll("_", " ").replace(/^./, char => char.toUpperCase()), amount]),
+            ...Object.entries(team.stats || {}).map(([name, amount]) => [
+                name.replaceAll("_", " ").replace(/^./, char => char.toUpperCase()),
+                /^(metal|energy|damage)(_|$)/.test(name) ? formatGameTotal(amount) : amount,
+                true,
+            ]),
         ].filter(([, value]) => value !== null && value !== undefined && value !== "");
         const details = element("details"), body = element("div", "tree-body");
         if (team.team === undefined && !items.length) continue;
         const title = team.team === undefined ? "AI events without a team" :
             `Side ${team.side} · Team ${team.team} · ${team.ai} · ${team.faction}`;
         details.append(element("summary", "", title));
-        for (const [label, value] of items) body.append(element("p", "", `${label} · ${value}`));
+        for (const [label, value, numeric] of items) {
+            const line = element("p", "", `${label} · `);
+            line.append(element("span", numeric || typeof value === "number" ? "game-number" : "", value));
+            body.append(line);
+        }
         if (!items.length) body.append(element("p", "muted", "This team emitted no recognized telemetry."));
         details.append(body);
         card.append(details);
@@ -2139,13 +2395,116 @@ const matchComparisonMetrics = [
     ["units_produced", "Units produced"],
 ];
 const matchStatFormat = new Intl.NumberFormat(undefined, {maximumFractionDigits: 2});
+const gameThousandsFormat = new Intl.NumberFormat(undefined, {maximumFractionDigits: 0});
 let matchTracker = null;
 
 function trackerClock(seconds) {
-    if (seconds == null) return "—";
-    const value = Math.floor(seconds);
-    return [Math.floor(value / 3600), Math.floor(value / 60) % 60, value % 60]
-        .map(part => String(part).padStart(2, "0")).join(":");
+    if (!Number.isFinite(seconds)) return "—";
+    const value = Math.max(0, Math.round(seconds));
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.floor(value / 60) % 60;
+    const padded = part => String(part).padStart(2, "0");
+    return hours ? `${hours}:${padded(minutes)}:${padded(value % 60)}` : `${minutes}:${padded(value % 60)}`;
+}
+
+function formatGameTotal(value) {
+    return Number.isFinite(value) ? gameThousandsFormat.format(value / 1000) + "k" : "—";
+}
+
+function matchupLine(label, marker = "") {
+    const line = element("div", "game-matchup-line");
+    if (marker) {
+        const dot = element("span", `game-outcome-dot outcome-${marker.toLowerCase()}`);
+        dot.setAttribute("role", "img");
+        dot.setAttribute("aria-label", marker);
+        dot.title = marker;
+        line.append(dot);
+    }
+    const name = element("span", "", label);
+    name.title = label;
+    line.append(name);
+    return line;
+}
+
+function liveBalance(label, values) {
+    const [first, second] = values;
+    const known = values.every(Number.isFinite);
+    const total = known ? Math.max(0, first) + Math.max(0, second) : 0;
+    const share = total > 0 ? Math.round(100 * Math.max(0, first) / total) : null;
+    const row = element("div", "live-game-balance");
+    row.append(element("span", "live-game-metric-label", label));
+    const meter = element("div", "live-game-split");
+    if (share !== null) {
+        meter.classList.add("has-values");
+        meter.style.setProperty("--first-share", share + "%");
+    }
+    meter.setAttribute("role", "img");
+    const describe = side => `Side ${side + 1} ${formatGameTotal(values[side])}`;
+    meter.setAttribute("aria-label", `${label}, ${describe(0)}, ${describe(1)}`);
+    meter.title = `${describe(0)} · ${describe(1)}`;
+    const noShare = known ? formatGameTotal(0) : "—";
+    row.append(element("span", "live-game-share", share === null ? noShare : `${share}%`),
+        meter, element("span", "live-game-share", share === null ? noShare : `${100 - share}%`));
+    return row;
+}
+
+function renderLiveGames(container, games) {
+    if (!container) return;
+    container.hidden = !games.length;
+    if (!games.length) return;
+    if (!container.firstChild) {
+        const wrap = element("div", "table-wrap");
+        const table = element("table", "live-game-table");
+        table.setAttribute("aria-label", "Games in progress");
+        table.setAttribute("aria-live", "off");
+        const header = table.createTHead().insertRow();
+        for (const title of ["Game", "Matchup", "Side 1 / Side 2 balance", "Game time / limit"]) {
+            const column = element("th", "", title);
+            column.scope = "col";
+            header.append(column);
+        }
+        table.createTBody();
+        wrap.append(table);
+        container.append(element("h3", "", "Games in progress"), wrap);
+    }
+    const body = container.querySelector("tbody");
+    body.replaceChildren();
+    for (const game of games) {
+        const row = body.insertRow();
+        const title = element("th", "live-game-title", "Game ");
+        title.scope = "row";
+        title.append(element("span", "game-number", game.index), element("div", "muted", game.map));
+        const matchup = element("td", "game-matchup");
+        matchup.append(matchupLine(game.side1), matchupLine(game.side2));
+        matchup.children[0].classList.add("live-side-one");
+        matchup.children[1].classList.add("live-side-two");
+        const balance = element("td", "live-game-balances");
+        const totals = game.live?.side_totals || [{}, {}];
+        balance.append(liveBalance("Resources", totals.map(side => side.resources)),
+            liveBalance("Damage", totals.map(side => side.damage)));
+        const time = element("td", "live-game-clock");
+        const elapsed = game.live?.simulated_seconds;
+        time.append(element("strong", "", `${trackerClock(elapsed)} / ${trackerClock(game.limit)}`));
+        const meter = element("progress", "live-game-time");
+        meter.max = game.limit || 1;
+        meter.value = Math.min(meter.max, elapsed ?? 0);
+        meter.setAttribute("aria-label", `Game ${game.index} time against limit`);
+        const phase = trackedGameStatuses[game.state] || game.state;
+        const wall = element("div", "muted", `${phase} · `);
+        wall.append(element("span", "game-number", trackerClock(game.elapsed_seconds)), " wall");
+        time.append(meter, wall);
+        row.append(title, matchup, balance, time);
+    }
+}
+
+function renderLiveTests(container, snapshot) {
+    const active = snapshot?.operation === "match"
+        ? (snapshot.games || []).filter(game => trackedGameActive.has(game.state)) : [];
+    renderLiveGames(container, active.map(game => ({
+        ...game, index: game.game_index, limit: game.game_time_limit_seconds,
+        side1: game.players.filter(player => player.ally === 0).map(trackedProfile).join(", "),
+        side2: game.players.filter(player => player.ally === 1).map(trackedProfile).join(", "),
+    })));
 }
 
 function trackedProfile(player) {
@@ -2156,10 +2515,18 @@ function matchComparison(game) {
     const telemetry = game.telemetry?.teams || [];
     const sides = [0, 1].map(ally => game.players.flatMap((player, team) =>
         player.ally === ally ? [telemetry.find(row => row.team === team && row.side === ally + 1)?.stats] : []));
-    return matchComparisonMetrics.flatMap(([key, label]) => {
-        const totals = sides.map(teams => teams.length && teams.every(stats => Number.isFinite(stats?.[key]))
-            ? teams.reduce((sum, stats) => sum + stats[key], 0) : null);
-        return totals.some(total => total !== null) ? [[label, ...totals]] : [];
+    const compute = (teams, metric) => teams.length && teams.every(stats => Number.isFinite(metric(stats)))
+        ? teams.reduce((sum, stats) => sum + metric(stats), 0) : null;
+    const metrics = [
+        ["Total resources", stats => stats?.metal_produced + stats?.energy_produced / 60, formatGameTotal],
+        ...matchComparisonMetrics.map(([key, label]) => [
+            label, stats => stats?.[key],
+            key.startsWith("units_") ? value => matchStatFormat.format(value) : formatGameTotal,
+        ]),
+    ];
+    return metrics.flatMap(([label, metric, format]) => {
+        const totals = sides.map(teams => compute(teams, metric));
+        return totals.some(total => total !== null) ? [[label, format, ...totals]] : [];
     });
 }
 
@@ -2177,13 +2544,14 @@ function trackedGameDetails(body, game) {
         }
         const thead = element("thead"), tbody = element("tbody");
         thead.append(head);
-        for (const [label, first, second] of comparison) {
+        for (const [label, format, first, second] of comparison) {
             const row = element("tr");
             const metric = element("th", "", label);
             metric.scope = "row";
             row.append(metric);
             for (const [value, other] of [[first, second], [second, first]]) {
-                const cell = element("td", "", value === null ? "—" : matchStatFormat.format(value));
+                const cell = element("td");
+                cell.append(element("span", "game-number", value === null ? "—" : format(value)));
                 if (value !== null && other !== null && value > other) {
                     cell.append(element("span", "match-stat-lead", "Higher"));
                 }
@@ -2491,10 +2859,69 @@ async function loadMatchHistory() {
     }
     renderMatchHistory($("match-history-body"));
 }
+const gameMemoryBytes = 5_000_000_000;
+
+function gameMemoryWarning(games, memoryBytes) {
+    if (!games || !memoryBytes || 4 * games * gameMemoryBytes <= 3 * memoryBytes) return "";
+    const percent = games * gameMemoryBytes / memoryBytes * 100;
+    return `${games} parallel games could use ${games * 5} GB of RAM, about ${percent.toFixed(1)}% of system memory. This exceeds 75%.`;
+}
+
+function gameParallelControl() {
+    const capacity = state.match.capacity;
+    const control = element("div");
+    control.id = "game-parallel-control";
+    if (!capacity) return control;
+    const currentLimit = () => state.match.snapshot?.parallel_games ?? capacity.parallel_games;
+    const label = element("label", "field", "Parallel game limit");
+    const input = element("input");
+    Object.assign(input, {type: "number", min: 0, max: capacity.processor_cores, step: 1, required: true, value: currentLimit()});
+    label.append(input);
+    const row = element("div", "row");
+    const current = element("p", "muted");
+    const warning = notice("", true);
+    warning.setAttribute("role", "status");
+    let lastLimit = currentLimit();
+    const update = () => {
+        const limit = currentLimit();
+        if (Number(input.value) === lastLimit && input.value !== "") input.value = limit;
+        lastLimit = limit;
+        const currentText = `Current limit ${limit} · ${capacity.processor_cores} processor cores · 0 pauses new games`;
+        if (current.textContent !== currentText) current.textContent = currentText;
+        const draft = input.checkValidity() ? Number(input.value) : 0;
+        const active = state.match.snapshot?.active_games ?? 0;
+        const text = gameMemoryWarning(Math.max(draft, limit, active), capacity.memory_bytes);
+        if (warning.textContent !== text) warning.textContent = text;
+        warning.hidden = !text;
+    };
+    input.addEventListener("input", update);
+    const apply = button("Apply limit", async () => {
+        if (!input.reportValidity()) return;
+        apply.disabled = true;
+        try {
+            const previous = state.match.snapshot;
+            const snapshot = await api("/api/match/parallel", {parallel_games: Number(input.value)});
+            capacity.parallel_games = snapshot.parallel_games;
+            if (state.match.snapshot === previous || state.match.snapshot?.id === snapshot.id) {
+                state.match.snapshot = snapshot;
+            }
+            updateMatchStatus();
+            if (isMatchActive(snapshot)) pollMatch(true);
+        } catch (error) { message(errorText(error), true); }
+        finally { apply.disabled = false; }
+    });
+    row.append(label, apply);
+    control.append(row, current, warning);
+    control.updateLimit = update;
+    update();
+    return control;
+}
+
 function matchView(target) {
     const m = state.match, panel = element("div", "panel");
     const info = state.settings;
     panel.append(element("h2", "", "Headless testing"));
+    panel.append(gameParallelControl());
     if (info) {
         panel.append(element("p", "muted", `Using ${info.engine} · ${info.bar_root}`));
     } else {
@@ -2564,6 +2991,9 @@ function matchView(target) {
     const tracker = element("div");
     tracker.id = "match-tracker";
     renderMatchTracker(tracker, m.snapshot);
+    const liveGames = element("section", "live-game-tracker");
+    liveGames.id = "live-test-games";
+    renderLiveTests(liveGames, m.snapshot);
     if (m.content) {
         const content = m.content;
         if (!content.games.length || !content.maps.length || !content.ais.length) {
@@ -2725,22 +3155,14 @@ function matchView(target) {
             extra.type = "checkbox"; extra.checked = m.extraUnits === true;
             extra.addEventListener("change", () => { m.extraUnits = extra.checked; });
             extraLabel.append(extra);
-            const slots = element("input"), slotsLabel = element("label", "field", "Parallel game limit");
-            slots.type = "number"; slots.min = "1"; slots.max = "8"; slots.step = "1"; slots.required = true;
-            slots.value = m.parallelGames ?? m.snapshot?.parallel_games ?? 2;
-            slots.addEventListener("change", () => {
-                if (slots.checkValidity()) m.parallelGames = Number(slots.value);
-            });
-            slotsLabel.append(slots);
             const startLabel = (m.seriesGames || 1) > 1 ? `Queue ${m.seriesGames}-game series` : "Queue match";
             const submit = button(startLabel, async () => {
                 if (m.submitting) return;
                 try {
                     if (dirty().length) throw Error("Save and install profile changes before testing.");
-                    if (!minutes.reportValidity() || !slots.reportValidity()) return;
+                    if (!minutes.reportValidity()) return;
                     m.submitting = true;
                     updateMatchControls();
-                    m.parallelGames = Number(slots.value);
                     const player = (value, faction, ally) => {
                         const [short_name, version, profile] = JSON.parse(value);
                         return {short_name, version, profile, faction, ally};
@@ -2756,7 +3178,6 @@ function matchView(target) {
                         players,
                         minutes: m.minutes,
                         skip_smoke: m.skip,
-                        parallel_games: m.parallelGames,
                         record_demo: m.recordDemo === true,
                         extra_units: m.extraUnits === true,
                     };
@@ -2781,12 +3202,12 @@ function matchView(target) {
             }, "button primary");
             submit.id = "match-submit";
             submit.disabled = !canQueueMatch(m);
-            settings.append(minuteLabel, skipLabel, replayLabel, extraLabel, slotsLabel, submit);
+            settings.append(minuteLabel, skipLabel, replayLabel, extraLabel, submit);
             panel.append(settings);
             if (content.warnings.length) panel.append(notice("Scan warnings: " + content.warnings.join("; "), true));
         }
     }
-    panel.append(tracker, scoreboard);
+    panel.append(liveGames, tracker, scoreboard);
     const historyPanel = element("div", "panel");
     historyPanel.id = "match-history-panel";
     historyPanel.append(element("h2", "", "Match history"),
@@ -2861,6 +3282,9 @@ function matchStatusText(snapshot, error, cacheError = "") {
         const historyError = historyErrors.length === 1 ? ` · ${historyErrors[0]}`
             : historyErrors.length ? ` · ${historyErrors.length} runs could not be saved to match history` : "";
         if (snapshot.state === "running") {
+            if (snapshot.parallel_games === 0 && queued) {
+                return `New launches paused · ${active} active · ${queued} queued · ${finished} finished${historyError}`;
+            }
             return `${active} active · ${snapshot.parallel_games} parallel limit · ${queued} queued · ${finished} finished${historyError}`;
         }
         if (snapshot.state === "cancelling") return `Cancelling queue · ${active} stopping`;
@@ -2876,6 +3300,7 @@ function matchStatusText(snapshot, error, cacheError = "") {
 }
 function updateMatchStatus() {
     const m = state.match, statusBox = $("match-status"), scanProgress = $("scan-progress");
+    $("game-parallel-control")?.updateLimit?.();
     if (statusBox) {
         const status = matchStatusText(m.snapshot, m.statusError, m.cacheError);
         if (statusBox.textContent !== status) statusBox.textContent = status;
@@ -2884,6 +3309,7 @@ function updateMatchStatus() {
     updateMatchControls();
     renderSeriesScoreboard($("series-scoreboard"), m.snapshot?.series_scores);
     renderMatchTracker($("match-tracker"), m.snapshot);
+    renderLiveTests($("live-test-games"), m.snapshot);
     updateExperimentStatus();
 }
 let matchPoll = null;

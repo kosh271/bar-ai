@@ -273,7 +273,8 @@ class StudioServerTests(unittest.TestCase):
         with patch.object(service, "start_experiment", return_value={"operation": "experiment"}) as start:
             self.assertEqual(self._request(start_path, method="POST", body={})[0], 400)
             self.assertEqual(self._request(start_path, method="POST", body=spec)[1]["operation"], "experiment")
-            start.assert_called_once_with("bar", "engine", "Game", ["Map"], 1, 2, 60, "tournament", [], sweep=None)
+            start.assert_called_once_with("bar", "engine", "Game", ["Map"], 1, 2, 60, "tournament", [],
+                                          sweep=None, parallel_games=None)
         self.assertEqual(self._request("/api/experiment/history")[1], {"experiments": []})
         self.assertEqual(self._request("/api/experiment/pause", method="POST", body={"id": "e", "paused": 1})[0], 400)
         self.assertEqual(self._request("/api/experiment/pause", method="POST", body={"paused": True})[0], 400)
@@ -315,6 +316,24 @@ class StudioServerTests(unittest.TestCase):
             status, snapshot, _ = self._request(path, method="POST", body=body)
         self.assertEqual((status, snapshot["state"]), (200, "running"))
         cancel.assert_called_once_with("queue", 3)
+
+    def test_match_parallel_setting_accepts_zero_and_enforces_detected_cores(self):
+        path = "/api/match/parallel"
+        with patch.object(self.server.match_service, "_processor_cores", 4):
+            status, snapshot, _ = self._request(path, method="POST", body={"parallel_games": 0})
+            self.assertEqual((status, snapshot["parallel_games"]), (200, 0))
+            _, state, _ = self._request("/api/state")
+            self.assertEqual(state["game_capacity"]["processor_cores"], 4)
+            self.assertEqual(state["game_capacity"]["parallel_games"], 0)
+            self.assertEqual(self._request(path, method="POST", body={"parallel_games": 5})[0], 400)
+
+    def test_server_close_signals_active_experiment(self):
+        with patch.object(self.server.match_service, "is_busy", return_value=True) as busy, \
+                patch.object(self.server.match_service, "cancel") as cancel, \
+                patch("app.studio_server.ThreadingHTTPServer.server_close"):
+            self.server.server_close()
+        busy.assert_called_once_with("experiment")
+        cancel.assert_called_once_with()
 
     def test_match_log_endpoint_pages_bounded_raw_artifacts(self):
         url = "/api/match/logs?run_id=match-logs&file="

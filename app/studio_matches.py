@@ -20,7 +20,8 @@ import threading
 import time
 import uuid
 from collections import deque
-from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import closing, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from itertools import islice
@@ -30,11 +31,11 @@ from typing import Callable
 
 from . import discovery, headless, installation, project_history, settings, studio_experiments
 from .unit_catalog import valid_catalog
+from .system_capacity import game_capacity
 
 
 _operation_lock = threading.Lock()
 _MAX_MATCH_SECONDS = 6 * 60 * 60
-_MAX_PARALLEL_GAMES = 8
 _MAX_QUEUE_GAMES = 500
 # The raw-byte and row limits keep even a fully JSON-escaped page below 256 KiB.
 _LOG_PAGE_BYTES = 32 * 1024
@@ -43,7 +44,7 @@ _RESULT_METADATA_BYTES = 8 * 1024 * 1024
 _LOG_FILES = {"infolog.txt", "stdout.txt", "result.json"}
 _RUN_ID = re.compile(r"(?:match|smoke)-[a-zA-Z0-9_-]{1,64}")
 _REPLAY_PATH = re.compile(r"demos/([^/\\:\x00-\x1f]+\.sdfz)", re.IGNORECASE)
-_VALID_FACTIONS = ("Armada", "Cortex", "Legion")
+_VALID_FACTIONS = settings.FACTIONS
 _FAILURE_MARKERS = (
     "Engine failed (exit",
     "Stopped: the game did not confirm",
@@ -73,12 +74,9 @@ class MatchBatch:
     history_error: str | None = None
 
 
-@dataclass
-class QueuedGame:
-    batch: MatchBatch
-    players: list[headless.Player]
-    row: dict
-    factions: list[str] | None
+@dataclass(kw_only=True)
+class GameExecution:
+    row: dict = field(default_factory=dict)
     stop: threading.Event = field(default_factory=threading.Event)
     cancel_requested: bool = False
     started: float | None = None
@@ -87,6 +85,14 @@ class QueuedGame:
     process: subprocess.Popen | None = None
     events: list[dict] = field(default_factory=list)
     logs: dict = field(default_factory=dict)
+    live: dict | None = None
+
+
+@dataclass
+class QueuedGame(GameExecution):
+    batch: MatchBatch
+    players: list[headless.Player]
+    factions: list[str] | None
     path: Path | None = None
     outcome: str | None = None
 
@@ -109,16 +115,15 @@ class MatchService:
         self._queue_changed = threading.Condition(self._lock)
         self._submission_lock = threading.Lock()
         self._pending_games: deque[QueuedGame] = deque()
-        self._active_games: dict[int, QueuedGame] = {}
+        self._active_games: dict[int, GameExecution] = {}
         self._batches: list[MatchBatch] = []
+        self._processor_cores, self._memory_bytes = game_capacity()
         self._parallel_games = 1
         self._accept_matches = False
         self._admitting_to_queue: str | None = None
         self._history_lock = threading.Lock()
         self._stop = threading.Event()
-        self._game_stop: threading.Event | None = None
         self._state: dict = self._empty_state()
-        self._process: subprocess.Popen | None = None
         self._content: dict | None = None
         self._scan_key: tuple[Path, str] | None = None
         self._invalidated_scans: set[tuple[Path, str]] = set()
@@ -138,10 +143,30 @@ class MatchService:
             return (self._state["state"] in ("running", "cancelling")
                     and (operation is None or self._state["operation"] == operation))
 
+    def capacity(self) -> dict:
+        with self._lock:
+            return {"processor_cores": self._processor_cores, "memory_bytes": self._memory_bytes,
+                    "parallel_games": self._parallel_games}
+
+    def _validate_parallel_games(self, count: int) -> None:
+        if type(count) is not int or not 0 <= count <= self._processor_cores:
+            raise headless.MatchError(f"Parallel games must be an integer between 0 and {self._processor_cores}.")
+
+    def set_parallel_games(self, count: int) -> dict:
+        self._validate_parallel_games(count)
+        with self._lock:
+            self._parallel_games = count
+            self._queue_changed.notify_all()
+            self._experiment_changed.notify_all()
+        return self.status()
+
     def status(self) -> dict:
         """Return an independent snapshot of the current or most recent operation."""
         with self._lock:
             snapshot = copy.deepcopy(self._state)
+            snapshot["parallel_games"] = self._parallel_games
+            snapshot["active_games"] = len(self._active_games)
+            snapshot["active_matchups"] = []
             started = snapshot.pop("_started", None)
             if started is not None:
                 snapshot["elapsed_seconds"] = max(0.0, time.monotonic() - started)
@@ -150,18 +175,7 @@ class MatchService:
             phase_started = snapshot.pop("_phase_started", None)
             if phase_started is not None:
                 snapshot["phase_elapsed_seconds"] = max(0.0, time.monotonic() - phase_started)
-            if snapshot["operation"] in ("match", "experiment") and snapshot["state"] in ("running", "cancelling"):
-                if snapshot["phase"] in ("smoke", "match"):
-                    if self._process is None:
-                        snapshot["engine"] = {"state": "starting", "exit_code": None}
-                    else:
-                        code = self._process.poll()
-                        snapshot["engine"] = {
-                            "state": "running" if code is None else "exited", "exit_code": code,
-                        }
             if self._batches:
-                now = time.monotonic()
-                snapshot["parallel_games"] = self._parallel_games
                 snapshot["history_errors"] = [batch.history_error for batch in self._batches if batch.history_error]
                 snapshot["series_scores"] = [
                     self._series_summary(batch, include_games=False) for batch in self._batches if batch.series
@@ -170,25 +184,33 @@ class MatchService:
                     snapshot["series"] = copy.deepcopy(self._series_summary(self._batches[0]))
                 elif snapshot["result"] is not None:
                     snapshot["series"] = snapshot["result"].get("series")
-                first = next(iter(self._active_games), None)
-                for index, task in self._active_games.items():
+            now = time.monotonic()
+            first = next(iter(self._active_games), None)
+            for index, task in self._active_games.items():
+                code = task.process.poll() if task.process is not None else None
+                engine_state = "starting" if task.process is None else "running" if code is None else "exited"
+                elapsed = max(0.0, now - task.started)
+                state = (
+                    "stopping" if task.cancel_requested else "smoke" if task.phase == "smoke"
+                    else {"exited": "finalizing"}.get(engine_state, engine_state)
+                )
+                live = copy.deepcopy(task.live)
+                if self._batches:
                     row = snapshot["games"][index - 1]
-                    code = task.process.poll() if task.process is not None else None
-                    engine_state = "starting" if task.process is None else "running" if code is None else "exited"
-                    row["elapsed_seconds"] = max(0.0, now - task.started)
+                    row.update(elapsed_seconds=elapsed, state=state, live=live)
                     if task.process is None:
                         row["pid"] = None
-                    row["state"] = (
-                        "stopping" if task.cancel_requested else "smoke" if task.phase == "smoke"
-                        else {"exited": "finalizing"}.get(engine_state, engine_state)
-                    )
                     row["logs"] = copy.deepcopy(task.logs)
-                    if index == first:
-                        snapshot.update(
-                            phase=task.phase, progress=copy.deepcopy(task.events), logs=row["logs"],
-                            phase_elapsed_seconds=max(0.0, now - task.phase_started) if task.phase_started else None,
-                            engine={"state": engine_state, "exit_code": code},
-                        )
+                else:
+                    snapshot["active_matchups"].append({
+                        **task.row, "index": index, "elapsed_seconds": elapsed, "state": state, "live": live,
+                    })
+                if index == first:
+                    snapshot.update(
+                        phase=task.phase, progress=copy.deepcopy(task.events), logs=copy.deepcopy(task.logs),
+                        phase_elapsed_seconds=max(0.0, now - task.phase_started) if task.phase_started else None,
+                        engine={"state": engine_state, "exit_code": code},
+                    )
             return snapshot
 
     def cancel(self, expected_id: str | None = None) -> dict:
@@ -204,8 +226,6 @@ class MatchService:
                 self._state["cancel_requested"] = True
                 self._state["message"] = "Cancelling..."
                 self._stop.set()
-                if self._game_stop is not None:
-                    self._game_stop.set()
                 while self._pending_games:
                     task = self._pending_games.popleft()
                     task.outcome = "cancelled"
@@ -248,11 +268,9 @@ class MatchService:
         if not _operation_lock.acquire(blocking=False):
             raise headless.MatchError("Another workshop scan or match is already running.")
         self._stop = threading.Event()
-        self._game_stop = None
         self._batches.clear()
         self._accept_matches = False
         self._state = self._empty_state()
-        self._process = None
         self._state.update(
             id=uuid.uuid4().hex, operation=operation, state="running",
             phase="preparing", message=f"Preparing {operation}...",
@@ -296,8 +314,6 @@ class MatchService:
                                 state="failed", error="Operation worker stopped unexpectedly.",
                                 message="Operation worker stopped unexpectedly.",
                             )
-                        self._process = None
-                        self._game_stop = None
                         _operation_lock.release()
                         if operation == "match":
                             self._queue_changed.notify_all()
@@ -346,7 +362,6 @@ class MatchService:
         if self._state["phase"] != phase:
             self._state["phase"] = phase
             self._state["_phase_started"] = time.monotonic()
-            self._process = None
 
     def _selected(self, bar_root: str | Path, engine: str) -> tuple[discovery.Installation, Path]:
         if not isinstance(engine, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", engine) or engine in (".", ".."):
@@ -1027,23 +1042,18 @@ class MatchService:
 
     def _run_game(
         self, engine_dir: Path, data: Path, map_name: str, game: str, players: list[headless.Player],
-        minutes: int, *, skip_smoke: bool, record_demo: bool = False, extra_units: bool = False, label: str = "",
-        real_time_deadline: float | None = None, task: QueuedGame | None = None,
+        minutes: int, *, skip_smoke: bool, task: GameExecution, record_demo: bool = False,
+        extra_units: bool = False, real_time_deadline: float | None = None,
     ) -> tuple[str, Path, bool, bool, list[dict]]:
-        game_stop = task.stop if task is not None else threading.Event()
+        game_stop = task.stop
         phase = "match" if skip_smoke else "smoke"
         with self._lock:
             if self._stop.is_set() or game_stop.is_set():
                 raise headless.MatchError("Stopped before the match started.")
             if real_time_deadline is not None and real_time_deadline <= time.monotonic():
                 raise headless.MatchError("Match exceeded its real-time deadline.")
-            if task is None:
-                self._game_stop = game_stop
-            else:
-                task.phase = phase
-                task.phase_started = time.monotonic()
-        if task is None:
-            self._set_phase(phase, f"{label}Starting headless match...")
+            task.phase = phase
+            task.phase_started = time.monotonic()
         timed_out = threading.Event()
 
         def timeout() -> None:
@@ -1061,40 +1071,29 @@ class MatchService:
 
         def progress(event: headless.MatchProgress) -> None:
             with self._lock:
-                if task is not None:
-                    if event.summary != "Skipped" and event.phase != task.phase:
-                        task.phase = event.phase
-                        task.phase_started = time.monotonic()
-                        task.process = None
-                    task.events.append(asdict(event))
-                    del task.events[:-64]
-                    if event.run_id and _RUN_ID.fullmatch(event.run_id):
-                        task.logs["smoke_run_id" if event.phase == "smoke" else "run_id"] = event.run_id
+                if event.live is not None:
+                    task.live = event.live
                     return
-                if event.summary != "Skipped":
-                    self._change_phase(event.phase)
-                self._state["progress"].append(asdict(event))
-                self._state["progress"] = self._state["progress"][-64:]
+                if event.summary != "Skipped" and event.phase != task.phase:
+                    task.phase = event.phase
+                    task.phase_started = time.monotonic()
+                    task.process = None
+                task.events.append(asdict(event))
+                del task.events[:-64]
                 if event.run_id and _RUN_ID.fullmatch(event.run_id):
-                    key = "smoke_run_id" if event.phase == "smoke" else "run_id"
-                    self._state["logs"][key] = event.run_id
-                if event.message and not self._state["cancel_requested"]:
-                    self._state["message"] = f"{label}{event.message}"
+                    task.logs["smoke_run_id" if event.phase == "smoke" else "run_id"] = event.run_id
 
         def process_started(process: subprocess.Popen) -> None:
             with self._lock:
-                if task is None:
-                    self._process = process
-                else:
-                    task.process = process
-                    if type(process.pid) is int:
-                        task.row["pid"] = process.pid
+                task.process = process
+                if type(process.pid) is int:
+                    task.row["pid"] = process.pid
 
         try:
             summary, path = headless.run_match(
                 engine_dir, data, self.local_data, map_name, game, players, minutes, game_stop,
                 progress, skip_smoke=skip_smoke, process_started=process_started, record_demo=record_demo,
-                extra_units=extra_units, capture_stats=task is not None,
+                extra_units=extra_units, capture_stats=True,
             )
         except Exception as error:
             if timed_out.is_set():
@@ -1102,13 +1101,8 @@ class MatchService:
             raise
         finally:
             timer.cancel()
-            if task is None:
-                with self._lock:
-                    self._game_stop = None
         with self._lock:
-            cancelled = task.cancel_requested if task is not None else self._state["cancel_requested"]
-            events = list(task.events if task is not None else self._state["progress"])
-        return summary, path, timed_out.is_set(), cancelled, events
+            return summary, path, timed_out.is_set(), task.cancel_requested, list(task.events)
 
     def _experiment_workspace(self, experiment_id: str) -> Path:
         if not isinstance(experiment_id, str) or not re.fullmatch(r"[0-9a-f]{32}", experiment_id):
@@ -1145,6 +1139,34 @@ class MatchService:
             return saved
         return None
 
+    def _experiment_history_entry(self, experiment_id: str, active: str | None) -> dict | None:
+        saved = self._read_experiment(experiment_id)
+        if saved is None:
+            return None
+        entry = saved["experiment"]
+        if entry.get("state") == "running" and experiment_id != active:
+            entry.update(state="interrupted", stop_reason="interrupted", paused=False, pause_requested=False,
+                         promotable=False, best_candidate_id=None)
+        return entry
+
+    def experiment_details(self, experiment_id: str) -> dict:
+        with self._lock:
+            active = self._state["id"] if self._state["state"] in ("running", "cancelling") else None
+        with self._history_lock:
+            entry = self._experiment_history_entry(experiment_id, active)
+        if entry is None:
+            raise headless.MatchError("The saved experiment is unavailable.")
+        # Read legacy artifacts only for the selected experiment.
+        games = entry.get("games")
+        for game in games[:100] if isinstance(games, list) else ():
+            if not isinstance(game, dict):
+                continue
+            run_id = game.get("run_id")
+            if "side_totals" not in game and isinstance(run_id, str) and _RUN_ID.fullmatch(run_id):
+                metadata = self._artifact_metadata(run_id)
+                game["side_totals"] = studio_experiments.telemetry_metrics(metadata)["side_totals"]
+        return entry
+
     def experiment_history(self) -> list[dict]:
         directory = self.local_data / "experiments"
         installation._check_links(self.root, directory)
@@ -1157,14 +1179,9 @@ class MatchService:
             for workspace in directory.iterdir():
                 if not re.fullmatch(r"[0-9a-f]{32}", workspace.name) or installation._link(workspace):
                     continue
-                saved = self._read_experiment(workspace.name)
-                if saved is None:
-                    continue
-                entry = saved["experiment"]
-                if entry.get("state") == "running" and workspace.name != active:
-                    entry.update(state="interrupted", stop_reason="interrupted", paused=False, pause_requested=False,
-                                 promotable=False, best_candidate_id=None)
-                entries.append(entry)
+                entry = self._experiment_history_entry(workspace.name, active)
+                if entry is not None:
+                    entries.append(entry)
         return sorted(entries, key=lambda entry: str(entry.get("started_at", "")), reverse=True)[:100]
 
     def pause_experiment(self, paused: bool, expected_id: str | None = None) -> dict:
@@ -1180,26 +1197,61 @@ class MatchService:
             self._experiment_changed.notify_all()
         return self.status()
 
-    def _await_experiment_slot(self, deadline: float) -> str | None:
-        with self._experiment_changed:
-            experiment = self._state["experiment"]
-            while not self._stop.is_set() and experiment["pause_requested"]:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                experiment["paused"] = True
-                self._change_phase("paused")
-                self._state["message"] = "Experiment paused."
-                self._experiment_changed.wait(remaining)
-            experiment["paused"] = False
-            if self._stop.is_set():
-                return "cancelled"
-            return "time_limit" if time.monotonic() >= deadline else None
+    def _experiment_games(self, schedule: list, deadline: float, play: Callable):
+        """Yield finished games while keeping eligible tournament slots occupied."""
+        pending = deque(enumerate(schedule, 1))
+
+        def changed(_future):
+            with self._experiment_changed:
+                self._experiment_changed.notify_all()
+
+        with ThreadPoolExecutor(max_workers=max(1, min(len(schedule), self._processor_cores))) as pool:
+            futures = {}
+            try:
+                while pending or futures:
+                    submitted = []
+                    with self._experiment_changed:
+                        completed = [future for future in futures if future.done()]
+                        for future in completed:
+                            self._active_games.pop(futures.pop(future))
+                        experiment = self._state["experiment"]
+                        remaining = deadline - time.monotonic()
+                        if self._stop.is_set() or remaining <= 0:
+                            pending.clear()
+                        slots = 0 if experiment["pause_requested"] else self._parallel_games
+                        while pending and len(futures) < slots:
+                            index, game = pending.popleft()
+                            map_name, first, second = game
+                            task = GameExecution(started=time.monotonic(), row={
+                                "map": map_name, "side1": first.label, "side2": second.label,
+                            })
+                            future = pool.submit(play, index, *game, task)
+                            self._active_games[index] = task
+                            futures[future] = index
+                            submitted.append(future)
+                        experiment["paused"] = bool(pending and not futures and slots == 0)
+                        if not submitted and not completed and (pending or futures):
+                            self._experiment_changed.wait(remaining if remaining > 0 else None)
+                    for future in submitted:
+                        future.add_done_callback(changed)
+                    for future in completed:
+                        yield future.result()
+            finally:
+                with self._experiment_changed:
+                    for index in futures.values():
+                        self._active_games[index].stop.set()
+                wait(futures)
+                with self._experiment_changed:
+                    for index in futures.values():
+                        self._active_games.pop(index)
 
     def start_experiment(
         self, bar_root: str | Path, engine: str, game: str, maps: list[str], minutes: int,
         game_limit: int, seconds_limit: int, mode: str, players: list[dict], sweep: dict | None = None,
+        *, parallel_games: int | None = None,
     ) -> dict:
+        if parallel_games is not None:
+            self._validate_parallel_games(parallel_games)
         if mode not in ("tournament", "sweep"):
             raise headless.MatchError("Choose tournament or sweep mode.")
         if type(game_limit) is not int or not 1 <= game_limit <= 100:
@@ -1268,9 +1320,16 @@ class MatchService:
                     selected_players = [headless.Player(project, installation.VERSION, profile,
                                                        source["faction"], source["ally"], project), opponent]
                 else:
-                    selected_players = self._validate_players(players, content, require_both_sides=False)
-                    if len({(p.short_name, p.version, p.profile, p.faction)
-                            for p in selected_players}) != len(selected_players):
+                    # Resolve dynamic choices when building the schedule, after validating the installed profiles.
+                    validation_players = [
+                        {**player, "faction": _VALID_FACTIONS[0]}
+                        if isinstance(player, dict) and player.get("faction") in ("Rotate", "Random") else player
+                        for player in players
+                    ]
+                    selected_players = self._validate_players(validation_players, content, require_both_sides=False)
+                    faction_choices = [player["faction"] for player in players]
+                    if len({(p.short_name, p.version, p.profile, faction)
+                            for p, faction in zip(selected_players, faction_choices)}) != len(selected_players):
                         raise headless.MatchError("Each tournament AI profile and faction combination must be distinct.")
                 self._prepare_storage(engine_dir, selected.data)
                 snapshots = self._capture_project_snapshots(selected_players, selected.data, engine)
@@ -1298,9 +1357,10 @@ class MatchService:
                     else:
                         candidates = [
                             studio_experiments.Candidate(
-                                f"v{index}", f"{player.name} · {player.profile or 'Default'} · {player.faction}", player,
+                                f"v{index}", f"{player.name} · {player.profile or 'Default'} · {faction}", player,
+                                faction_policy=faction if faction in ("Rotate", "Random") else "",
                             )
-                            for index, player in enumerate(selected_players, 1)
+                            for index, (player, faction) in enumerate(zip(selected_players, faction_choices), 1)
                         ]
                     total_games = (len(candidates) * (len(candidates) - 1) if mode == "tournament"
                                    else 2 * (len(candidates) - 1)) * len(maps)
@@ -1310,30 +1370,22 @@ class MatchService:
                         for key in ("scheduled_games", "rankings"):
                             self._state["experiment"][key] = copy.deepcopy(experiment[key])
                     self._save_experiment(workspace, experiment, promotion)
-                    schedule = studio_experiments.matrix(candidates, maps, mode)
-                    for index, (map_name, first, second) in enumerate(islice(schedule, game_limit), 1):
-                        reason = self._await_experiment_slot(deadline)
-                        if reason:
-                            break
-                        game_started = time.monotonic()
-                        if game_started >= deadline:
-                            reason = "time_limit"
-                            break
+                    schedule = list(islice(studio_experiments.matrix(candidates, maps, mode), game_limit))
+
+                    def play(index, map_name, first, second, task):
                         match_players = [replace(first.player, ally=0), replace(second.player, ally=1)]
-                        with self._lock:
-                            self._state["progress"] = []
-                            self._state["logs"] = {}
                         summary = ""
                         run = None
+                        logs = {}
                         try:
                             summary, run, timed_out, cancelled, events = self._run_game(
                                 engine_dir, selected.data, map_name, game, match_players, minutes,
                                 skip_smoke=False, real_time_deadline=deadline,
-                                label=f"[Game {index}/{experiment['scheduled_games']} · {map_name}] ",
+                                task=task,
                             )
                             outcome, _ = self._classify_game_outcome(summary, run, timed_out, cancelled, False, events)
-                        except (headless.MatchError, OSError) as error:
-                            summary = str(error)
+                        except Exception as error:
+                            summary = str(error) or type(error).__name__
                             outcome = ("cancelled" if self._stop.is_set() else "timeout"
                                        if "real-time deadline" in summary else "failed")
                         if outcome == "completed":
@@ -1342,8 +1394,8 @@ class MatchService:
                         run_id = None
                         metadata = {}
                         if run is not None:
-                            last_logs, _ = self._run_artifacts(run, events)
-                            run_id = last_logs.get("run_id")
+                            logs, _ = self._run_artifacts(run, events)
+                            run_id = logs.get("run_id")
                             if run_id:
                                 metadata = self._artifact_metadata(run_id)
                             history = {
@@ -1351,7 +1403,7 @@ class MatchService:
                                 "game": game, "map": map_name, "engine": engine,
                                 "players": [asdict(player) for player in match_players], "projects": snapshots,
                                 "outcome": outcome, "simulated_limit": simulated_limit,
-                                "elapsed_seconds": round(time.monotonic() - game_started, 2),
+                                "elapsed_seconds": round(time.monotonic() - task.started, 2),
                             }
                             if prepared:
                                 history["sweep_source"] = {"project": sweep["project"], "profile": sweep["profile"]}
@@ -1359,22 +1411,28 @@ class MatchService:
                         metrics = studio_experiments.telemetry_metrics(metadata)
                         if outcome == "failed" and "smoke_passed" not in metadata:
                             metrics["engine_error"] = True
-                        experiment["games"].append({
+                        return {
                             "index": index, "map": map_name, "side1": first.id, "side2": second.id,
+                            "side_labels": [first.label, second.label],
+                            "factions": [player.faction for player in match_players],
                             "outcome": outcome, "run_id": run_id, "summary": summary[:4000],
                             "simulated_limit": simulated_limit,
-                            "elapsed_seconds": round(time.monotonic() - game_started, 2), **metrics,
-                        })
-                        experiment["completed_games"] += int(outcome != "cancelled")
-                        experiment["rankings"] = studio_experiments.rankings(candidates, experiment["games"])
-                        experiment["elapsed_seconds"] = round(time.monotonic() - started, 2)
-                        self._save_experiment(workspace, experiment, promotion)
-                        with self._lock:
-                            for key in ("scheduled_games", "games", "rankings", "completed_games", "elapsed_seconds"):
-                                self._state["experiment"][key] = copy.deepcopy(experiment[key])
-                        if outcome == "cancelled":
-                            reason = "cancelled"
-                            break
+                            "elapsed_seconds": round(time.monotonic() - task.started, 2), **metrics,
+                        }, logs
+
+                    with closing(self._experiment_games(schedule, deadline, play)) as results:
+                        for result, logs in results:
+                            if logs:
+                                last_logs = logs
+                            experiment["games"].append(result)
+                            experiment["games"].sort(key=lambda row: row["index"])
+                            experiment["completed_games"] += int(result["outcome"] != "cancelled")
+                            experiment["rankings"] = studio_experiments.rankings(candidates, experiment["games"])
+                            experiment["elapsed_seconds"] = round(time.monotonic() - started, 2)
+                            self._save_experiment(workspace, experiment, promotion)
+                            with self._lock:
+                                for key in ("scheduled_games", "games", "rankings", "completed_games", "elapsed_seconds"):
+                                    self._state["experiment"][key] = copy.deepcopy(experiment[key])
                     if reason is None:
                         reason = ("time_limit" if time.monotonic() >= deadline else
                                   "game_limit" if game_limit < total_games else "completed")
@@ -1407,7 +1465,11 @@ class MatchService:
             }[reason]
             return {"summary": summary, "experiment": experiment}, last_logs, outcome
 
-        return self._launch("experiment", work)
+        with self._lock:
+            self._launch_locked("experiment", work)
+            if parallel_games is not None:
+                self._parallel_games = parallel_games
+        return self.status()
 
     def promote_experiment(self, experiment_id: str, candidate_id: str, name: str) -> dict:
         from . import studio_sweeps
@@ -1467,10 +1529,11 @@ class MatchService:
             row = {
                 "batch_id": batch.id, "batch_game": idx + 1, "batch_size": series["games"] if series else 1,
                 "game": game, "map": game_map, "swapped": swapped,
+                "game_time_limit_seconds": minutes * 60,
                 "players": [asdict(player) for player in game_players], "state": "queued",
                 "pid": None, "elapsed_seconds": None, "winner_side": None,
             }
-            batch.games.append(QueuedGame(batch, game_players, row, pair))
+            batch.games.append(QueuedGame(batch, game_players, pair, row=row))
         return batch
 
     def start(
@@ -1484,10 +1547,8 @@ class MatchService:
             raise headless.MatchError("record_demo must be a boolean.")
         if type(extra_units) is not bool:
             raise headless.MatchError("extra_units must be a boolean.")
-        if parallel_games is not None and (
-            type(parallel_games) is not int or not 1 <= parallel_games <= _MAX_PARALLEL_GAMES
-        ):
-            raise headless.MatchError(f"Parallel games must be an integer between 1 and {_MAX_PARALLEL_GAMES}.")
+        if parallel_games is not None:
+            self._validate_parallel_games(parallel_games)
         with self._submission_lock:
             with self._queue_changed:
                 while self._state["operation"] == "match" and self._state["state"] == "running" and not self._accept_matches:

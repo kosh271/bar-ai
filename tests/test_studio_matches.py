@@ -764,6 +764,26 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertEqual([row["state"] for row in status["games"]], ["cancelled", "completed", "completed"])
         self.assertEqual(len(self.service.history()), 3)
 
+    def test_test_queue_waits_at_zero_and_resumes_at_the_detected_limit(self):
+        self.scan()
+        with patch.object(self.service, "_processor_cores", 2), \
+                patch("app.studio_matches.headless.run_match", return_value=("Draw.", self.root / "match")) as launch:
+            self.service.start(self.bar_root, self.engine, "Game", "Map", PLAYERS, 20, True, parallel_games=0)
+            try:
+                self.assertEqual(self.service.status()["games"][0]["state"], "queued")
+                launch.assert_not_called()
+                for invalid in (-1, 3, True, 1.5):
+                    with self.assertRaisesRegex(MatchError, "between 0 and 2"):
+                        self.service.set_parallel_games(invalid)
+                self.service.set_parallel_games(2)
+                status = self.wait()
+            finally:
+                if self.service.is_busy():
+                    self.service.cancel()
+                    self.wait()
+        self.assertEqual(status["games"][0]["state"], "draw")
+        launch.assert_called_once()
+
     def test_cancelling_queue_rejects_an_in_flight_submission(self):
         self.scan()
         entered, preparing, continue_preparation = (threading.Event() for _ in range(3))
@@ -887,7 +907,12 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
             (path / "result.json").write_text(json.dumps({
                 "winning_sides": [0], "engine_exit": 0,
                 "telemetry": {"end_frame": 3600, "ai_script_errors": 1,
-                              "teams": [{"side": 1, "ai_script_errors": 0}, {"side": 2, "ai_script_errors": 1}]},
+                              "teams": [
+                                  {"side": 1, "ai_script_errors": 0, "stats": {
+                                      "metal_produced": 800, "energy_produced": 6000, "damage_dealt": 321,
+                                  }},
+                                  {"side": 2, "ai_script_errors": 1},
+                              ]},
             }), encoding="utf-8")
             return "Winner: side 1.", path
 
@@ -904,12 +929,51 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertEqual(len({frozenset(call[1:]) for call in calls[:3]}), 3)
         self.assertEqual({call[0] for call in calls}, {"Map", "Map2"})
         self.assertEqual(entry["games"][1]["outcome"], "failed")
+        totals = [{"resources": 900, "damage": 321}, {"resources": None, "damage": None}]
+        self.assertEqual(entry["games"][0]["side_totals"], totals)
         first = entry["rankings"][0]
         self.assertGreater(first["wins"], 0)
         self.assertEqual(first["average_duration_seconds"], 120.0)
         self.assertEqual(first["error_free_games"], first["wins"])
         restarted = MatchService(self.root, projects_root=self.projects)
         self.assertEqual(restarted.experiment_history()[0], entry)
+        workspace = restarted._experiment_workspace(entry["id"])
+        saved = json.loads((workspace / "experiment.json").read_text(encoding="utf-8"))
+        saved["experiment"]["games"][0].pop("side_totals")
+        restarted._save_experiment(workspace, saved["experiment"], saved["promotion"])
+        self.assertEqual(restarted.experiment_details(entry["id"])["games"][0]["side_totals"], totals)
+
+    def test_experiment_tournament_resolves_factions_for_each_game(self):
+        self.scan()
+        players = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Rotate", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Random", "ally": 1},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+        ]
+        calls = []
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            calls.append(tuple(player.faction for player in players))
+            raise MatchError("Engine test stub")
+
+        rolls = ["Legion", "Legion", "Armada", "Cortex", "Legion", "Armada", "Armada", "Cortex"]
+        with (patch("app.studio_matches.headless.run_match", side_effect=run),
+              patch("app.studio_experiments.choice", side_effect=rolls) as roll):
+            self.service.start_experiment(
+                self.bar_root, self.engine, "Game", ["Map", "Map2"], 30, 12, 60, "tournament", players,
+            )
+            entry = self.wait()["experiment"]
+        self.assertEqual(roll.call_count, 8)
+        self.assertEqual(entry["completed_games"], 12)
+        self.assertCountEqual(calls, [tuple(game["factions"]) for game in entry["games"]])
+        for candidate, expected in (
+            ("v1", ["Armada", "Cortex", "Legion", "Armada", "Cortex", "Legion", "Armada", "Cortex"]),
+            ("v2", rolls),
+            ("v3", ["Cortex"] * 8),
+        ):
+            actual = [game["factions"][side] for game in entry["games"]
+                      for side, key in enumerate(("side1", "side2")) if game[key] == candidate]
+            self.assertEqual(actual, expected)
 
     def test_experiment_pauses_after_active_game_and_cancels_while_paused(self):
         self.scan()
@@ -940,6 +1004,51 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertEqual(launch.call_count, 1)
         self.assertEqual(status["state"], "cancelled")
         self.assertEqual(status["result"]["experiment"]["stop_reason"], "cancelled")
+
+    def test_tournament_resumes_from_zero_refills_a_slot_and_cancels_active_games(self):
+        self.scan()
+        entered, release_first, refilled = (threading.Event() for _ in range(3))
+        signals = []
+        lock = threading.Lock()
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            with lock:
+                signals.append(stop)
+                number = len(signals)
+                if number == 2:
+                    entered.set()
+                elif number == 3:
+                    refilled.set()
+            if number == 1:
+                self.assertTrue(release_first.wait(3))
+                return "Draw.", self.root / "match"
+            self.assertTrue(stop.wait(3))
+            return "Stopped by user.", self.root / "match"
+
+        with patch("app.studio_matches.headless.run_match", side_effect=run) as launch:
+            job = self.service.start_experiment(
+                self.bar_root, self.engine, "Game", ["Map", "Map2"], 30, 4, 60, "tournament",
+                PLAYERS, parallel_games=0,
+            )
+            self.assertEqual(launch.call_count, 0)
+            try:
+                self.service.set_parallel_games(2)
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(self.service.status()["active_games"], 2)
+                self.assertFalse(refilled.is_set())
+                release_first.set()
+                self.assertTrue(refilled.wait(2))
+                self.service.set_parallel_games(0)
+                self.assertTrue(all(not stop.is_set() for stop in signals))
+            finally:
+                release_first.set()
+                self.service.cancel(job["id"])
+            status = self.wait()
+        self.assertEqual(launch.call_count, 3)
+        self.assertEqual(status["state"], "cancelled")
+        games = status["experiment"]["games"]
+        self.assertEqual([game["index"] for game in games], [1, 2, 3])
+        self.assertCountEqual([game["outcome"] for game in games], ["draw", "cancelled", "cancelled"])
 
     def test_experiment_deadline_stops_active_game_without_launching_another(self):
         self.scan()

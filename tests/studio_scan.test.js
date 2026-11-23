@@ -7,6 +7,14 @@ const vm = require("node:vm");
 
 const source = readFileSync(require.resolve("../web/studio/studio.js"), "utf8");
 
+test("game RAM warning is shown only above 75 percent of total memory", () => {
+    const context = vm.createContext({window: {}});
+    vm.runInContext(source.slice(0, source.indexOf('$("dialog-close").addEventListener')), context);
+    assert.equal(vm.runInContext("gameMemoryWarning(0, 20e9)", context), "");
+    assert.equal(vm.runInContext("gameMemoryWarning(3, 20e9)", context), "");
+    assert.match(vm.runInContext("gameMemoryWarning(4, 20e9)", context), /20 GB.*100.0%/);
+});
+
 test("a new scan is polled while the previous match history is loading", async () => {
     const context = vm.createContext({window: {}, AbortController, setTimeout, clearTimeout});
     vm.runInContext(source.slice(0, source.indexOf('$("dialog-close").addEventListener')), context);

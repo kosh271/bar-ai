@@ -142,6 +142,12 @@ class StudioServer(ThreadingHTTPServer):
         with self._client_lock:
             self._cancel_timer_locked("_client_expiry_timer")
             self._cancel_timer_locked("_shutdown_timer")
+        if self.match_service.is_busy("experiment"):
+            try:
+                self.match_service.cancel()
+            except MatchError:
+                # The experiment may have finished before cancellation acquired its lock.
+                pass
         super().server_close()
 
     def handle_error(self, request: object, client_address: object) -> None:
@@ -175,6 +181,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                         "projects": self._state_projects(),
                         "settings": self._settings(),
                         "preferences": load_studio_preferences(self._preferences_path()),
+                        "game_capacity": self.server.match_service.capacity(),
                         "default_bar_root": str(default_bar_root) if default_bar_root is not None else None,
                     })
                 except Exception as error:
@@ -198,8 +205,11 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, result)
                 except Exception as error:
                     return self._handle_error(error)
-            if parsed.path == "/api/experiment/history" and not parsed.query:
+            if parsed.path == "/api/experiment/history":
                 try:
+                    if parsed.query:
+                        query = self._query_fields(parsed.query, "id")
+                        return self._json(200, {"experiment": self.server.match_service.experiment_details(query["id"])})
                     return self._json(200, {"experiments": self.server.match_service.experiment_history()})
                 except Exception as error:
                     return self._handle_error(error)
@@ -355,7 +365,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/preferences",
             "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
-            "/api/match/start", "/api/match/cancel", "/api/match/cancel-game", "/api/match/replay/copy",
+            "/api/match/start", "/api/match/cancel", "/api/match/cancel-game", "/api/match/replay/copy", "/api/match/parallel",
             "/api/experiment/start", "/api/experiment/pause", "/api/experiment/promote",
         }:
             return self._error(404, "Unknown API endpoint.")
@@ -502,6 +512,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 return self._json(200, self.server.match_service.cancel_game(
                     self._string(payload["id"], "id"), index,
                 ))
+            if parsed.path == "/api/match/parallel":
+                self._require_fields(payload, ("parallel_games",))
+                return self._json(200, self.server.match_service.set_parallel_games(payload["parallel_games"]))
             if parsed.path == "/api/match/replay/copy":
                 self._require_fields(payload, ("run_id", "path"))
                 selected = load_settings(self.server.settings_path)
@@ -517,6 +530,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 with self.server.write_lock:
                     return self._json(200, self.server.match_service.start_experiment(
                         *(payload[field] for field in fields), sweep=payload.get("sweep"),
+                        parallel_games=payload.get("parallel_games"),
                     ))
             if parsed.path == "/api/experiment/pause":
                 self._require_fields(payload, ("id", "paused"))

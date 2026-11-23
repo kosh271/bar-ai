@@ -9,6 +9,9 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+FACTIONS = ("Armada", "Cortex", "Legion")
+TOURNAMENT_FACTIONS = (*FACTIONS, "Rotate", "Random")
+
 
 class SettingsError(Exception):
     """Settings could not be read or saved."""
@@ -132,8 +135,8 @@ def _preference_ai(player: object) -> bool:
 
 
 def _studio_preferences(value: object) -> dict:
-    if not isinstance(value, dict) or not value or value.keys() - {"workspace", "match"}:
-        raise SettingsError("Supply workspace or match preferences.")
+    if not isinstance(value, dict) or not value or value.keys() - {"workspace", "match", "tournament"}:
+        raise SettingsError("Supply workspace, match, or tournament preferences.")
     if "workspace" in value:
         workspace = value["workspace"]
         if (not isinstance(workspace, dict) or workspace.keys() != {"project", "profile"}
@@ -149,7 +152,7 @@ def _studio_preferences(value: object) -> dict:
                 or not all(_preference_text(match[key]) for key in ("game", "map"))
                 or type(match["minutes"]) is not int or not 1 <= match["minutes"] <= 2147483647 // 1800
                 or type(match["skip_smoke"]) is not bool
-                or any(match[key] not in ("Armada", "Cortex", "Legion") for key in ("faction1", "faction2"))):
+                or any(match[key] not in FACTIONS for key in ("faction1", "faction2"))):
             raise SettingsError("Invalid Studio match preferences.")
         if not all(_preference_ai(match[key]) for key in ("first", "second")):
             raise SettingsError("Invalid Studio AI selection.")
@@ -159,9 +162,25 @@ def _studio_preferences(value: object) -> dict:
                     or not all(isinstance(team, list) and team for team in rosters)
                     or sum(map(len, rosters)) > 16
                     or not all(isinstance(slot, dict) and slot.keys() == {"ai", "faction"}
-                               and _preference_ai(slot["ai"]) and slot["faction"] in ("Armada", "Cortex", "Legion")
+                               and _preference_ai(slot["ai"]) and slot["faction"] in FACTIONS
                                for team in rosters for slot in team)):
                 raise SettingsError("Invalid Studio roster selection.")
+    if "tournament" in value:
+        draft = value["tournament"]
+        fields = {"game", "maps", "players", "minutes", "game_limit", "seconds_limit"}
+        if (not isinstance(draft, dict) or draft.keys() != fields or not _preference_text(draft["game"])
+                or not all(type(draft[key]) is int and 1 <= draft[key] <= limit for key, limit in
+                           (("minutes", 2147483647 // 1800), ("game_limit", 100), ("seconds_limit", 21600)))):
+            raise SettingsError("Invalid Studio tournament preferences.")
+        maps, players = draft["maps"], draft["players"]
+        if (not isinstance(maps, list) or len(maps) > 32 or not all(map(_preference_text, maps))
+                or len(set(maps)) != len(maps)
+                or not isinstance(players, list) or len(players) > 16
+                or not all(isinstance(player, dict) and player.keys() == {"ai", "faction"}
+                           and _preference_ai(player["ai"]) and player["faction"] in TOURNAMENT_FACTIONS
+                           for player in players)
+                or len({tuple(player["ai"]) for player in players}) != len(players)):
+            raise SettingsError("Invalid Studio tournament map or profile selection.")
     return value
 
 

@@ -51,6 +51,7 @@ window.StudioGuides = {
             "Open Preview combined layers, use the order that matches your test's game options, and find the file named under Source for the tier you want. Close the preview, select that file under Configuration layer, then choose Factory and Situation.",
             "Find the unit you want and adjust an existing tier weight. Compare the percentage before and after. A newly added row starts with zero weights, so give it a positive weight in the situations and tiers you want to test.",
             "Use the catalog to look for build options and check the selected game's actual factory menu. Removing a unit removes its row across every tier and situation in this file.",
+            "Use Unit reserve & recruitment rules below the factory weights when you want a factory to build toward a target unit count or react to completed milestone buildings or enemy forces.",
             "Save and install. Observe the factory after its initial queue and compare the mix during the income range and situation you changed."
         ],
         detail: [
@@ -187,8 +188,8 @@ window.StudioGuides = {
     advanced: {
         intro: "All files gives you direct access to the selected profile's settings and scripts. Use it to inspect startup logic, check a setting without a dedicated control, or edit a custom rule. The visual tree lets you browse configuration values, and the Source box shows the text Studio saves. Changes here affect the same files used by the other editors, so review the diff before testing.",
         brief: [
-            "Use Profile file to find a configuration file or script. Start at script/init.as if you need to identify the files the AI may load.",
-            "Expand Visual configuration tree for supported JSON files, or edit the Source box. Use the unit catalog as a reference when checking IDs.",
+            "Use Profile file to find a configuration file or script. Start at script/init.as to edit Startup configuration layers visually, or inspect its startup logic.",
+            "Expand Visual configuration tree for supported JSON files, or use Adjustable script constants and Script structure on .as files before editing the Source box. Use the unit catalog as a reference when checking IDs.",
             "Use Review changes to inspect what you edited and Undo to back out a pending change. Save changes after checking the path and diff.",
             "Save and install before running an engine smoke test. If a script fails to load, use View logs to locate the first relevant error."
         ],

@@ -51,6 +51,7 @@ class MatchProgress:
     seconds: float | None = None
     message: str = ""
     run_id: str | None = None
+    live: dict | None = None
 
 
 def artifact_stat(base: Path, *parts: str, directory: bool = False) -> os.stat_result:
@@ -398,6 +399,75 @@ def _stats_sample(value: dict) -> dict:
     return stats
 
 
+def _team_log_stats(line: str) -> tuple[int, dict] | None:
+    match = _TEAM_STATS.match(line)
+    if not match:
+        return None
+    fields = re.findall(r"([\w ]+?)\s*[:=]\s*(-?\d+(?:\.\d+)?)", match[2])
+    return int(match[1]), _stats_sample({name: float(value) for name, value in fields})
+
+
+def side_totals(teams: list) -> list[dict]:
+    totals = []
+    for side in (1, 2):
+        members = [
+            _stats_sample(team["stats"]) if isinstance(team.get("stats"), dict) else {}
+            for team in teams if isinstance(team, dict) and team.get("side") == side
+        ]
+        resources = None
+        damage = None
+        if members and all("metal_produced" in stats and "energy_produced" in stats for stats in members):
+            resources = sum(stats["metal_produced"] + stats["energy_produced"] / 60 for stats in members)
+        if members and all("damage_dealt" in stats for stats in members):
+            damage = sum(stats["damage_dealt"] for stats in members)
+        totals.append({"resources": resources, "damage": damage})
+    return totals
+
+
+def live_match_sample(run: Path, players: list[Player]) -> dict | None:
+    try:
+        with open_artifact(run, "LuaUI", "Config", "studio_match_live.txt") as stream:
+            sample = stream.read(8193).decode("ascii")
+    except (OSError, UnicodeError, MatchError):
+        return None
+    lines = sample.splitlines()
+    if (len(sample) > 8192 or not sample.endswith("\n") or len(lines) < 2 or lines[-1] != "end"
+            or not re.fullmatch(r"[0-9]{1,10}", lines[0]) or int(lines[0]) >= 2**31):
+        return None
+    samples = {}
+    for line in lines[1:-1]:
+        parsed = _team_log_stats(line)
+        if parsed is None:
+            return None
+        index, stats = parsed
+        if index in samples:
+            return None
+        samples[index] = stats
+    teams = [{"side": player.ally + 1, "stats": samples.get(index, {})}
+             for index, player in enumerate(players)]
+    return {"simulated_seconds": int(lines[0]) / 30, "side_totals": side_totals(teams)}
+
+
+def _logged_game_seconds(run: Path) -> float | None:
+    """Recover a game clock from recent engine output when Lua telemetry is unavailable."""
+    try:
+        with open_artifact(run, "infolog.txt") as stream:
+            offset = max(0, stream.seek(0, os.SEEK_END) - 16384)
+            stream.seek(offset)
+            tail = stream.read(16384)
+    except (OSError, MatchError):
+        return None
+    if offset:
+        tail = tail.partition(b"\n")[2]
+    # The engine may be in the middle of writing the last line.
+    lines = tail.split(b"\n")[:-1]
+    for line in reversed(lines):
+        match = _FRAMED_LINE.match(line.decode("utf-8", errors="replace"))
+        if match and int(match[1]) < 2**31:
+            return int(match[1]) / 30
+    return None
+
+
 def _end_stats(run: Path) -> dict[int, dict]:
     try:
         with open_artifact(run, "LuaUI", "Config", "teamstats.json") as stream:
@@ -489,11 +559,10 @@ def match_telemetry(run: Path, players: list[Player], log: str, output: str) -> 
                     defeated = frame if defeated is None else max(defeated, frame)
             if duplicate:
                 continue
-            if stats_line := _TEAM_STATS.match(message):
-                fields = dict(re.findall(r"([\w ]+?)\s*[:=]\s*(-?\d+(?:\.\d+)?)", stats_line[2]))
-                team_id = int(stats_line[1])
+            if parsed_stats := _team_log_stats(message):
+                team_id, stats = parsed_stats
                 if team_id < len(teams):
-                    teams[team_id]["stats"].update(_stats_sample({k: float(v) for k, v in fields.items()}))
+                    teams[team_id]["stats"].update(stats)
             tagged = _AI_TAG.search(message)
             if not tagged:
                 if _AI_COMPILE_ERROR.search(message) or _AI_SCRIPT_WARNING.search(message) or (
@@ -659,6 +728,7 @@ def _run_match(
     players: list[Player], minutes: int, stop: threading.Event, *, archive_cache: Path,
     process_started: Callable[[subprocess.Popen], None] | None = None, record_demo: bool = False,
     extra_units: bool = False, capture_stats: bool = False,
+    progress: Callable[[MatchProgress], None] | None = None,
 ) -> tuple[str, Path]:
     script = build_script(map_name, game, players, minutes, record_demo, extra_units=extra_units)
     if not (engine / "spring-headless.exe").is_file():
@@ -671,6 +741,7 @@ def _run_match(
     if capture_stats:
         widgets = run / "LuaUI" / "Widgets"
         widgets.mkdir(parents=True)
+        (widgets.parent / "Config").mkdir()
         shutil.copyfile(Path(__file__).with_name("match_stats.lua"), widgets / "studio_match_stats.lua")
     env = {**os.environ, "SPRING_DATADIR": str(data), "SPRING_WRITEDIR": str(run)}
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as host:
@@ -700,6 +771,8 @@ def _run_match(
                 game_over_at = None
                 game_started = None
                 checked_at = 0.0
+                sampled_at = 0.0
+                last_sample = None
                 limit_registered = False
                 while process.poll() is None:
                     try:
@@ -714,6 +787,18 @@ def _run_match(
                         if address == peer and packet[0] == 3 and len(packet) >= 3 and packet[1] == len(packet):
                             winner = list(packet[3:])
                     now = time.monotonic()
+                    if capture_stats and progress is not None and now - sampled_at >= 0.5:
+                        sampled_at = now
+                        sample = live_match_sample(run, players)
+                        if sample is None and (last_sample is None or last_sample["side_totals"] is None):
+                            logged_seconds = _logged_game_seconds(run)
+                            if logged_seconds is not None:
+                                sample = {"simulated_seconds": logged_seconds, "side_totals": None}
+                        if sample is not None and last_sample is not None:
+                            sample["simulated_seconds"] = max(sample["simulated_seconds"], last_sample["simulated_seconds"])
+                        if sample is not None and sample != last_sample:
+                            last_sample = sample
+                            progress(MatchProgress("match", "Telemetry", live=sample))
                     if winner is not None and game_over_at is None:
                         game_over_at = now
                     if game_started is not None and not limit_registered and now - checked_at >= 2:
@@ -837,7 +922,7 @@ def run_match(
     try:
         result, match_path = _run_match(engine, data, local_data, map_name, game, players, minutes, stop,
                                         archive_cache=cache, process_started=process_started, record_demo=record_demo,
-                                        extra_units=extra_units, capture_stats=capture_stats)
+                                        extra_units=extra_units, capture_stats=capture_stats, progress=progress)
     except (MatchError, OSError, ValueError) as error:
         if progress is not None:
             progress(MatchProgress("match", "Stopped" if stop.is_set() else "Failed",

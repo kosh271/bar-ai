@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from itertools import combinations
+from random import choice
 from typing import Iterator
 
-from .headless import Player
+from .headless import Player, side_totals
+from .settings import FACTIONS
 
 
 @dataclass(frozen=True)
@@ -15,6 +18,11 @@ class Candidate:
     label: str
     player: Player
     promotable: bool = False
+    faction_policy: str = ""
+
+    @property
+    def profile_label(self) -> str:
+        return f"{self.player.name} · {self.player.profile or 'Default'}"
 
 
 def matrix(candidates: list[Candidate], maps: list[str], mode: str) -> Iterator[tuple[str, Candidate, Candidate]]:
@@ -26,12 +34,27 @@ def matrix(candidates: list[Candidate], maps: list[str], mode: str) -> Iterator[
                 yield map_name, baseline, candidate
         return
     pairs = list(combinations(candidates, 2))
+    appearances: Counter[str] = Counter()
+
+    def with_faction(candidate: Candidate) -> Candidate:
+        if candidate.faction_policy == "Rotate":
+            faction = FACTIONS[appearances[candidate.id] % len(FACTIONS)]
+            appearances[candidate.id] += 1
+        elif candidate.faction_policy == "Random":
+            faction = choice(FACTIONS)
+        else:
+            return candidate
+        return replace(candidate, player=replace(candidate.player, faction=faction),
+                       label=f"{candidate.profile_label} · {faction}")
+
     for reverse_pass in (False, True):
         for map_index in range(len(maps)):
             swap = reverse_pass != bool(map_index % 2)
             for index, (first, second) in enumerate(pairs):
                 map_name = maps[(map_index + index) % len(maps)]
-                yield map_name, second if swap else first, first if swap else second
+                if swap:
+                    first, second = second, first
+                yield map_name, with_faction(first), with_faction(second)
 
 
 def rankings(candidates: list[Candidate], games: list[dict]) -> list[dict]:
@@ -109,6 +132,7 @@ def telemetry_metrics(metadata: dict) -> dict:
     script_errors = max(script_errors, sum(side_errors.values()))
     return {
         "simulated_seconds": simulated_seconds, "script_errors": script_errors,
+        "side_totals": side_totals(teams if isinstance(teams, list) and "smoke_passed" not in metadata else []),
         "script_errors_by_side": side_errors,
         "unassigned_script_errors": script_errors - sum(side_errors.values()),
         "engine_error": bool(metadata.get("engine_exit")),
