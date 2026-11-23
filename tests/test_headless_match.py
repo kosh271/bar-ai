@@ -26,6 +26,37 @@ class HeadlessMatchTests(unittest.TestCase):
                          self.stop, self.events.append, **kwargs)
 
     @patch("app.headless.subprocess.Popen")
+    def test_match_collects_team_totals_without_retaining_a_replay(self, popen):
+        def launch(command, **kwargs):
+            run = Path(command[-1]).parent
+            self.assertIn("RecordDemo=0;", (run / "script.txt").read_text(encoding="utf-8"))
+            self.assertTrue((run / "LuaUI" / "Widgets" / "studio_match_stats.lua").is_file())
+            (run / "infolog.txt").write_text(
+                "[f=0000901] Team 0 stats: damageDealt=7, metalProduced=11, energyProduced=20\n"
+                "[f=0001800] Executing debugcommand, quitforce\n"
+                "[f=0001800] Team 0 stats: damageDealt=15, metalProduced=25, energyProduced=35\n"
+                "[f=0001800] Team 1 stats: damageDealt=2, metalProduced=20, energyProduced=40\n",
+                encoding="utf-8",
+            )
+            return process
+
+        process = unittest.mock.Mock()
+        process.poll.return_value = process.wait.return_value = 0
+        popen.side_effect = launch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "spring-headless.exe").touch()
+            _, run = run_match(root, root, root, "Map", "Game", self.players, 1, self.stop, skip_smoke=True,
+                               capture_stats=True)
+            result = json.loads((run / "result.json").read_text(encoding="utf-8"))
+            stats = [team["stats"] for team in result["telemetry"]["teams"]]
+            self.assertEqual([row["damage_dealt"] for row in stats], [15, 2])
+            self.assertEqual([row["metal_produced"] for row in stats], [25, 20])
+            self.assertEqual([row["energy_produced"] for row in stats], [35, 40])
+            self.assertEqual(result["replays"], [])
+            self.assertIn("Time limit reached", result["result"])
+
+    @patch("app.headless.subprocess.Popen")
     def test_opt_in_records_only_match_and_persists_replays_and_telemetry(self, popen):
         def launch(command, **kwargs):
             run = Path(command[-1]).parent

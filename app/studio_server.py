@@ -355,7 +355,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/preferences",
             "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
-            "/api/match/start", "/api/match/cancel", "/api/match/replay/copy",
+            "/api/match/start", "/api/match/cancel", "/api/match/cancel-game", "/api/match/replay/copy",
             "/api/experiment/start", "/api/experiment/pause", "/api/experiment/promote",
         }:
             return self._error(404, "Unknown API endpoint.")
@@ -446,6 +446,8 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 with self.server.write_lock:
                     if self.server.match_service.is_busy("experiment"):
                         raise MatchError("Wait for the experiment to finish before changing installed AIs.")
+                    if self.server.match_service.is_busy("match"):
+                        raise MatchError("Wait for the test queue to finish before changing installed AIs.")
                     change = self._install if parsed.path == "/api/install" else self._remove
                     return self._json(200, change(payload))
             if parsed.path == "/api/match/cache":
@@ -480,15 +482,25 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 extra_units = payload.get("extra_units", False)
                 if type(extra_units) is not bool:
                     raise ValueError("extra_units must be a boolean.")
-                return self._json(200, self.server.match_service.start(
-                    payload["bar_root"],
-                    payload["engine"],
-                    payload["game"],
-                    payload["map_name"],
-                    payload["players"],
-                    payload["minutes"],
-                    payload["skip_smoke"],
-                    series=payload.get("series"), record_demo=record_demo, extra_units=extra_units,
+                with self.server.write_lock:
+                    return self._json(200, self.server.match_service.start(
+                        payload["bar_root"],
+                        payload["engine"],
+                        payload["game"],
+                        payload["map_name"],
+                        payload["players"],
+                        payload["minutes"],
+                        payload["skip_smoke"],
+                        series=payload.get("series"), record_demo=record_demo, extra_units=extra_units,
+                        parallel_games=payload.get("parallel_games"),
+                    ))
+            if parsed.path == "/api/match/cancel-game":
+                self._require_fields(payload, ("id", "game_index"))
+                index = payload["game_index"]
+                if type(index) is not int or index < 1:
+                    raise ValueError("game_index must be a positive integer.")
+                return self._json(200, self.server.match_service.cancel_game(
+                    self._string(payload["id"], "id"), index,
                 ))
             if parsed.path == "/api/match/replay/copy":
                 self._require_fields(payload, ("run_id", "path"))

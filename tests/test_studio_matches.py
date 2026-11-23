@@ -137,7 +137,7 @@ class MatchServiceTests(unittest.TestCase):
         self.assertEqual(self.scan()["result"]["content"], CONTENT)
 
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
-                skip_smoke, process_started, record_demo, extra_units):
+                skip_smoke, process_started, record_demo, extra_units, capture_stats):
             self.assertTrue(skip_smoke)
             self.assertTrue(extra_units)
             self.assertEqual(players[0].name, "Display")
@@ -253,11 +253,12 @@ class MatchServiceTests(unittest.TestCase):
         self.scan()
         smoke_ready, match_ready, advance, finish = (threading.Event() for _ in range(4))
         smoke, match = MagicMock(), MagicMock()
+        smoke.pid, match.pid = 123, 456
         smoke.poll.return_value = None
         match.poll.return_value = None
 
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
-                skip_smoke, process_started, record_demo, extra_units):
+                skip_smoke, process_started, record_demo, extra_units, capture_stats):
             process_started(smoke)
             smoke_ready.set()
             advance.wait(2)
@@ -277,14 +278,18 @@ class MatchServiceTests(unittest.TestCase):
                 status = self.service.status()
                 self.assertEqual((status["phase"], status["engine"]["state"]), ("smoke", "running"))
                 self.assertGreater(status["phase_elapsed_seconds"], 0)
-                smoke_started = self.service._state["_phase_started"]
+                self.assertEqual(status["games"][0]["state"], "smoke")
+                self.assertEqual(status["games"][0]["pid"], 123)
+                smoke_elapsed = status["phase_elapsed_seconds"]
                 smoke.poll.return_value = 7
                 self.assertEqual(self.service.status()["engine"], {"state": "exited", "exit_code": 7})
                 advance.set()
                 self.assertTrue(match_ready.wait(2))
                 status = self.service.status()
                 self.assertEqual((status["phase"], status["engine"]["state"]), ("match", "running"))
-                self.assertGreater(self.service._state["_phase_started"], smoke_started)
+                self.assertEqual(status["games"][0]["pid"], 456)
+                self.assertGreater(status["games"][0]["elapsed_seconds"], 0)
+                self.assertLess(status["phase_elapsed_seconds"], smoke_elapsed)
                 match.poll.return_value = 9
                 self.assertEqual(self.service.status()["engine"], {"state": "exited", "exit_code": 9})
             finally:
@@ -293,6 +298,7 @@ class MatchServiceTests(unittest.TestCase):
             status = self.wait()
         self.assertEqual(status["state"], "failed")
         self.assertIsNone(status["engine"])
+        self.assertEqual((status["games"][0]["state"], status["games"][0]["pid"]), ("failed", 456))
 
     def test_unexpected_worker_exit_is_not_left_running(self):
         self.scan()
@@ -335,7 +341,7 @@ class MatchServiceTests(unittest.TestCase):
         self.assertIn("Profile", status["error"])
 
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
-                skip_smoke, process_started, record_demo, extra_units):
+                skip_smoke, process_started, record_demo, extra_units, capture_stats):
             progress(MatchProgress("smoke", "Failed", 1, "Smoke logs: smoke"))
             return "Smoke test failed", self.root / "smoke"
 
@@ -364,7 +370,7 @@ class MatchServiceTests(unittest.TestCase):
         self.assertEqual(status["result"]["catalog"], catalog)
         self.assertEqual(self.service.latest_catalog(), catalog)
         def fail_smoke(engine, data, local, map_name, game, players, minutes, stop, progress, *,
-                       skip_smoke, process_started, record_demo, extra_units):
+                       skip_smoke, process_started, record_demo, extra_units, capture_stats):
             progress(MatchProgress("smoke", "Failed"))
             return "Smoke test failed", self.root
         with patch("app.studio_matches.headless.run_match", side_effect=fail_smoke):
@@ -476,7 +482,7 @@ class MatchServiceTests(unittest.TestCase):
                 pass
 
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
-                skip_smoke, process_started, record_demo, extra_units):
+                skip_smoke, process_started, record_demo, extra_units, capture_stats):
             self.assertTrue(stop.is_set())
             raise MatchError("Stopped")
 
@@ -638,8 +644,13 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
             item = outcomes[idx]
             if isinstance(item, Exception):
                 raise item
+            run_dir = local / "matches" / f"match-{idx}"
+            run_dir.mkdir(parents=True)
+            (run_dir / "result.json").write_text(json.dumps({"telemetry": {
+                "teams": [{"team": 0, "side": players[0].ally + 1, "stats": {"damage_dealt": idx + 1}}],
+            }}), encoding="utf-8")
             progress(MatchProgress("match", "Done", 2))
-            return item, self.root / f"match-{idx}"
+            return item, run_dir
 
         players = [
             {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
@@ -663,6 +674,11 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertEqual(calls[1], ("Map2", [("AI", "Legion", 1), ("BARb", "Armada", 0)]))
         self.assertEqual(calls[2][0], "Map")
         self.assertEqual(calls[3][0], "Map2")
+        rows = status["games"]
+        self.assertEqual([row["state"] for row in rows], ["completed", "completed", "draw", "failed"])
+        self.assertEqual([row["winner_side"] for row in rows], [1, 2, None, None])
+        self.assertEqual(rows[1]["telemetry"]["teams"][0]["stats"]["damage_dealt"], 2)
+        self.assertEqual(rows[0]["logs"]["run_id"], "match-0")
 
     def test_mid_series_cancellation_stops_active_game_and_prevents_next(self):
         self.scan()
@@ -687,6 +703,10 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
                 series={"games": 5, "swap_sides": False, "maps": ["Map", "Map2"]},
             )
             self.assertTrue(entered.wait(2))
+            active = self.service.status()["games"]
+            self.assertEqual(active[0]["state"], "completed")
+            self.assertEqual([row["state"] for row in active[2:]], ["queued"] * 3)
+            self.assertEqual(active[2]["players"][0]["profile"], "hard")
             self.service.cancel()
             status = self.wait()
 
@@ -694,9 +714,94 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(status["series"]["side1_wins"], 1)
         self.assertEqual(status["series"]["cancelled"], 1)
+        self.assertEqual([row["state"] for row in status["games"]],
+                         ["completed", "cancelled", "not_run", "not_run", "not_run"])
         history = self.service.history()
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["state"], "cancelled")
+
+    def test_parallel_queue_refills_a_slot_and_cancels_one_game_independently(self):
+        self.scan()
+        first, second, third = (threading.Event() for _ in range(3))
+        release_second, release_third = threading.Event(), threading.Event()
+        started = {}
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            process = MagicMock(pid=minutes + 100)
+            process.poll.return_value = None
+            kwargs["process_started"](process)
+            started[minutes] = stop
+            {10: first, 20: second, 30: third}[minutes].set()
+            if minutes == 10:
+                stop.wait(3)
+            else:
+                {20: release_second, 30: release_third}[minutes].wait(3)
+            return "Winner: side 1.", self.root / f"match-{minutes}"
+
+        players = [
+            {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Armada", "ally": 0},
+            {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
+        ]
+        with patch("app.studio_matches.headless.run_match", side_effect=run):
+            try:
+                for minutes in (10, 20, 30):
+                    self.service.start(self.bar_root, self.engine, "Game", "Map", players, minutes, True,
+                                       parallel_games=2)
+                self.assertTrue(first.wait(2))
+                self.assertTrue(second.wait(2))
+                self.assertFalse(third.is_set())
+                status = self.service.status()
+                self.assertEqual([(row["state"], row["pid"]) for row in status["games"]],
+                                 [("running", 110), ("running", 120), ("queued", None)])
+                self.service.cancel_game(status["id"], status["games"][0]["game_index"])
+                self.assertTrue(third.wait(2))
+                self.assertFalse(started[20].is_set())
+                self.assertFalse(started[30].is_set())
+            finally:
+                release_second.set()
+                release_third.set()
+            status = self.wait()
+        self.assertEqual([row["state"] for row in status["games"]], ["cancelled", "completed", "completed"])
+        self.assertEqual(len(self.service.history()), 3)
+
+    def test_cancelling_queue_rejects_an_in_flight_submission(self):
+        self.scan()
+        entered, preparing, continue_preparation = (threading.Event() for _ in range(3))
+        errors = []
+        prepare = self.service._prepare_batch
+
+        def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
+            entered.set()
+            stop.wait(3)
+            raise MatchError("Stopped by user.")
+
+        def delayed_prepare(*args):
+            preparing.set()
+            continue_preparation.wait(3)
+            return prepare(*args)
+
+        # The generic test roster contains two profiles of the same installed AI.
+        def start():
+            try:
+                self.service.start(self.bar_root, self.engine, "Game", "Map", PLAYERS, 20, True)
+            except MatchError as error:
+                errors.append(str(error))
+
+        with patch("app.studio_matches.headless.run_match", side_effect=run) as launch:
+            start()
+            self.assertTrue(entered.wait(2), errors)
+            with patch.object(self.service, "_prepare_batch", side_effect=delayed_prepare):
+                submitter = threading.Thread(target=start, daemon=True)
+                submitter.start()
+                try:
+                    self.assertTrue(preparing.wait(2))
+                    self.service.cancel()
+                    self.assertEqual(self.wait()["state"], "cancelled")
+                finally:
+                    continue_preparation.set()
+                    submitter.join(3)
+        self.assertEqual(errors, ["The test queue was cancelled before the games could be added."])
+        launch.assert_called_once()
 
     @unittest.skipUnless(os.name != "invalid" and __import__("shutil").which("git"), "Git required")
     def test_persistent_history_checkpoint_drift_legacy_and_filtering(self):

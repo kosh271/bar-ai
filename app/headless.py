@@ -31,6 +31,7 @@ UDP_RECEIVE_SIZE = 65535
 SMOKE_MINUTES = 2
 SMOKE_TIMEOUT = 600
 GAME_OVER_GRACE = 30
+_ARCHIVE_CACHE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -107,23 +108,25 @@ def archive_cache_path(local_data: Path, engine: Path, data: Path) -> Path:
 
 
 def _copy_archive_cache(source: Path, destination: Path, *, atomic: bool = False) -> None:
-    if not source.is_dir():
-        return
-    for cache_file in source.iterdir():
-        if not cache_file.is_file() or not re.fullmatch(r"ArchiveCache\d+\.lua", cache_file.name):
-            continue
-        destination.mkdir(parents=True, exist_ok=True)
-        if not atomic:
-            shutil.copy2(cache_file, destination / cache_file.name)
-            continue
-        descriptor, name = tempfile.mkstemp(prefix=".archive-", dir=destination)
-        os.close(descriptor)
-        temporary = Path(name)
-        try:
-            shutil.copyfile(cache_file, temporary)
-            os.replace(temporary, destination / cache_file.name)
-        finally:
-            temporary.unlink(missing_ok=True)
+    # On Windows a reader can prevent the atomic replacement of an open file.
+    with _ARCHIVE_CACHE_LOCK:
+        if not source.is_dir():
+            return
+        for cache_file in source.iterdir():
+            if not cache_file.is_file() or not re.fullmatch(r"ArchiveCache\d+\.lua", cache_file.name):
+                continue
+            destination.mkdir(parents=True, exist_ok=True)
+            if not atomic:
+                shutil.copy2(cache_file, destination / cache_file.name)
+                continue
+            descriptor, name = tempfile.mkstemp(prefix=".archive-", dir=destination)
+            os.close(descriptor)
+            temporary = Path(name)
+            try:
+                shutil.copyfile(cache_file, temporary)
+                os.replace(temporary, destination / cache_file.name)
+            finally:
+                temporary.unlink(missing_ok=True)
 
 
 def scan_content(
@@ -379,6 +382,7 @@ _TEAM_STATS = re.compile(r"^team\s+(\d{1,4})\s+stats\s*:\s*(.*)", re.IGNORECASE)
 _STAT_FIELDS = {
     "metalproduced": "metal_produced", "energyproduced": "energy_produced", "metalused": "metal_used",
     "energyused": "energy_used", "metalexcess": "metal_excess", "energyexcess": "energy_excess",
+    "metalreceived": "metal_received", "energyreceived": "energy_received",
     "unitsproduced": "units_produced", "unitskilled": "units_killed", "unitsdied": "units_died",
     "unitslost": "units_died", "unitcount": "unit_count", "damagedealt": "damage_dealt",
     "damagereceived": "damage_received", "metal": "metal", "energy": "energy",
@@ -654,7 +658,7 @@ def _run_match(
     engine: Path, data: Path, local_data: Path, map_name: str, game: str,
     players: list[Player], minutes: int, stop: threading.Event, *, archive_cache: Path,
     process_started: Callable[[subprocess.Popen], None] | None = None, record_demo: bool = False,
-    extra_units: bool = False,
+    extra_units: bool = False, capture_stats: bool = False,
 ) -> tuple[str, Path]:
     script = build_script(map_name, game, players, minutes, record_demo, extra_units=extra_units)
     if not (engine / "spring-headless.exe").is_file():
@@ -664,6 +668,10 @@ def _run_match(
     run = Path(tempfile.mkdtemp(prefix="match-", dir=runs)).resolve()
     (run / "script.txt").write_text(script, encoding="utf-8")
     _copy_archive_cache(archive_cache, run / "cache")
+    if capture_stats:
+        widgets = run / "LuaUI" / "Widgets"
+        widgets.mkdir(parents=True)
+        shutil.copyfile(Path(__file__).with_name("match_stats.lua"), widgets / "studio_match_stats.lua")
     env = {**os.environ, "SPRING_DATADIR": str(data), "SPRING_WRITEDIR": str(run)}
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as host:
         host.bind(("127.0.0.1", 0))
@@ -788,7 +796,7 @@ def run_match(
     players: list[Player], minutes: int, stop: threading.Event,
     progress: Callable[[MatchProgress], None] | None = None, *, skip_smoke: bool = False,
     process_started: Callable[[subprocess.Popen], None] | None = None, record_demo: bool = False,
-    extra_units: bool = False,
+    extra_units: bool = False, capture_stats: bool = False,
 ) -> tuple[str, Path]:
     build_script(map_name, game, players, minutes, record_demo, extra_units=extra_units)
     if stop.is_set():
@@ -829,7 +837,7 @@ def run_match(
     try:
         result, match_path = _run_match(engine, data, local_data, map_name, game, players, minutes, stop,
                                         archive_cache=cache, process_started=process_started, record_demo=record_demo,
-                                        extra_units=extra_units)
+                                        extra_units=extra_units, capture_stats=capture_stats)
     except (MatchError, OSError, ValueError) as error:
         if progress is not None:
             progress(MatchProgress("match", "Stopped" if stop.is_set() else "Failed",

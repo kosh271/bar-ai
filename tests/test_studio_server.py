@@ -298,12 +298,23 @@ class StudioServerTests(unittest.TestCase):
             self.assertEqual(self._request("/api/match/start", method="POST", body=payload)[0], 200)
             self.assertIs(start.call_args.kwargs["record_demo"], False)
             self.assertEqual(self._request("/api/match/start", method="POST",
-                                           body={**payload, "record_demo": True})[0], 200)
+                                           body={**payload, "record_demo": True, "parallel_games": 3})[0], 200)
             self.assertIs(start.call_args.kwargs["record_demo"], True)
+            self.assertEqual(start.call_args.kwargs["parallel_games"], 3)
             for invalid in (None, "false", 1, []):
                 self.assertEqual(self._request("/api/match/start", method="POST",
                                                body={**payload, "record_demo": invalid})[0], 400)
             self.assertEqual(start.call_count, 2)
+
+    def test_match_cancel_game_targets_an_authenticated_queue_and_game(self):
+        path = "/api/match/cancel-game"
+        body = {"id": "queue", "game_index": 3}
+        with patch.object(self.server.match_service, "cancel_game", return_value={"state": "running"}) as cancel:
+            self.assertEqual(self._request(path, method="POST", body=body, token=False)[0], 401)
+            self.assertEqual(self._request(path, method="POST", body={**body, "game_index": True})[0], 400)
+            status, snapshot, _ = self._request(path, method="POST", body=body)
+        self.assertEqual((status, snapshot["state"]), (200, "running"))
+        cancel.assert_called_once_with("queue", 3)
 
     def test_match_log_endpoint_pages_bounded_raw_artifacts(self):
         url = "/api/match/logs?run_id=match-logs&file="

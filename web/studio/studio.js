@@ -12,7 +12,7 @@ const state = {
         content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "",
         first: "", second: "", faction1: "Armada", faction2: "Cortex",
         side1: [], side2: [], seriesGames: 1, swapSides: false, seriesMaps: [], factionPairs: [],
-        minutes: 120, skip: false, snapshot: null, statusError: "",
+        minutes: 120, skip: false, snapshot: null, statusError: "", parallelGames: null,
         history: [], historyFilters: {project: "", profile: "", map: "", checkpoint: ""}, historyError: ""
     }
 };
@@ -2099,9 +2099,8 @@ function showMatchLogs(runId) {
     navigateLog(async () => { page = await load(0); });
 }
 
-function matchTelemetryView(telemetry, series) {
-    const card = element("section", "panel");
-    card.append(element("h3", "", series ? "Last game telemetry" : "Match telemetry"));
+function matchTelemetryView(telemetry) {
+    const card = element("div", "tree-body");
     const frame = telemetry.end_frame;
     const timeLabel = telemetry.end_frame_source === "last_log_frame" ? "Last logged game time" : "Game time";
     const clock = frame == null ? "Game time unavailable" : `${timeLabel} ${telemetry.duration} · frame ${frame}`;
@@ -2128,17 +2127,245 @@ function matchTelemetryView(telemetry, series) {
     return card;
 }
 
-function setMatchLogActions(actions, snapshot) {
-    if (!actions) return;
-    const logs = snapshot?.operation === "match" && snapshot.logs;
-    const match = logs?.run_id?.startsWith("match-") ? logs.run_id : "";
-    const smoke = logs?.smoke_run_id || (logs?.run_id?.startsWith("smoke-") ? logs.run_id : "");
-    if (actions.dataset.runIds === `${match},${smoke}`) return;
-    actions.dataset.runIds = `${match},${smoke}`;
-    actions.replaceChildren();
-    actions.hidden = !match && !smoke;
-    if (match) actions.append(button("View match logs", () => showMatchLogs(match)));
-    if (smoke) actions.append(button("View smoke logs", () => showMatchLogs(smoke)));
+const trackedGameStatuses = {
+    queued: "Queued", starting: "Starting", smoke: "Smoke test", running: "Running",
+    stopping: "Stopping", finalizing: "Processing result", completed: "Completed", draw: "Draw",
+    timeout: "Timed out", failed: "Failed", cancelled: "Cancelled", not_run: "Not run",
+};
+const trackedGameActive = new Set(["starting", "smoke", "running", "stopping", "finalizing"]);
+const matchComparisonMetrics = [
+    ["damage_dealt", "Damage dealt"], ["metal_produced", "Metal produced"],
+    ["energy_produced", "Energy produced"], ["units_killed", "Units killed"],
+    ["units_produced", "Units produced"],
+];
+const matchStatFormat = new Intl.NumberFormat(undefined, {maximumFractionDigits: 2});
+let matchTracker = null;
+
+function trackerClock(seconds) {
+    if (seconds == null) return "—";
+    const value = Math.floor(seconds);
+    return [Math.floor(value / 3600), Math.floor(value / 60) % 60, value % 60]
+        .map(part => String(part).padStart(2, "0")).join(":");
+}
+
+function trackedProfile(player) {
+    return `${player.name || player.short_name} ${player.version} · ${player.profile || "Default"}`;
+}
+
+function matchComparison(game) {
+    const telemetry = game.telemetry?.teams || [];
+    const sides = [0, 1].map(ally => game.players.flatMap((player, team) =>
+        player.ally === ally ? [telemetry.find(row => row.team === team && row.side === ally + 1)?.stats] : []));
+    return matchComparisonMetrics.flatMap(([key, label]) => {
+        const totals = sides.map(teams => teams.length && teams.every(stats => Number.isFinite(stats?.[key]))
+            ? teams.reduce((sum, stats) => sum + stats[key], 0) : null);
+        return totals.some(total => total !== null) ? [[label, ...totals]] : [];
+    });
+}
+
+function trackedGameDetails(body, game) {
+    const comparison = game.logs?.run_id?.startsWith("smoke-") ? [] : matchComparison(game);
+    if (comparison.length) {
+        const wrap = element("div", "table-wrap");
+        const table = element("table", "match-comparison");
+        table.setAttribute("aria-label", "Team totals by side");
+        const head = element("tr");
+        for (const label of ["Metric", "Side 1 total", "Side 2 total"]) {
+            const column = element("th", "", label);
+            column.scope = "col";
+            head.append(column);
+        }
+        const thead = element("thead"), tbody = element("tbody");
+        thead.append(head);
+        for (const [label, first, second] of comparison) {
+            const row = element("tr");
+            const metric = element("th", "", label);
+            metric.scope = "row";
+            row.append(metric);
+            for (const [value, other] of [[first, second], [second, first]]) {
+                const cell = element("td", "", value === null ? "—" : matchStatFormat.format(value));
+                if (value !== null && other !== null && value > other) {
+                    cell.append(element("span", "match-stat-lead", "Higher"));
+                }
+                row.append(cell);
+            }
+            tbody.append(row);
+        }
+        table.append(thead, tbody);
+        wrap.append(table);
+        body.append(wrap);
+    } else {
+        body.append(element("p", "muted", "Match statistics unavailable for this game."));
+    }
+    if (game.telemetry) {
+        const details = element("details");
+        details.append(element("summary", "", "Team telemetry"), matchTelemetryView(game.telemetry));
+        body.append(details);
+    }
+    if (game.summary) {
+        const report = element("details");
+        report.append(element("summary", "", "Engine report"), element("pre", "match-engine-report", game.summary));
+        body.append(report);
+    }
+    const match = game.logs?.run_id?.startsWith("match-") ? game.logs.run_id : "";
+    const smoke = game.logs?.smoke_run_id || (game.logs?.run_id?.startsWith("smoke-") ? game.logs.run_id : "");
+    if (match || smoke) {
+        const actions = element("div", "row");
+        if (match) actions.append(matchLogButton(match, "View match logs"));
+        if (smoke) actions.append(matchLogButton(smoke, "View smoke logs"));
+        body.append(actions);
+    }
+    for (const replay of game.logs?.replays || []) {
+        const {directory, run_id} = game.logs;
+        if (!directory) continue;
+        const separator = directory.includes("\\") ? "\\" : "/";
+        const path = [directory, ...replay.path.split("/")].join(separator);
+        const actions = element("div", "row");
+        actions.append(button("Copy replay path", async () => {
+            try { await navigator.clipboard.writeText(path); message("Replay path copied."); }
+            catch (error) { message(errorText(error), true); }
+        }));
+        if (state.settings) actions.append(button("Copy to BAR demos", async event => {
+            const action = event.currentTarget;
+            action.disabled = true;
+            try {
+                const result = await api("/api/match/replay/copy", {run_id, path: replay.path});
+                message("Replay copied to " + result.path);
+            } catch (error) { message(errorText(error), true); }
+            finally { action.disabled = false; }
+        }));
+        body.append(element("p", "path", path), actions);
+    }
+}
+
+function renderMatchTracker(container, snapshot) {
+    if (!container) return;
+    const games = snapshot?.operation === "match" && snapshot.games;
+    container.hidden = !games?.length;
+    if (container.hidden) {
+        if (matchTracker?.id !== snapshot?.id) matchTracker = null;
+        container.replaceChildren();
+        return;
+    }
+    if (matchTracker?.id !== snapshot.id) {
+        const section = element("section", "match-tracker");
+        const wrap = element("div", "table-wrap");
+        const table = element("table", "match-tracker-table");
+        table.setAttribute("aria-label", "Test runs");
+        const thead = element("thead"), head = element("tr"), tbody = element("tbody");
+        for (const label of ["Game", "PID", "Status", "Run time", "Profiles under test", "Winner", "Details"]) {
+            const column = element("th", "", label);
+            column.scope = "col";
+            head.append(column);
+        }
+        thead.append(head);
+        table.append(thead, tbody);
+        wrap.append(table);
+        const toolbar = element("div", "match-tracker-toolbar");
+        const filter = dropdown("Show games", [["all", "All games"], ["pending", "Active and queued"],
+            ["finished", "Finished"]], "all", () => renderMatchTracker(section.parentNode, state.match.snapshot));
+        toolbar.append(element("h3", "", "Test runs"), filter);
+        section.append(toolbar, wrap);
+        matchTracker = {id: snapshot.id, section, tbody, rows: new Map(), filter: filter.querySelector("select")};
+    }
+    const {section, tbody, rows, filter} = matchTracker;
+    if (section.parentNode !== container) container.replaceChildren(section);
+    for (const game of games) {
+        const index = game.game_index;
+        const players = [0, 1].map(ally => game.players.filter(player => player.ally === ally));
+        if (!rows.has(index)) {
+            const row = element("tr");
+            const title = element("th", "match-tracker-game", `Game ${index}`);
+            title.scope = "row";
+            title.append(element("div", "muted", game.map), element("div", "muted", game.game));
+            if (game.batch_size > 1) {
+                const leg = `Series game ${game.batch_game}/${game.batch_size}`;
+                title.append(element("div", "muted", game.swapped ? `${leg} · Sides swapped` : leg));
+            }
+            const pid = element("td", "match-tracker-number"), status = element("span");
+            const statusCell = element("td");
+            statusCell.append(status);
+            const elapsed = element("td", "match-tracker-number");
+            const profiles = element("td", "match-tracker-profiles");
+            players.forEach((roster, side) => {
+                const group = element("div", "match-tracker-side");
+                group.append(element("strong", "", `Side ${side + 1}`));
+                for (const player of roster) {
+                    group.append(element("div", "", `${trackedProfile(player)} · ${player.faction}`));
+                }
+                profiles.append(group);
+            });
+            const winner = element("td", "match-tracker-winner", "—"), control = element("td");
+            const cancel = button("Cancel", async () => {
+                const current = state.match.snapshot;
+                cancel.disabled = true;
+                try {
+                    const response = await api("/api/match/cancel-game", {id: snapshot.id, game_index: index});
+                    if (state.match.snapshot === current) {
+                        state.match.snapshot = response;
+                        updateMatchStatus();
+                    }
+                    if (state.match.snapshot?.id === response.id) pollMatch(true);
+                } catch (error) { message(errorText(error), true); }
+                finally { cancel.disabled = false; }
+            });
+            cancel.setAttribute("aria-label", `Cancel game ${index}`);
+            control.append(cancel);
+            const detailRow = element("tr", "match-tracker-detail-row");
+            detailRow.hidden = true;
+            const detailCell = element("td", "match-tracker-detail");
+            detailCell.colSpan = 7;
+            detailCell.id = `match-tracker-game-${index}`;
+            detailRow.append(detailCell);
+            row.append(title, pid, statusCell, elapsed, profiles, winner, control);
+            tbody.append(row, detailRow);
+            rows.set(index, {row, pid, status, elapsed, winner, control, cancel, detailRow, detailCell, detailed: false});
+        }
+        const row = rows.get(index);
+        const pending = game.state === "queued" || trackedGameActive.has(game.state);
+        row.row.hidden = filter.value === "pending" ? !pending : filter.value === "finished" && pending;
+        row.detailRow.classList.toggle("match-tracker-filtered", row.row.hidden);
+        const statusLabel = trackedGameStatuses[game.state] || game.state;
+        if (row.status.textContent !== statusLabel) {
+            row.status.textContent = statusLabel;
+            row.status.className = `match-tracker-status status-${game.state}`;
+        }
+        const pid = String(game.pid ?? "—"), elapsed = trackerClock(game.elapsed_seconds);
+        if (row.pid.textContent !== pid) row.pid.textContent = pid;
+        if (row.elapsed.textContent !== elapsed) row.elapsed.textContent = elapsed;
+        row.cancel.hidden = game.state !== "queued" &&
+            (!trackedGameActive.has(game.state) || ["stopping", "finalizing"].includes(game.state));
+        if (game.summary !== undefined && !row.detailed) {
+            row.detailed = true;
+            if (game.winner_side) {
+                row.winner.replaceChildren(element("strong", "", `Side ${game.winner_side}`));
+                for (const player of players[game.winner_side - 1]) {
+                    row.winner.append(element("div", "", trackedProfile(player)));
+                }
+            } else {
+                row.winner.textContent = game.state === "draw" ? "Draw" : "—";
+            }
+            const toggle = button("", () => {
+                if (matchTracker.autoExpanded === setExpanded) matchTracker.autoExpanded = null;
+                setExpanded(row.detailRow.hidden);
+            });
+            const setExpanded = expanded => {
+                row.detailRow.hidden = !expanded;
+                toggle.textContent = expanded ? "Hide" : "Show";
+                toggle.setAttribute("aria-expanded", String(expanded));
+                toggle.setAttribute("aria-label", `${toggle.textContent} details for game ${index}`);
+            };
+            toggle.setAttribute("aria-controls", row.detailCell.id);
+            trackedGameDetails(row.detailCell, game);
+            row.control.append(toggle);
+            setExpanded(false);
+            if (game.elapsed_seconds != null) {
+                matchTracker.autoExpanded?.(false);
+                matchTracker.autoExpanded = setExpanded;
+                setExpanded(true);
+            }
+        }
+    }
 }
 
 function matchLogButton(runId, label = "View logs") {
@@ -2148,59 +2375,34 @@ function matchLogButton(runId, label = "View logs") {
     return element("span", "muted", "—");
 }
 
-function renderSeriesScoreboard(container, series) {
+function renderSeriesScoreboard(container, scores = []) {
     if (!container) return;
-    if (!series) {
-        container.replaceChildren();
-        container.hidden = true;
-        return;
-    }
-    container.hidden = false;
-    const total = series.total_games || 0;
-    const completed = series.completed_games || 0;
-    const s1 = series.side1_wins || 0;
-    const s2 = series.side2_wins || 0;
-    const pct = wins => (completed > 0 ? `${Math.round((wins / completed) * 100)}%` : "0%");
-    const heading = series.current_game && completed < total && !series.cancelled
-        ? `Benchmark series · Game ${series.current_game} of ${total}${series.current_map ? ` (${series.current_map})` : ""}${series.swapped ? " · sides swapped" : ""}`
-        : `Benchmark series · ${completed}/${total} games finished`;
-    const grid = element("div", "scoreboard");
-    for (const [label, value] of [
-        ["Side 1 wins", `${s1} (${pct(s1)})`],
-        ["Side 2 wins", `${s2} (${pct(s2)})`],
-        ["Draws", String(series.draws || 0)],
-        ["Timeouts", String(series.timeouts || 0)],
-        ["Failures", String(series.failures || 0)],
-        ["Cancelled", String(series.cancelled || 0)],
-    ]) {
-        const card = element("div", "score-card");
-        card.append(element("small", "", label), element("div", "score-value", value));
-        grid.append(card);
-    }
-    const nodes = [element("h3", "", heading), grid];
-    if (Array.isArray(series.games) && series.games.length) {
-        const wrap = element("div", "table-wrap"), table = element("table"), head = element("tr");
-        for (const col of ["#", "Map", "Sides", "Factions", "Outcome", "Elapsed", "Logs"]) head.append(element("th", "", col));
-        table.append(head);
-        for (const game of series.games) {
-            const tr = element("tr");
-            const logs = element("td");
-            logs.append(matchLogButton(game.run_dir));
-            tr.append(
-                element("td", "", String(game.game_index)),
-                element("td", "", game.map || ""),
-                element("td", "", game.swapped ? "Swapped" : "Standard"),
-                element("td", "", Array.isArray(game.factions) ? game.factions.join(" vs ") : "Roster"),
-                element("td", "", game.outcome || ""),
-                element("td", "", typeof game.elapsed_seconds === "number" ? `${game.elapsed_seconds.toFixed(1)}s` : "—"),
-                logs
-            );
-            table.append(tr);
+    container.hidden = !scores.length;
+    const key = JSON.stringify(scores);
+    if (container.dataset.scores === key) return;
+    container.dataset.scores = key;
+    container.replaceChildren();
+    for (const series of scores) {
+        const {completed_games: completed, total_games: total, first_game, last_game, side1_wins, side2_wins} = series;
+        const pct = wins => completed ? `${Math.round((wins / completed) * 100)}%` : "0%";
+        const range = first_game === last_game ? `Game ${first_game}` : `Games ${first_game}–${last_game}`;
+        const heading = `Benchmark series · ${range} · ${completed}/${total} games finished`;
+        const grid = element("div", "scoreboard");
+        const side = series.swap_sides ? "Original side" : "Side";
+        for (const [label, value] of [
+            [`${side} 1 wins`, `${side1_wins} (${pct(side1_wins)})`],
+            [`${side} 2 wins`, `${side2_wins} (${pct(side2_wins)})`],
+            ["Draws", String(series.draws)],
+            ["Timeouts", String(series.timeouts)],
+            ["Failures", String(series.failures)],
+            ["Cancelled", String(series.cancelled)],
+        ]) {
+            const card = element("div", "score-card");
+            card.append(element("small", "", label), element("div", "score-value", value));
+            grid.append(card);
         }
-        wrap.append(table);
-        nodes.push(wrap);
+        container.append(element("h3", "", heading), grid);
     }
-    container.replaceChildren(...nodes);
 }
 function renderMatchHistory(container) {
     if (!container) return;
@@ -2322,7 +2524,7 @@ function matchView(target) {
     });
     scanButton.id = "match-scan";
     scanButton.disabled = !info || m.scanStarting || isMatchActive(m.snapshot);
-    const cancelButton = button("Cancel operation", async () => {
+    const cancelButton = button(m.snapshot?.operation === "match" ? "Cancel queue" : "Cancel operation", async () => {
         const snapshot = m.snapshot;
         m.cancellingId = snapshot.id;
         updateMatchControls();
@@ -2356,42 +2558,12 @@ function matchView(target) {
     setScanProgress(scanProgress, m.snapshot);
     panel.append(statusBox, scanProgress);
     if (m.cached) panel.append(notice("Showing saved scan results from a previous run. Refresh after changing the selected engine or installing, removing, or updating games, maps, or AIs."));
-    if (m.snapshot?.error) panel.append(notice(m.snapshot.error, true));
-    if (m.snapshot?.result && m.snapshot.operation === "match") {
-        panel.append(element("pre", "", m.snapshot.result.summary || ""));
-        if (m.snapshot.result.telemetry) panel.append(matchTelemetryView(m.snapshot.result.telemetry, m.snapshot.result.series));
-    }
     const scoreboard = element("div");
     scoreboard.id = "series-scoreboard";
-    renderSeriesScoreboard(scoreboard, m.snapshot?.series || m.snapshot?.result?.series);
-    panel.append(scoreboard);
-    const logActions = element("div", "row");
-    logActions.id = "match-log-actions";
-    setMatchLogActions(logActions, m.snapshot);
-    panel.append(logActions);
-    if (m.snapshot?.operation === "match") {
-        const logs = m.snapshot.logs || {};
-        if (logs.directory) panel.append(element("p", "path", "Logs: " + logs.directory));
-        for (const replay of logs.replays || []) {
-            const separator = logs.directory.includes("\\") ? "\\" : "/";
-            const path = [logs.directory, ...replay.path.split("/")].join(separator);
-            const replayActions = element("div", "row");
-            replayActions.append(button("Copy replay path", async () => {
-                try { await navigator.clipboard.writeText(path); message("Replay path copied."); }
-                catch (error) { message(errorText(error), true); }
-            }));
-            if (info) replayActions.append(button("Copy to BAR demos", async event => {
-                const action = event.currentTarget;
-                action.disabled = true;
-                try {
-                    const result = await api("/api/match/replay/copy", {run_id: logs.run_id, path: replay.path});
-                    message("Replay copied to " + result.path);
-                } catch (error) { message(errorText(error), true); }
-                finally { action.disabled = false; }
-            }));
-            panel.append(element("p", "path", path), replayActions);
-        }
-    }
+    renderSeriesScoreboard(scoreboard, m.snapshot?.series_scores);
+    const tracker = element("div");
+    tracker.id = "match-tracker";
+    renderMatchTracker(tracker, m.snapshot);
     if (m.content) {
         const content = m.content;
         if (!content.games.length || !content.maps.length || !content.ais.length) {
@@ -2553,11 +2725,22 @@ function matchView(target) {
             extra.type = "checkbox"; extra.checked = m.extraUnits === true;
             extra.addEventListener("change", () => { m.extraUnits = extra.checked; });
             extraLabel.append(extra);
-            const startLabel = (m.seriesGames || 1) > 1 ? `Start ${m.seriesGames}-game series` : "Start match";
-            settings.append(minuteLabel, skipLabel, replayLabel, extraLabel, button(startLabel, async () => {
+            const slots = element("input"), slotsLabel = element("label", "field", "Parallel game limit");
+            slots.type = "number"; slots.min = "1"; slots.max = "8"; slots.step = "1"; slots.required = true;
+            slots.value = m.parallelGames ?? m.snapshot?.parallel_games ?? 2;
+            slots.addEventListener("change", () => {
+                if (slots.checkValidity()) m.parallelGames = Number(slots.value);
+            });
+            slotsLabel.append(slots);
+            const startLabel = (m.seriesGames || 1) > 1 ? `Queue ${m.seriesGames}-game series` : "Queue match";
+            const submit = button(startLabel, async () => {
+                if (m.submitting) return;
                 try {
                     if (dirty().length) throw Error("Save and install profile changes before testing.");
-                    if (!minutes.reportValidity()) return;
+                    if (!minutes.reportValidity() || !slots.reportValidity()) return;
+                    m.submitting = true;
+                    updateMatchControls();
+                    m.parallelGames = Number(slots.value);
                     const player = (value, faction, ally) => {
                         const [short_name, version, profile] = JSON.parse(value);
                         return {short_name, version, profile, faction, ally};
@@ -2573,6 +2756,7 @@ function matchView(target) {
                         players,
                         minutes: m.minutes,
                         skip_smoke: m.skip,
+                        parallel_games: m.parallelGames,
                         record_demo: m.recordDemo === true,
                         extra_units: m.extraUnits === true,
                     };
@@ -2587,18 +2771,22 @@ function matchView(target) {
                     }
                     m.snapshot = await api("/api/match/start", body);
                     m.statusError = "";
-                    render(); pollMatch(true);
+                    if (state.page === "match") render();
+                    pollMatch(true);
                 } catch (error) { message(errorText(error), true); }
-            }, "button primary"));
-            const activity = element("span", "match-activity");
-            activity.id = "match-activity";
-            activity.setAttribute("role", "status");
-            setMatchActivity(activity, m.snapshot, m.statusError);
-            settings.append(activity);
+                finally {
+                    m.submitting = false;
+                    updateMatchControls();
+                }
+            }, "button primary");
+            submit.id = "match-submit";
+            submit.disabled = !canQueueMatch(m);
+            settings.append(minuteLabel, skipLabel, replayLabel, extraLabel, slotsLabel, submit);
             panel.append(settings);
             if (content.warnings.length) panel.append(notice("Scan warnings: " + content.warnings.join("; "), true));
         }
     }
+    panel.append(tracker, scoreboard);
     const historyPanel = element("div", "panel");
     historyPanel.id = "match-history-panel";
     historyPanel.append(element("h2", "", "Match history"),
@@ -2629,23 +2817,6 @@ function matchView(target) {
     historyPanel.append(filterRow, historyBody);
     target.append(panel, historyPanel);
 }
-function matchActivity(snapshot, error) {
-    if (error) return "Status unavailable — cannot verify engine. Retrying…";
-    if (!snapshot || snapshot.operation !== "match") return "";
-    if (!["running", "cancelling"].includes(snapshot.state)) {
-        return snapshot.state === "failed" ? "Match failed; see status above." : "";
-    }
-    if (snapshot.phase !== "smoke" && snapshot.phase !== "match") return "Preparing match…";
-    const stage = snapshot.phase === "smoke" ? "Smoke test" : "Headless match";
-    const seconds = Math.floor(snapshot.phase_elapsed_seconds || 0);
-    const elapsed = [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60]
-        .map(value => String(value).padStart(2, "0")).join(":");
-    const engine = snapshot.engine;
-    if (!engine || engine.state === "starting") return `${stage}: starting · ${elapsed}`;
-    if (engine.state === "exited") return `${stage}: engine exited (code ${engine.exit_code}); processing result`;
-    if (engine.state !== "running") return `${stage}: engine status unavailable`;
-    return `${stage}: ${snapshot.state === "cancelling" ? "stopping" : "running"} · ${elapsed}`;
-}
 function isMatchActive(snapshot) {
     return ["running", "cancelling"].includes(snapshot?.state);
 }
@@ -2655,10 +2826,18 @@ function isScanActive(snapshot) {
 function canCancelMatch(match) {
     return !!match.snapshot?.id && match.snapshot.state === "running" && !match.cancellingId;
 }
+function canQueueMatch(match) {
+    return !match.submitting && !match.scanStarting &&
+        (!isMatchActive(match.snapshot) || (match.snapshot.operation === "match" && match.snapshot.state === "running"));
+}
 function updateMatchControls() {
-    const m = state.match, start = $("match-scan"), cancel = $("match-cancel");
+    const m = state.match, start = $("match-scan"), cancel = $("match-cancel"), submit = $("match-submit");
     if (start) start.disabled = !state.settings || m.scanStarting || isMatchActive(m.snapshot);
-    if (cancel) cancel.disabled = !canCancelMatch(m);
+    if (cancel) {
+        cancel.disabled = !canCancelMatch(m);
+        cancel.textContent = m.snapshot?.operation === "match" ? "Cancel queue" : "Cancel operation";
+    }
+    if (submit) submit.disabled = !canQueueMatch(m);
 }
 function setScanProgress(node, snapshot) {
     node.hidden = !isScanActive(snapshot);
@@ -2674,7 +2853,20 @@ function matchStatusText(snapshot, error, cacheError = "") {
     if (error) return "Status unavailable: " + error + ". Retrying…";
     if (cacheError) return "Saved scan results unavailable: " + cacheError + ". Scan installed content to refresh.";
     if (!snapshot || snapshot.state === "idle") return "No scan or match started.";
-    const status = `${snapshot.state}: ${snapshot.message || ""}`;
+    if (snapshot.operation === "match" && snapshot.games?.length) {
+        const active = snapshot.games.filter(game => trackedGameActive.has(game.state)).length;
+        const queued = snapshot.games.filter(game => game.state === "queued").length;
+        const finished = snapshot.games.length - active - queued;
+        const historyErrors = snapshot.history_errors || [];
+        const historyError = historyErrors.length === 1 ? ` · ${historyErrors[0]}`
+            : historyErrors.length ? ` · ${historyErrors.length} runs could not be saved to match history` : "";
+        if (snapshot.state === "running") {
+            return `${active} active · ${snapshot.parallel_games} parallel limit · ${queued} queued · ${finished} finished${historyError}`;
+        }
+        if (snapshot.state === "cancelling") return `Cancelling queue · ${active} stopping`;
+        return `Test queue ${snapshot.state} · ${finished} resolved${historyError}`;
+    }
+    const status = snapshot.error || `${snapshot.state}: ${snapshot.message || ""}`;
     if (!isScanActive(snapshot)) return status;
     const seconds = Math.floor(snapshot.elapsed_seconds || 0);
     const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
@@ -2682,19 +2874,16 @@ function matchStatusText(snapshot, error, cacheError = "") {
     const maps = progress && snapshot.state === "running" ? ` · ${progress.checked}/${progress.total} maps checked` : "";
     return `${status}${maps} · elapsed ${elapsed}`;
 }
-function setMatchActivity(node, snapshot, error) {
-    node.textContent = matchActivity(snapshot, error);
-    node.classList.toggle("error", !!error || snapshot?.state === "failed" ||
-        (snapshot?.engine?.state === "exited" && snapshot.engine.exit_code !== 0));
-}
 function updateMatchStatus() {
-    const m = state.match, statusBox = $("match-status"), scanProgress = $("scan-progress"), activity = $("match-activity");
-    if (statusBox) statusBox.textContent = matchStatusText(m.snapshot, m.statusError, m.cacheError);
+    const m = state.match, statusBox = $("match-status"), scanProgress = $("scan-progress");
+    if (statusBox) {
+        const status = matchStatusText(m.snapshot, m.statusError, m.cacheError);
+        if (statusBox.textContent !== status) statusBox.textContent = status;
+    }
     if (scanProgress) setScanProgress(scanProgress, m.snapshot);
     updateMatchControls();
-    if (activity) setMatchActivity(activity, m.snapshot, m.statusError);
-    setMatchLogActions($("match-log-actions"), m.snapshot);
-    renderSeriesScoreboard($("series-scoreboard"), m.snapshot?.series || m.snapshot?.result?.series);
+    renderSeriesScoreboard($("series-scoreboard"), m.snapshot?.series_scores);
+    renderMatchTracker($("match-tracker"), m.snapshot);
     updateExperimentStatus();
 }
 let matchPoll = null;
