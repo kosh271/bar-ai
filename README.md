@@ -16,7 +16,7 @@ Unit icons additionally require Pillow:
 python -m pip install -r requirements.txt
 ```
 
-The rest of the app works without it.
+The rest of the app works without it. See [BAR AI Studio MCP](docs/mcp.md) to connect a local MCP client.
 Other users or processes on the same computer may be able to access the local
 server while it is running; close it when finished.
 Git must be installed and available on PATH for project history.
