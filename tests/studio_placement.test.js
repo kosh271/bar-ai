@@ -10,7 +10,7 @@ global.window = {};
 require("../web/studio/config.js");
 const C = window.StudioConfig;
 const studio = readFileSync(join(__dirname, "../web/studio/studio.js"), "utf8");
-const placement = studio.slice(studio.indexOf("const placementGroupNames"), studio.indexOf("function scriptSettings"));
+const placement = studio.slice(studio.indexOf("function placementLaneControl"), studio.indexOf("function drawPlacementPreview"));
 
 function laneControl(rule) {
     const file = {text: `{"building":{"class_land":{"fac_air":${rule}}}}`};
@@ -22,18 +22,15 @@ function laneControl(rule) {
     const panel = element("div");
     let rendered = false;
     const context = {
-        C, file, panel, element, state: {placement: "fac_air"},
+        C, file, panel, element, path,
         parse: current => C.parse(current.text),
-        dropdown: text => ({text}),
-        treeNode: (_file, _node, text) => ({text}),
         button: (text, click) => ({text, click}),
         assign: (current, text) => {current.text = text;},
         render: () => {rendered = true;},
         message: text => {if (text) assert.fail(text);},
     };
-    vm.runInNewContext(`${placement}\nplacementView(panel, file, parse(file));`, context);
-    const controls = panel.items.flatMap(item => item.items || []);
-    return {file, path, controls, didRender: () => rendered};
+    vm.runInNewContext(`${placement}\nplacementLaneControl(panel, file, path);`, context);
+    return {file, path, controls: panel.items, didRender: () => rendered};
 }
 
 test("adds the lane category to the selected rule and preserves its existing categories and comments", () => {

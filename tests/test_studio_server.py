@@ -20,6 +20,7 @@ from app.projects import create_project
 from app.settings import Settings, save_settings
 from app.studio_server import StudioServer
 from app.studio_matches import MatchService
+from app.studio_storage import operation_lease
 
 
 TEST_DIR = Path(__file__).resolve().parent
@@ -90,6 +91,21 @@ class StudioServerTests(unittest.TestCase):
         self.assertEqual(self._request("/api/profile?project=ExampleAI&profile=hard")[0], 200)
         self.assertEqual(self._request("/api/profile?project=ExampleAI&profile=broken")[0], 400)
 
+    def test_experiment_literal_preview_checks_the_saved_profile_and_full_number(self):
+        source = self.projects / "ExampleAI" / "profiles" / "hard" / "script" / "main.as"
+        contents = '\ufeffstring label = "🦎"; const float delay = 150.0f;'.encode()
+        source.write_bytes(contents)
+        payload = {"project": "ExampleAI", "profile": "hard", "path": "script/main.as", "line": 1,
+                   "column": 43, "sha256": hashlib.sha256(contents).hexdigest()}
+        endpoint = "/api/experiment/literal"
+        self.assertEqual(self._request(endpoint, method="POST", body=payload, token=False)[0], 401)
+        status, preview, _ = self._request(endpoint, method="POST", body=payload)
+        self.assertEqual((status, preview), (200, {"column": 41, "length": 6}))
+        source.write_bytes(contents.replace(b"150.0f", b"5.0f"))
+        status, error, _ = self._request(endpoint, method="POST", body=payload)
+        self.assertEqual(status, 400)
+        self.assertIn("Reload the profile", error["error"])
+
     def test_storage_and_paged_history_use_the_same_run_artifacts(self):
         root = self.server.match_service.local_data / "matches"
         for name in ("match-first", "match-second"):
@@ -109,6 +125,54 @@ class StudioServerTests(unittest.TestCase):
         status, history, _ = self._request("/api/match/history?offset=0&limit=1")
         self.assertEqual(status, 200)
         self.assertEqual([entry["run_dir"] for entry in history["history"]], ["match-first"])
+
+    def test_delete_experiment_results_preserves_active_experiments_and_match_artifacts(self):
+        service = self.server.match_service
+        older, current = "1" * 32, "2" * 32
+        for experiment_id in (older, current):
+            workspace = service._experiment_workspace(experiment_id)
+            workspace.mkdir(parents=True)
+            service._save_experiment(workspace, {"id": experiment_id, "state": "completed"}, None)
+        match = service.local_data / "matches" / "match-retained"
+        match.mkdir(parents=True)
+        unrelated = service.local_data / "experiments" / "unrelated"
+        unrelated.mkdir()
+        service._state.update(id=current, operation="experiment", state="running")
+        endpoint = "/api/experiment/delete"
+        self.assertEqual(self._request(endpoint, method="POST", body={"all": True}, token=False)[0], 401)
+        for body in ({"all": True}, {"id": current}, {"id": "../matches"}, {"all": False}):
+            self.assertEqual(self._request(endpoint, method="POST", body=body)[0], 400)
+        self.assertEqual(self._request(endpoint, method="POST", body={"id": older})[:2],
+                         (200, {"removed": 1}))
+        self.assertEqual(self._request("/api/experiment/history?id=" + older)[0], 400)
+        service._state.update(state="completed")
+        with operation_lease(service.root, service.local_data):
+            self.assertEqual(self._request(endpoint, method="POST", body={"all": True})[0], 400)
+        self.assertEqual(self._request(endpoint, method="POST", body={"all": True})[:2],
+                         (200, {"removed": 1}))
+        self.assertEqual(self._request("/api/experiment/history")[:2], (200, {"experiments": []}))
+        self.assertEqual(service.status()["state"], "idle")
+        self.assertTrue(match.is_dir())
+        self.assertTrue(unrelated.is_dir())
+
+    def test_delete_all_experiments_keeps_failed_cleanup_visible_for_retry(self):
+        service = self.server.match_service
+        blocked, other = "3" * 32, "4" * 32
+        for experiment_id in (blocked, other):
+            workspace = service._experiment_workspace(experiment_id)
+            workspace.mkdir(parents=True)
+            service._save_experiment(workspace, {"id": experiment_id, "state": "completed"}, None)
+        sweep = service._experiment_workspace(blocked) / "sweep"
+        sweep.mkdir()
+        with patch("app.studio_matches.rmtree", side_effect=PermissionError("Files are in use.")):
+            status, result, _ = self._request("/api/experiment/delete", method="POST", body={"all": True})
+        self.assertEqual((status, result), (200, {
+            "removed": 1, "failed": [{"id": blocked, "error": "Files are in use."}],
+        }))
+        self.assertEqual([item["id"] for item in service.experiment_history()], [blocked])
+        self.assertEqual(self._request("/api/experiment/delete", method="POST", body={"id": blocked})[:2],
+                         (200, {"removed": 1}))
+        self.assertFalse(sweep.exists())
 
     def test_save_accepts_multiple_files_with_large_json_encoding_overhead(self):
         project = self.projects / "ExampleAI" / "profiles" / "hard"

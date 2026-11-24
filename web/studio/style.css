@@ -41,7 +41,20 @@
 @media(max-width:520px){.grid{grid-template-columns:1fr}.top-actions{flex-wrap:wrap}.heading{align-items:start;flex-direction:column}.side-field{width:100%}.tree-field{align-items:start;flex-direction:column}}
 .deployment-status{margin:14px 0 0;color:var(--mint);font-size:13px}.deployment-status.error{color:#f2d3ae}.selection-none{color:var(--red)}
 .panel .button.primary{background:var(--orange);color:#19212a;border-color:var(--orange);font-weight:700}.opening-field{display:inline-flex;align-items:center;gap:7px;color:var(--muted);font-size:12px}.opening-steps{padding-left:28px}.opening-step{padding:5px 0}.opening-queue{margin-top:16px}.opening-queue .row{align-items:center}
-.chain-card{background:#121b25;border:1px solid #344250;border-radius:9px;padding:15px;margin:12px 0}.chain-step{display:flex;gap:12px;align-items:start;padding:9px 0}.chain-number{display:grid;place-items:center;min-width:26px;height:26px;border-radius:50%;background:#3a312a;color:var(--orange);font-weight:700}.chain-step .grow{flex:1}.placement-preview{display:flex;align-items:center;gap:24px;padding:20px;margin:16px 0;border:1px solid #344250;border-radius:9px;background:#111b24}.placement-shape{width:125px;height:95px;flex-shrink:0;display:grid;place-items:center;border:2px solid #dda769;background:#9c713533;color:#f1c893}.placement-shape.circle{width:95px;border-radius:50%}
+.chain-card{background:#121b25;border:1px solid #344250;border-radius:9px;padding:15px;margin:12px 0}.chain-step{display:flex;gap:12px;align-items:start;padding:9px 0}.chain-number{display:grid;place-items:center;min-width:26px;height:26px;border-radius:50%;background:#3a312a;color:var(--orange);font-weight:700}.chain-step .grow{flex:1}
+.income-formula { color: var(--text); font-weight: 600; }
+.placement-preview { display: flex; flex-wrap: wrap; align-items: center; gap: 20px; padding: 16px; margin: 16px 0; border: 1px solid #344250; border-radius: 9px; background: #111b24; }
+.placement-preview-info { flex: 1 1 230px; min-width: 0; }
+.placement-preview-info p { margin: 7px 0 0; }
+.placement-diagram { position: relative; width: min(190px, 100%); aspect-ratio: 1; background: linear-gradient(#50657935 1px, transparent 1px), linear-gradient(90deg, #50657935 1px, transparent 1px), #14212f; background-size: 12.5% 12.5%; outline: 1px solid #35495c; }
+.placement-footprint, .placement-clearance, .placement-center { position: absolute; }
+.placement-footprint { outline: 2px solid #8fd9c1; outline-offset: -2px; background: #397e706b; }
+.placement-footprint.illustrative { outline-style: dashed; }
+.placement-clearance { outline: 2px solid #dda769; outline-offset: -2px; background: #9c71353d; }
+.placement-clearance.circle { border-radius: 50%; }
+.placement-center { width: 7px; height: 7px; border-radius: 50%; transform: translate(-50%, -50%); background: #f1c893; box-shadow: 0 0 0 2px #14212f; }
+.placement-footprint-label { color: #a2e7ce; }
+.placement-clearance-label, .placement-center-label { color: #f1c893; }
 .script-settings{margin-top:24px;padding-top:20px;border-top:1px solid var(--line)}
 .script-settings .field[hidden]{display:none}
 .layer-order{padding-left:0;list-style:none}.layer-order-item{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}.layer-order-item .grow{flex:1;min-width:180px;overflow-wrap:anywhere}.preview-value{max-width:50%;margin:0;text-align:right}
@@ -149,6 +162,10 @@
     .experiment-map-columns { grid-template-columns: minmax(0, 1fr); }
 }
 .experiment-line { overflow: auto; max-height: 6rem; }
+.experiment-setup[hidden], .experiment-form .field[hidden] { display: none; }
+.literal-token { background: #f7d28f; color: #231904; }
+.literal-column { border-bottom: 2px solid currentColor; font-weight: 700; }
+.experiment-literal-feedback:empty { display: none; }
 #experiment-status:empty { display: none; }
 .live-game-tracker { margin: 16px 0; }
 .live-game-tracker .table-wrap { border: 1px solid var(--line); border-radius: 8px; }
@@ -435,6 +452,7 @@ dialog.viewer #dialog-content{flex:1;min-height:0;display:flex;flex-direction:co
     .logv-body{min-height:64px}
     .logv-option-list{max-height:160px;overflow:auto}
 }
+.distance-value { text-decoration: underline dotted; text-underline-offset: .2em; cursor: help; }
 .control-tooltip {
   position: fixed;
   z-index: 10000;

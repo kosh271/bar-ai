@@ -390,7 +390,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
             "/api/match/start", "/api/match/cancel", "/api/match/cancel-game", "/api/match/replay/copy", "/api/match/parallel",
+            "/api/experiment/literal",
             "/api/experiment/start", "/api/experiment/pause", "/api/experiment/promote", "/api/storage",
+            "/api/experiment/delete",
         }:
             return self._error(404, "Unknown API endpoint.")
         try:
@@ -567,6 +569,14 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     self._string(payload["run_id"], "run_id"), self._string(payload["path"], "path"),
                     selected.bar_root, selected.engine,
                 ))
+            if parsed.path == "/api/experiment/literal":
+                from . import studio_sweeps
+                self._require_fields(payload, ("project", "profile", "path", "line", "column", "sha256"))
+                project = self._project(self._string(payload["project"], "project"))
+                profile = projects._profile_path(project, self._string(payload["profile"], "profile"))
+                return self._json(200, studio_sweeps.preview_literal(
+                    profile, payload["path"], payload["line"], payload["column"], payload["sha256"],
+                ))
             if parsed.path == "/api/experiment/start":
                 fields = ("bar_root", "engine", "game", "maps", "minutes", "game_limit", "seconds_limit", "mode", "players")
                 self._require_fields(payload, fields)
@@ -588,6 +598,14 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                         self._string(payload["id"], "id"), self._string(payload["candidate_id"], "candidate_id"),
                         self._string(payload["name"], "name"),
                     ))
+            if parsed.path == "/api/experiment/delete":
+                if set(payload) == {"all"} and payload["all"] is True:
+                    return self._json(200, self.server.match_service.delete_experiments())
+                if set(payload) == {"id"}:
+                    return self._json(200, self.server.match_service.delete_experiments(
+                        self._string(payload["id"], "id"),
+                    ))
+                raise ValueError("Choose one saved experiment ID or request deletion of all experiment results.")
             if parsed.path == "/api/match/cancel":
                 expected = self._string(payload["id"], "id") if "id" in payload else None
                 return self._json(200, self.server.match_service.cancel(expected))

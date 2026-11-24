@@ -7,6 +7,15 @@ from app import headless, studio_sweeps
 
 
 class SweepLiteralTests(unittest.TestCase):
+    def test_preview_finds_the_same_full_numeric_token_from_each_column(self):
+        content = '\ufeffstring label = "🦎";\r\nfloat delay = 150.0f;\r\n'.encode()
+        token = {"column": 15, "length": 6}
+        for column in range(15, 21):
+            with self.subTest(column=column):
+                self.assertEqual(studio_sweeps.literal_span(content, ".as", 2, column), token)
+                self.assertEqual(studio_sweeps.replace_literal(content, ".as", 2, column, 4),
+                                 content.replace(b"150.0f", b"4.0f"))
+
     def test_jsonc_replaces_literal_without_changing_bom_comments_or_crlf(self):
         raw = '\ufeff{\r\n  "😀": -1.5e-2, // keep 12\r\n  "name": "11",\r\n}\r\n'.encode()
         prefix = '  "😀": '

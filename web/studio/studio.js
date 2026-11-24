@@ -10,7 +10,8 @@ const state = {
     projects: [], projectIssues: [], project: "", profile: "", files: [], page: "overview",
     layer: {}, factory: "", situation: "land", response: "", file: "",
     settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), icons: {available: false, message: "", cache: new Map()}, saving: false, history: [], installStatus: null,
-    experiments: {history: [], historyOffset: 0, historyNext: null, selected: "", error: "", tournament: null},
+    experiments: {history: [], historyOffset: 0, historyNext: null, selected: "", error: "",
+        mode: "tournament", tournament: null, sweep: null, sweepSources: new Map()},
     match: {
         content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "",
         first: "", second: "", faction1: "Armada", faction2: "Cortex",
@@ -55,6 +56,41 @@ function button(text, fn, cls = "action", help = StudioTips.action(text)) {
     return StudioTips.set(b, help);
 }
 function describeControl(control, text) { return StudioTips.set(control, text); }
+function distanceValue(text, elmos) {
+    const value = element("span", "distance-value", text);
+    value.tabIndex = 0;
+    return StudioTips.dynamic(value, () => StudioTips.compareDistance(elmos));
+}
+function distanceCopy(tag, className, text) {
+    const node = element(tag, className);
+    let start = 0;
+    for (const match of text.matchAll(/\b(\d+(?:\.\d+)?)(?=\s+(?:by\s+\d+(?:\.\d+)?\s+)?elmos?\b)/gi)) {
+        node.append(text.slice(start, match.index), distanceValue(match[0], Number(match[0])));
+        start = match.index + match[0].length;
+    }
+    node.append(text.slice(start));
+    return node;
+}
+function distanceFactor(path) {
+    const key = path.join("/");
+    if (key === "porcupine/amount/map" || /^porcupine\/amount\/map\/\d+$/.test(key)) return 512;
+    if (key === "defence/infl_rad") return 256;
+    if (key === "terrain/lake_width_tiles") return 16;
+    if (key === "terrain/areas_merge_altitude") return 2; // Eight altitude units per 16-elmo tile.
+    if (/^building\/class_[^/]+\/[^/]+\/(?:radius|(?:size|yard|offset)(?:\/[01])?)$/.test(key)) return 16;
+    if (key === "economy/cluster_range" || key === "porcupine/point_range" ||
+        /^defence\/(?:base_rad|comm_rad)(?:\/[01])?$/.test(key) ||
+        /^commander\/unit\/[^/]+\/hide\/task_rad(?:\/[01])?$/.test(key) ||
+        /^behaviour\/[^/]+\/(?:range|midposoffset)(?:\/(?:[012]|air|surf|water))?$/.test(key) ||
+        /^build_chain\/[^/]+\/[^/]+\/hub\/\d+\/\d+\/offset(?:\/[^/]+)?$/.test(key)) return 1;
+    return 0;
+}
+function mapSizeComparison({width, height} = {}) {
+    if (!(width > 0 && height > 0)) return "";
+    const across = StudioTips.compareDistance(width);
+    return width === height ? `Width and height. ${across}` :
+        `Width. ${across} Height. ${StudioTips.compareDistance(height)}`;
+}
 function notice(text, warning = false) { return element("div", "notice" + (warning ? " warning" : ""), text); }
 function errorText(error) { return error instanceof Error ? error.message : String(error); }
 function message(text, error = false) {
@@ -67,6 +103,7 @@ async function api(url, data, signal) {
         method: data === undefined ? "GET" : "POST",
         headers: {"X-Workshop-Token": window.WORKSHOP_TOKEN, ...(data === undefined ? {} : {"Content-Type": "application/json"})},
         ...(data === undefined ? {} : {body: JSON.stringify(data)}),
+        ...(url === "/api/preferences" ? {keepalive: true} : {}),
         ...(signal ? {signal} : {})
     });
     const result = await response.json();
@@ -204,6 +241,7 @@ async function refreshState(project, profile) {
         project = data.preferences?.workspace?.project ?? "";
         profile = data.preferences?.workspace?.profile ?? "";
         state.experiments.tournament = data.preferences?.tournament ?? null;
+        state.experiments.sweep = data.preferences?.sweep ?? null;
         const match = data.preferences?.match;
         if (match) {
             const teams = match.rosters?.map(team => team.map(slot => ({
@@ -279,16 +317,16 @@ function showGuide(page, inDepth) {
     const body = element("article", "section-guide");
     if (inDepth) {
         for (const [title, explanation] of guide.detail) {
-            body.append(element("h3", "", title), element("p", "", explanation));
+            body.append(element("h3", "", title), distanceCopy("p", "", explanation));
         }
         const glossary = element("dl");
         for (const [term, definition] of guide.glossary) {
-            glossary.append(element("dt", "", term), element("dd", "", definition));
+            glossary.append(element("dt", "", term), distanceCopy("dd", "", definition));
         }
         body.append(element("h3", "", "Glossary"), glossary);
     } else {
         const steps = element("ol");
-        for (const step of guide.brief) steps.append(element("li", "", step));
+        for (const step of guide.brief) steps.append(distanceCopy("li", "", step));
         body.append(steps);
     }
     showDialog(pages[page][0] + " · " + (inDepth ? "In-depth guide" : "Brief guide"), body);
@@ -464,11 +502,27 @@ function layerPreview(initial, placement = false) {
 function previewNode(node, title, path) {
     title = unitLabel(title);
     const origin = node.source + (node.previous.length ? " · replaces earlier values from " + node.previous.map(item => item.source).join(" → ") : "");
+    function showValue(value, className) {
+        const display = element("pre", className);
+        const numeric = (entry, keys) => {
+            const factor = distanceFactor(keys);
+            return factor && Number.isFinite(entry) ? distanceValue(String(entry), entry * factor) : JSON.stringify(entry);
+        };
+        if (Array.isArray(value) && distanceFactor(path)) {
+            display.append("[");
+            value.forEach((entry, index) => {
+                if (index) display.append(",");
+                display.append(numeric(entry, path.concat(index)));
+            });
+            display.append("]");
+        } else display.append(numeric(value, path));
+        return display;
+    }
     function previousValues() {
         const detail = element("details"), body = element("div", "tree-body");
         detail.append(element("summary", "", "Earlier values"), body);
         for (const item of node.previous) {
-            body.append(element("div", "path", item.source), element("pre", "", JSON.stringify(item.value)));
+            body.append(element("div", "path", item.source), showValue(item.value, ""));
         }
         return detail;
     }
@@ -490,14 +544,18 @@ function previewNode(node, title, path) {
     label.append(element("div", "", title), element("div", "path", path.join(" / ")),
         element("div", "path", "Source: " + origin));
     if (node.previous.length) label.append(previousValues());
-    const value = element("pre", "preview-value", JSON.stringify(node.value));
+    const value = showValue(node.value, "preview-value");
     row.append(label, value); return row;
 }
-function fieldInput(file, node, aria, callback, {preserveNumberText = false, help = ""} = {}) {
-    const input = element("input");
+function fieldInput(file, node, aria, callback, {preserveNumberText = false, help = "", choices} = {}) {
+    const input = element(choices ? "select" : "input");
     input.setAttribute("aria-label", aria);
     const rawNumber = current => preserveNumberText ? file.text.slice(current.start, current.end) : current.value;
-    if (node.kind === "boolean") { input.type = "checkbox"; input.checked = node.value; }
+    if (choices) {
+        const options = choices.some(([value]) => value === node.value) ? choices :
+            [[node.value, `Custom (${node.value})`], ...choices];
+        selectOptions(input, options, node.value);
+    } else if (node.kind === "boolean") { input.type = "checkbox"; input.checked = node.value; }
     else {
         input.type = node.kind === "number" ? "number" : "text";
         if (node.kind === "number") input.step = "any";
@@ -526,7 +584,12 @@ function fieldInput(file, node, aria, callback, {preserveNumberText = false, hel
             else input.value = current.kind === "number" ? rawNumber(current) : current.value;
         }
     });
-    return describeControl(input, help || configValueTip(file, node));
+    describeControl(input, help || configValueTip(file, node));
+    if (node.kind === "number") {
+        const factor = distanceFactor(node.path);
+        if (factor) StudioTips.distance(input, factor);
+    }
+    return input;
 }
 function configValueTip(file, node) {
     const known = {
@@ -563,7 +626,7 @@ function configValueTip(file, node) {
     const format = {boolean: "Turn this setting on or off", number: "Enter a number", string: "Enter text or a game ID"}[node.kind];
     return `${format} for ${name || "the root value"} in this file. For custom settings, check the AI script that reads the value before changing it.`;
 }
-function treeNode(file, node, title, depth = 0, onChange = null, describe = null) {
+function treeNode(file, node, title, depth = 0, onChange = null, describe = null, onInput = null) {
     const info = describe ? describe(node.path, node.value, node.kind) : null;
     if (info && info.label) title = info.label;
     if (node.children) {
@@ -577,7 +640,7 @@ function treeNode(file, node, title, depth = 0, onChange = null, describe = null
                 if (info && info.description) body.append(element("p", "muted", info.description));
                 for (const child of node.children) {
                     const key = String(child.key), label = friendlyUnitName(key) ? unitLabel(key) : key.replace(/_/g, " ");
-                    body.append(treeNode(file, child.node, label, depth + 1, onChange, describe));
+                    body.append(treeNode(file, child.node, label, depth + 1, onChange, describe, onInput));
                 }
             }
         });
@@ -590,7 +653,10 @@ function treeNode(file, node, title, depth = 0, onChange = null, describe = null
     if (node.kind === "null") row.append(label, element("span", "muted", info ? "Not set (game default)" : "null · source view only"));
     else {
         const input = fieldInput(file, node, info && info.label ? info.label : node.path.join(" / "), onChange,
-            {help: [info?.description, info?.valueDescription].filter(Boolean).join(" ")});
+            {help: [info?.description, info?.valueDescription].filter(Boolean).join(" "), choices: info?.choices});
+        if (onInput && node.kind === "number") {
+            input.addEventListener("input", () => onInput(node.path, input.valueAsNumber));
+        }
         const id = "field-" + Math.random().toString(36).slice(2);
         input.id = id; label.htmlFor = id; row.append(label, input);
         if (describe && info && info.valueDescription !== undefined) {
@@ -989,13 +1055,16 @@ function production(target, selected) {
     const fac = C.at(root, ["factory", state.factory]), units = C.at(fac, ["unit"]), group = C.at(fac, [state.situation]);
     const thresholds = C.at(fac, ["income_tier"]);
     if (thresholds?.kind === "array") {
-        panel.append(element("h3", "", "Income thresholds"));
+        panel.append(element("h3", "", "Income thresholds"),
+            element("p", "muted", "In BARb, the factory uses these cutoffs to choose which tier of production weights applies. Tier 0 is the starting tier."),
+            element("p", "income-formula", "Income score = min(average metal income, average energy income) × economy factor"),
+            element("p", "muted", "BARb averages recent income rates per game second, including received metal and BAR's energy overdrive adjustment. The economy factor is 1 in a one-player team and increases by economy.eps_step per additional teammate (0.25 by default). For example, 12 metal/s and 30 energy/s give a score of 12 in a one-player team or 15 with one teammate at the default factor."));
         const inputs = element("div", "row");
         for (const item of thresholds.children) {
             if (item.node.kind !== "number") continue;
-            const label = element("label", "field", `Tier ${item.key + 1}`);
+            const label = element("label", "field", `Minimum score for Tier ${item.key + 1}`);
             label.append(fieldInput(file, item.node, `${state.factory} tier ${item.key + 1} income`, null, {
-                help: "Set the income cutoff for this production tier. A higher cutoff keeps the lower-tier weights in use longer. The AI's income calculation can depend on both metal and energy."
+                help: "Set the minimum income score for these production weights. A higher cutoff requires a stronger economy before this tier can apply."
             })); inputs.append(label);
         }
         panel.append(inputs);
@@ -1254,6 +1323,7 @@ function constructionRulesView(panel) {
         count.type = "number"; count.min = "1"; count.step = "1";
         const [radiusLabel, radius] = textInput("Nearby search radius (elmos)", rule?.radius || 400);
         radius.type = "number"; radius.min = "1"; radius.step = "1";
+        StudioTips.distance(radius);
         radiusLabel.hidden = !nearby;
         const unitChoices = ["", ...knownIds];
         row.append(unitPicker("Completed building", unitChoices, trigger, value => {trigger = value;}),
@@ -1671,6 +1741,7 @@ function defenseActionForm(file, getTrigger, chains = []) {
     const [chanceLabel, chance] = textInput("Chance (%)", "100");
     distance.type = chance.type = "number";
     distance.step = chance.step = "any";
+    StudioTips.distance(distance);
     chance.min = "0"; chance.max = "100";
     const row = element("div", "row");
     if (chains.length) row.append(dropdown("Chain", [["", "As a new chain"], ...chains], chain, value => {chain = value;}));
@@ -1800,6 +1871,7 @@ const placementCategories = {
     terra: "Terrain markers, including reserved factory lanes",
     unknown: "Other or unclassified buildings"
 };
+const placementShapes = [["rectangle", "Rectangle"], ["circle", "Circle"]];
 function placementGroupLabel(key) {
     return placementGroupNames[key] || `Additional building group (${key.replace(/_/g, " ")})`;
 }
@@ -1816,7 +1888,7 @@ function placementValueHelp(field, value) {
     if (field === "radius") return "Use a number, or the game presets \"explosion\" and \"expl_ally\".";
     return "";
 }
-function placementInfo(path, value) {
+function placementInfo(path, value, kind) {
     const parts = path.map(String), buildingIndex = parts.indexOf("building");
     if (parts[0] === "terrain") {
         const terrainDescriptions = {
@@ -1825,7 +1897,7 @@ function placementInfo(path, value) {
             lake_width_tiles: ["Lake width threshold", "Water-area width, measured in map squares, used to distinguish lakes from seas."],
             area_min_tiles: ["Smallest recognized area", "A connected map region must contain at least this many map squares to count as an area."],
             areas_merge_size: ["When map areas join", "A threshold the game uses when deciding whether to combine nearby map areas."],
-            areas_merge_altitude: ["Height difference for joining areas", "A threshold the game uses when combining areas at different heights."]
+            areas_merge_altitude: ["Clearance threshold for joining areas", "The terrain analyzer uses this distance from the nearest edge when deciding whether to join a small area to a larger one."]
         };
         if (parts.length === 1) return {label: "Map terrain rules", description: "These settings help the AI classify land, lakes, and seas; they do not set the space around a building."};
         const info = terrainDescriptions[parts[1]];
@@ -1865,22 +1937,24 @@ function placementInfo(path, value) {
     const field = parts[groupIndex + 1], index = parts[groupIndex + 2];
     const descriptions = {
         type: ["Spacing area and building category", "The first value chooses a box or round area. The second classifies the building so spacing rules can distinguish building types."],
-        offset: ["Position adjustment", "Moves the spacing area relative to the building. The first value shifts left or right; the second shifts toward the building's front or back."],
-        size: ["Building area size", "Sets the width and depth of the building area before extra clearance. If omitted, the game uses the building's own size."],
-        yard: ["Extra clearance", "Adds empty space around the building area. Larger values encourage the AI to leave more room."],
+        offset: ["Position adjustment", "Moves the spacing area while the building stays in place. In the south-facing preview, positive values move it right and toward the front (down)."],
+        size: ["Building area size", "Sets the width and depth of the building area for spacing checks. When omitted, BARb uses each building's own dimensions."],
+        yard: ["Extra clearance", "Adds to the total width and depth of a rectangular spacing area. A width of 4 adds 2 steps on each side when the area is centered. A circle uses its radius instead."],
         radius: ["Round area radius", "Sets the radius of a round spacing area. Use a number of steps or one of the game presets shown below."],
         ignore: ["Building types this rule can be close to", "The AI does not keep this building group apart from the listed types; it may place them close together. If absent, the game uses its default spacing behavior."],
         not_ignore: ["Building types to keep apart", "The AI checks spacing against only these types. Other building types are not considered by this rule."],
         terrain: ["Map terrain settings", "These settings help the AI classify land, lakes, and seas; they do not set the space around a building."]
     };
     if (field === "type" && index !== undefined) {
+        if (index === "0") return {
+            label: "Area shape",
+            description: "Rectangles use the building area plus extra clearance. Circles use the round area radius.",
+            choices: kind === "string" ? placementShapes : undefined,
+            valueDescription: placementShapes.some(([shape]) => shape === value) ? "" : "Custom shape. Check support in the selected AI version."
+        };
         return {
-            label: index === "0" ? "Area shape" : index === "1" ? "Building category" : `Additional type value ${Number(index) + 1}`,
-            description: index === "0"
-                ? "Choose rectangle for a box-shaped area or circle for a round area."
-                : index === "1"
-                    ? "Choose the category used by spacing rules. The value explanation updates as you edit it."
-                    : `Game setting value: ${value}.`,
+            label: index === "1" ? "Building category" : `Additional type value ${Number(index) + 1}`,
+            description: index === "1" ? "Choose the category used by spacing rules." : `Game setting value: ${value}.`,
             valueDescription: placementValueHelp("type", value)
         };
     }
@@ -1892,9 +1966,7 @@ function placementInfo(path, value) {
         };
         return {
             label: labels[field][Number(index)] || `Value ${Number(index) + 1}`,
-            description: field === "offset"
-                ? "Measured in placement steps; direction uses the game's standard orientation."
-                : "Measured in steps; each step represents 16 units of in-game distance."
+            description: "Each step is 16 elmos of in-game distance."
         };
     }
     if ((field === "ignore" || field === "not_ignore") && index !== undefined) {
@@ -1940,6 +2012,70 @@ function placementLaneControl(panel, file, path) {
             } catch (error) { message(errorText(error), true); }
         }));
 }
+function drawPlacementPreview(preview, rule, draftPath, draftValue) {
+    const value = path => draftPath && path.length === draftPath.length && path.every((key, i) => key === draftPath[i])
+        ? draftValue : C.at(rule, path)?.value;
+    const integer = (path, fallback = 0) => {
+        const number = value(path);
+        return Number.isFinite(number) && Math.abs(number) < 2 ** 31 ? Math.trunc(number) : fallback;
+    };
+    const pair = key => [integer([key, 0]), integer([key, 1])];
+    const sizeDefined = Boolean(C.at(rule, ["size"])?.children?.length);
+    const size = sizeDefined ? pair("size").map(value => Math.max(0, value)) : [8, 8];
+    const yard = pair("yard"), [x, z] = pair("offset");
+    const shape = value(["type", 0]), radiusValue = value(["radius"]);
+    const radius = typeof radiusValue === "number" ? integer(["radius"], null) : null;
+    const {building, spacing, halfSpan} = window.StudioEditors.placementGeometry(shape, size, yard, [x, z], radius);
+
+    const diagram = element("div", "placement-diagram");
+    diagram.setAttribute("aria-hidden", "true");
+    const position = number => `${(number + halfSpan) / (2 * halfSpan) * 100}%`;
+    function layer(className, {left, top, width, depth}) {
+        const node = element("div", className);
+        node.style.left = position(left);
+        node.style.top = position(top);
+        node.style.width = `${width / (2 * halfSpan) * 100}%`;
+        node.style.height = `${depth / (2 * halfSpan) * 100}%`;
+        diagram.append(node);
+    }
+    if (spacing) layer(shape === "circle" ? "placement-clearance circle" : "placement-clearance", spacing);
+    layer(sizeDefined ? "placement-footprint" : "placement-footprint illustrative", building);
+    if (shape === "rectangle" || shape === "circle") {
+        const center = element("div", "placement-center");
+        center.style.left = position(x);
+        center.style.top = position(z);
+        diagram.append(center);
+    }
+
+    const info = element("div", "placement-preview-info");
+    const step = value => distanceValue(String(value), value * 16);
+    const dimensions = ([width, depth]) => [step(width), " × ", step(depth), " steps"];
+    info.append(element("h3", "", "Spacing preview"),
+        distanceCopy("p", "muted", "South-facing view. The front of the building points down. Each step is 16 elmos."));
+    const footprint = element("p", "placement-footprint-label", "Building area · ");
+    footprint.append(...(sizeDefined ? dimensions(size) : ["Illustrative size. BARb uses each building's own dimensions."]));
+    info.append(footprint);
+    if (shape === "rectangle") {
+        const clearance = element("p", "placement-clearance-label", "Extra clearance · ");
+        clearance.append(...dimensions(yard), " added");
+        if (spacing) clearance.append(" · ", ...dimensions([spacing.width, spacing.depth]),
+            sizeDefined ? " total" : " total in this illustration");
+        info.append(clearance);
+    } else if (shape === "circle") {
+        const round = element("p", "placement-clearance-label", "Round spacing area · ");
+        if (radius !== null) round.append("Radius ", step(radius), " steps");
+        else round.append(radiusValue === "expl_ally" ? "Radius depends on the explosion area and team size" :
+            "Radius depends on the building's explosion area");
+        info.append(round);
+    } else {
+        info.append(element("p", "muted", "The spacing outline is unavailable for this shape."));
+    }
+    const axis = (value, negative, positive) => value ? [step(Math.abs(value)), " ", value < 0 ? negative : positive] : ["centered"];
+    const center = element("p", "placement-center-label", "Spacing center · ");
+    center.append(...axis(x, "left", "right"), " / ", ...axis(z, "back", "forward"));
+    info.append(center);
+    preview.replaceChildren(diagram, info);
+}
 function placementView(panel, file, root) {
     const classes = C.at(root, ["building", "class_land"]);
     if (!classes || classes.kind !== "object" || !classes.children.length) return;
@@ -1967,26 +2103,22 @@ function placementView(panel, file, root) {
     }
     const preview = element("div", "placement-preview"), laneControl = element("div");
     const rulePath = selected.path;
-    function updatePreview() {
-        const current = C.at(parse(file), rulePath);
-        const type = C.at(current, ["type", 0]), size = C.at(current, ["size"]), yard = C.at(current, ["yard"]);
-        const shape = element("div", type?.value === "circle" ? "placement-shape circle" : "placement-shape",
-            type?.value === "circle" ? "Round area" : "Rectangular area");
-        const info = element("div");
-        const spacing = yard?.children ? yard.children.map(e => e.node.value).join(" × ") : "game default";
-        const footprint = size?.children ? size.children.map(e => e.node.value).join(" × ") : "built-in building size";
-        info.append(element("h3", "", "Spacing preview"),
-            element("p", "muted", "A guide to the configured space, not a map or an exact drawing."),
-            element("p", "muted", `Building area: ${footprint} · Extra clearance: ${spacing}`));
-        preview.replaceChildren(shape, info);
+    function refresh() {
+        drawPlacementPreview(preview, C.at(parse(file), rulePath));
         laneControl.replaceChildren();
         placementLaneControl(laneControl, file, rulePath);
     }
-    updatePreview(); panel.append(preview, laneControl);
-    panel.append(element("p", "muted", "For size, clearance, and radius values, each step represents 16 units of in-game distance. If a value is missing, the game uses its built-in default."));
-    if (selected?.children) for (const item of selected.children) {
-        panel.append(treeNode(file, item.node, item.key.replace(/_/g, " "), 0, updatePreview, placementInfo));
+    function previewInput(path, value) {
+        const relativePath = path.slice(rulePath.length);
+        if (["size", "yard", "offset", "radius"].includes(relativePath[0])) {
+            drawPlacementPreview(preview, C.at(parse(file), rulePath), Number.isFinite(value) ? relativePath : null, value);
+        }
     }
+    refresh(); panel.append(preview, laneControl);
+    if (selected?.children) for (const item of selected.children) {
+        panel.append(treeNode(file, item.node, item.key.replace(/_/g, " "), 0, refresh, placementInfo, previewInput));
+    }
+    return refresh;
 }
 function scriptSettings(panel, path, title, definitions) {
     const section = element("div", "script-settings");
@@ -2065,7 +2197,7 @@ function configPage(target, page, selected) {
         defenseView(panel, file, root);
         constructionRulesView(panel);
     }
-    if (page === "placement") placementView(panel, file, root);
+    const updatePlacement = page === "placement" ? placementView(panel, file, root) : null;
     if (page === "economy") {
         scriptSettings(panel, "script/manager/economy.as", "Economy script thresholds", [
             ["Metal empty: fraction of storage", "aiEconomyMgr\\.isMetalEmpty\\s*=\\s*metal\\.current\\s*<\\s*metal\\.storage\\s*\\*\\s*", "\\s*;", "float", 0, 1],
@@ -2094,7 +2226,7 @@ function configPage(target, page, selected) {
         element("p", "muted", page === "placement"
             ? "The controls above explain land-building spacing. If the file contains water-building rules, they appear below along with settings that help the AI identify lakes and seas."
             : "Open a section to edit its existing values. IDs and unfamiliar fields are shown as written; check your runtime before assuming an effect."));
-    const tree = treeNode(file, root, page === "placement" ? "All placement settings" : "All settings", 0, null,
+    const tree = treeNode(file, root, page === "placement" ? "All placement settings" : "All settings", 0, updatePlacement,
         page === "placement" ? placementInfo : null);
     panel.append(tree, element("div", "source-bar", page === "placement"
         ? "Settings file: building placement rules"
@@ -2362,6 +2494,7 @@ function advanced(target) {
                         else if (item.type === "uint") input.min = "0";
                         if (item.meta?.max !== undefined) input.max = String(item.meta.max);
                         input.value = item.value;
+                        if (/^elmos?$/i.test(item.unit || item.meta?.unit || "")) StudioTips.distance(input);
                     }
                     input.addEventListener("change", () => {
                         try {
@@ -3217,10 +3350,13 @@ function matchView(target) {
             if (!m.side1.length) m.side1 = [{ai: m.first, faction: m.faction1 || "Armada"}];
             if (!m.side2.length) m.side2 = [{ai: m.second, faction: m.faction2 || "Cortex"}];
             const row = element("div", "row");
-            row.append(dropdown("Game", content.games.map(v => [v, v]), m.game, v => matchPreference("game", v)),
-                dropdown("Primary map", content.maps.map(v => [v.name,
+            const mapField = dropdown("Primary map", content.maps.map(v => [v.name,
                     `${v.name} (${v.width && v.height ? `${v.width / 512} × ${v.height / 512}` : "size unknown"})`
-                ]), m.map, v => matchPreference("map", v)));
+                ]), m.map, v => matchPreference("map", v));
+            const mapControl = mapField.querySelector("select");
+            const installedMaps = new Map(content.maps.map(map => [map.name, map]));
+            StudioTips.dynamic(mapControl, () => mapSizeComparison(installedMaps.get(mapControl.value)));
+            row.append(dropdown("Game", content.games.map(v => [v, v]), m.game, v => matchPreference("game", v)), mapField);
             panel.append(row);
 
             const factions = ["Armada", "Cortex", "Legion"].map(v => [v, v]);
@@ -3586,6 +3722,7 @@ async function pollMatch(restart = false) {
                 state.match.cacheKey = "";
                 state.match.scanSettingsKey = "";
             }
+            const previous = state.match.snapshot;
             state.match.snapshot = snapshot;
             if (foundActiveScan && state.page === "match") render();
             else updateMatchStatus();
@@ -3604,7 +3741,10 @@ async function pollMatch(restart = false) {
                 } else if (snapshot.operation === "match") {
                     await loadMatchHistory();
                 } else if (snapshot.operation === "experiment") {
-                    await loadExperimentHistory();
+                    const completed = snapshot.state === "completed" &&
+                        previous?.id === snapshot.id && isMatchActive(previous);
+                    if (completed) state.experiments.selected = snapshot.id;
+                    await loadExperimentHistory(false, completed ? 0 : state.experiments.historyOffset);
                 }
                 if (matchPoll === poll && snapshot.operation === "scan" && ["match", "experiments"].includes(state.page)) render();
                 break;

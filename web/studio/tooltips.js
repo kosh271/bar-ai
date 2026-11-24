@@ -1,6 +1,77 @@
 "use strict";
 
 window.StudioTips = (() => {
+    // [Scale anchor in elmos, reference measurement, reference name].
+    // Unit widths use the BAR collision volumes. Ranges and blast diameters use
+    // the BAR weapon definitions. Map dimensions are installed map scan values.
+    const distanceScale = [
+        [1, 24, "the width of a Grunt"],
+        [5, 20, "the width of a Tick"],
+        [10, 20, "the width of a Tick"],
+        [15, 16, "one building-grid step"],
+        [20, 24, "the width of a Grunt"],
+        [35, 32, "the width of a Sentry"],
+        [55, 52, "the width of an Agitator"],
+        [90, 97, "the width of a Juggernaut"],
+        [145, 145, "an Armada Commander's build range"],
+        [235, 215, "a Grunt's weapon range"],
+        [380, 430, "a Sentry's weapon range"],
+        [615, 620, "an Overwatch's weapon range"],
+        [950, 950, "a Juggernaut's rocket range"],
+        [1100, 1280, "the diameter of an Armada nuke blast"],
+        [1610, 1280, "the diameter of an Armada nuke blast"],
+        [2605, 2100, "an Armada Radar Tower's detection range"],
+        [4215, 4650, "the range of the Basilica long-range plasma cannon"],
+        [6820, 6144, "the height of Comet Catcher Remake"],
+        [11035, 12288, "the height of Supreme Isthmus"],
+        [17855, 16384, "the height of Pit of Azar"],
+    ];
+    const quantities = new Intl.NumberFormat("en", {maximumSignificantDigits: 8});
+    const multiples = new Intl.NumberFormat("en", {maximumSignificantDigits: 2});
+    const liveDescriptions = new WeakMap();
+
+    function compareDistance(elmos) {
+        if (!Number.isFinite(elmos)) return "";
+        const distance = Math.abs(elmos);
+        if (!distance) return "No distance (0 elmos).";
+        const [, reference, name] = distanceScale.find(([anchor], index) => {
+            const next = distanceScale[index + 1]?.[0];
+            return next === undefined || distance <= (anchor + next) / 2;
+        });
+        const ratio = distance / reference;
+        let comparison;
+        if (ratio < 0.2) comparison = `Much smaller than ${name}`;
+        else if (ratio < 0.4) comparison = `Less than half of ${name}`;
+        else if (ratio <= 0.6) comparison = `About half of ${name}`;
+        else if (ratio < 0.82) comparison = `Smaller than ${name}`;
+        else if (ratio <= 1.2) comparison = `About ${name}`;
+        else if (ratio < 1.8) comparison = `Larger than ${name}`;
+        else comparison = `About ${multiples.format(ratio)} times ${name}`;
+        return `${comparison} (${quantities.format(distance)} elmos).`;
+    }
+
+    function description(control) {
+        return [control.dataset.tooltip, liveDescriptions.get(control)?.()].filter(Boolean).join(" ");
+    }
+
+    function refreshDescription(control) {
+        const text = description(control);
+        if (text) control.setAttribute("aria-description", text);
+        else control.removeAttribute("aria-description");
+        return text;
+    }
+
+    function dynamic(control, readDescription) {
+        control.dataset.liveTooltip = "";
+        liveDescriptions.set(control, readDescription);
+        refreshDescription(control);
+        return control;
+    }
+
+    function distance(control, factor = 1) {
+        return dynamic(control, () => compareDistance(control.valueAsNumber * factor));
+    }
+
     const workspace = {
         home: "Reload Studio and open Overview. Save any edits you want to keep before leaving this page.",
         project: "Switch to another AI project. Its profiles and files replace the ones shown in the editor. Studio asks before discarding unsaved edits.",
@@ -90,9 +161,9 @@ window.StudioTips = (() => {
         "Search installed maps": "Filter the available maps by name. The maps you already selected stay in the pool.",
         "Game time limit (minutes)": "Cap each game in simulated minutes. A short cap can leave slow strategies without enough time to win.",
         "Game limit": "Set the maximum number of games in the experiment. A small budget can leave some matchups or swapped-side pairs unfinished.",
-        "Real-time limit (seconds)": "Cap the whole experiment in real seconds. Time spent paused still uses this budget.",
+        "Real-time limit (minutes)": "Cap the whole experiment in wall-clock minutes, rounded to the nearest second. Time spent paused still uses this budget.",
         "Literal line": "Enter the source line containing the number you want to test. The preview shows the line from the saved file.",
-        "Literal column": "Point to a digit in the number on the source line shown below. The first character is column 1, and every space or tab counts as one character.",
+        "Literal column": "Choose a character in the number shown below. The preview marks your column and highlights the full number that each candidate replaces. Counting starts at 1, including spaces and tabs.",
         "Candidate values (2–16)": "Enter 2 to 16 distinct numbers separated by commas. Studio tests temporary variants of one setting against the same opponent.",
         "Source file": "Choose the saved profile file that contains the number you want to vary. Studio tests copies of that file.",
         "Baseline opponent": "Choose the installed opponent every candidate faces. A good result against this profile may differ against other opponents.",
@@ -259,7 +330,7 @@ window.StudioTips = (() => {
         tip.className = "control-tooltip";
         tip.setAttribute("aria-hidden", "true");
         tip.hidden = true;
-        let target, timer, closeTimer;
+        let target, timer, closeTimer, ready = false;
         const removal = new MutationObserver(() => { if (!target?.isConnected) hide(); });
 
         function hide() {
@@ -267,6 +338,7 @@ window.StudioTips = (() => {
             clearTimeout(closeTimer);
             removal.disconnect();
             target = null;
+            ready = false;
             tip.hidden = true;
         }
 
@@ -279,19 +351,31 @@ window.StudioTips = (() => {
             timer = setTimeout(() => {
                 if (!control.isConnected || !control.getClientRects().length) return hide();
                 (control.closest(":popover-open, dialog[open]") || root.body).append(tip);
-                tip.textContent = control.dataset.tooltip;
-                tip.hidden = false;
-                const anchor = control.getBoundingClientRect();
-                const {offsetWidth: width, offsetHeight: height} = tip;
-                const vw = root.documentElement.clientWidth, vh = root.documentElement.clientHeight;
-                tip.style.left = Math.max(8, Math.min(anchor.left, vw - width - 8)) + "px";
-                const top = anchor.bottom + 5 + height <= vh ? anchor.bottom + 5 : anchor.top - height - 5;
-                tip.style.top = Math.max(8, top) + "px";
+                ready = true;
+                render(control);
                 removal.observe(root.body, {childList: true, subtree: true});
             }, 450);
         }
 
-        const described = node => node?.closest?.("[data-tooltip]");
+        function render(control) {
+            tip.textContent = description(control);
+            const anchor = control.getBoundingClientRect();
+            const vw = root.documentElement.clientWidth, vh = root.documentElement.clientHeight;
+            tip.hidden = !tip.textContent || anchor.bottom <= 0 || anchor.top >= vh;
+            if (tip.hidden) return;
+            const {offsetWidth: width, offsetHeight: height} = tip;
+            tip.style.left = Math.max(8, Math.min(anchor.left, vw - width - 8)) + "px";
+            const top = anchor.bottom + 5 + height <= vh ? anchor.bottom + 5 : anchor.top - height - 5;
+            tip.style.top = Math.max(8, top) + "px";
+        }
+
+        for (const name of ["input", "change"]) root.addEventListener(name, event => {
+            if (!liveDescriptions.has(event.target)) return;
+            refreshDescription(event.target);
+            if (event.target === target && ready) render(target);
+        });
+
+        const described = node => node?.closest?.("[data-tooltip], [data-live-tooltip]");
         function pointerControl(node) {
             const control = described(node);
             return control || described(node?.closest?.("label")?.control);
@@ -315,7 +399,11 @@ window.StudioTips = (() => {
         });
         root.addEventListener("focusout", event => { if (event.target === target) hide(); });
         root.addEventListener("pointerdown", hide, true);
-        root.addEventListener("scroll", hide, true);
+        root.addEventListener("scroll", () => {
+            if (target && target === root.activeElement && target.matches(":focus-visible")) {
+                if (ready) render(target);
+            } else hide();
+        }, true);
         root.addEventListener("close", hide, true);
         root.addEventListener("beforetoggle", event => { if (event.newState === "closed") hide(); }, true);
         root.addEventListener("keydown", event => {
@@ -336,7 +424,7 @@ window.StudioTips = (() => {
         attach(root);
     }
 
-    return {set, addDescription, start, field: name => Object.hasOwn(fields, name) ? fields[name] : "",
+    return {set, addDescription, start, compareDistance, distance, dynamic, field: name => Object.hasOwn(fields, name) ? fields[name] : "",
         action: name => Object.hasOwn(actions, name) ? actions[name] : "", summary,
         page: name => navigation[name]};
 })();

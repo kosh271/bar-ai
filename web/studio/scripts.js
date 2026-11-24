@@ -553,7 +553,7 @@ ${constructionEnd}\n`.replace(/\n/g, newline);
             if (key === "min" || key === "max") {
                 const num = Number(val);
                 if (Number.isFinite(num)) meta[key] = num;
-            } else if (["label", "page", "description"].includes(key)) {
+            } else if (["label", "page", "description"].includes(key) || (key === "unit" && /^elmos?$/i.test(val))) {
                 meta[key] = val;
             }
         }

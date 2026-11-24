@@ -151,8 +151,8 @@ def _preference_ai(player: object) -> bool:
 
 
 def _studio_preferences(value: object) -> dict:
-    if not isinstance(value, dict) or not value or value.keys() - {"workspace", "match", "tournament"}:
-        raise SettingsError("Supply workspace, match, or tournament preferences.")
+    if not isinstance(value, dict) or not value or value.keys() - {"workspace", "match", "tournament", "sweep"}:
+        raise SettingsError("Supply workspace, match, tournament, or sweep preferences.")
     if "workspace" in value:
         workspace = value["workspace"]
         if (not isinstance(workspace, dict) or workspace.keys() != {"project", "profile"}
@@ -183,25 +183,39 @@ def _studio_preferences(value: object) -> dict:
                                and _preference_ai(slot["ai"]) and slot["faction"] in FACTIONS
                                for team in rosters for slot in team)):
                 raise SettingsError("Invalid Studio roster selection.")
-    if "tournament" in value:
-        draft = value["tournament"]
-        fields = {"game", "maps", "players", "minutes", "game_limit", "seconds_limit"}
-        if (not isinstance(draft, dict) or not fields <= draft.keys() <= fields | {"start_options"}
+    for mode in ("tournament", "sweep"):
+        if mode not in value:
+            continue
+        draft = value[mode]
+        fields = {"game", "maps", "minutes", "game_limit", "seconds_limit"}
+        fields |= {"players"} if mode == "tournament" else {"baseline", "values"}
+        if (not isinstance(draft, dict)
+                or not fields <= draft.keys() <= fields | {"start_options", "seed", "game_selected"}
                 or not _preference_text(draft["game"])
+                or ("game_selected" in draft and type(draft["game_selected"]) is not bool)
+                or ("seed" in draft and draft["seed"] is not None
+                    and (type(draft["seed"]) is not int or not 0 <= draft["seed"] < 2**32))
                 or not all(type(draft[key]) is int and 1 <= draft[key] <= limit for key, limit in
                            (("minutes", 2147483647 // 1800), ("game_limit", 100), ("seconds_limit", 21600)))):
-            raise SettingsError("Invalid Studio tournament preferences.")
+            raise SettingsError(f"Invalid Studio {mode} preferences.")
         if "start_options" in draft:
             validate_start_options(draft["start_options"])
-        maps, players = draft["maps"], draft["players"]
+        maps = draft["maps"]
         if (not isinstance(maps, list) or len(maps) > 32 or not all(map(_preference_text, maps))
-                or len(set(maps)) != len(maps)
-                or not isinstance(players, list) or len(players) > 16
+                or len(set(maps)) != len(maps)):
+            raise SettingsError(f"Invalid Studio {mode} map selection.")
+        if mode == "sweep":
+            if (not _preference_ai(draft["baseline"]) or not isinstance(draft["values"], str)
+                    or len(draft["values"]) > 512):
+                raise SettingsError("Invalid Studio sweep opponent or candidate values.")
+            continue
+        players = draft["players"]
+        if (not isinstance(players, list) or len(players) > 16
                 or not all(isinstance(player, dict) and player.keys() == {"ai", "faction"}
                            and _preference_ai(player["ai"]) and player["faction"] in TOURNAMENT_FACTIONS
                            for player in players)
                 or len({tuple(player["ai"]) for player in players}) != len(players)):
-            raise SettingsError("Invalid Studio tournament map or profile selection.")
+            raise SettingsError("Invalid Studio tournament profile selection.")
     return value
 
 

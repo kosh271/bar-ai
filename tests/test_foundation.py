@@ -19,6 +19,17 @@ TEST_DIR = Path(__file__).resolve().parent
 
 
 class StudioPreferenceTests(unittest.TestCase):
+    def test_sweep_draft_persists_map_pool_and_rejects_invalid_maps(self):
+        with tempfile.TemporaryDirectory(dir=TEST_DIR) as temporary:
+            path = Path(temporary) / "studio-preferences.json"
+            sweep = {"game": "BAR", "maps": ["Map v1", "Map v2"], "minutes": 30,
+                     "game_limit": 10, "seconds_limit": 71, "baseline": ["OtherAI", "stable", ""],
+                     "values": "2, 4", "seed": 0}
+            save_studio_preferences(path, {"sweep": sweep})
+            with self.assertRaises(SettingsError):
+                save_studio_preferences(path, {"sweep": {**sweep, "maps": ["Map v1", "Map v1"]}})
+            self.assertEqual(load_studio_preferences(path), {"sweep": sweep})
+
     def test_preferences_merge_and_reject_invalid_replacements(self):
         with tempfile.TemporaryDirectory(dir=TEST_DIR) as temporary:
             path = Path(temporary) / "studio-preferences.json"

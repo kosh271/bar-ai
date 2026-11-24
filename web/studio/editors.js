@@ -15,6 +15,20 @@ window.StudioEditors = (() => {
         return percent.format(share / 100);
     }
 
+    function placementGeometry(shape, size, yard, [x, z], radius) {
+        function bounds(width, depth, centerX = 0, centerZ = 0) {
+            return {left: centerX - Math.trunc(width / 2), top: centerZ - Math.trunc(depth / 2), width, depth};
+        }
+        const building = bounds(...size);
+        let spacing = null;
+        if (shape === "rectangle") spacing = bounds(size[0] + yard[0], size[1] + yard[1], x, z);
+        if (shape === "circle" && radius !== null) spacing = bounds(radius * 2, radius * 2, x, z);
+        if (spacing && (spacing.width <= 0 || spacing.depth <= 0)) spacing = null;
+        const halfSpan = Math.max(24, Math.abs(x) + 3, Math.abs(z) + 3, ...[building, spacing].filter(Boolean)
+            .flatMap(({left, top, width, depth}) => [-left + 3, -top + 3, left + width + 3, top + depth + 3]));
+        return {building, spacing, halfSpan};
+    }
+
     function filterUnits(entries, query, faction, role) {
         const search = query.trim().toLowerCase();
         return entries.filter(entry => (!faction || entry.faction === faction) && (!role || entry.role === role) &&
@@ -199,5 +213,5 @@ window.StudioEditors = (() => {
         return visible;
     }
 
-    return {weightShares, weightPercent, filterUnits, unitSearchInput, draggableBuildOrder, compareFiles, lineDiff};
+    return {weightShares, weightPercent, placementGeometry, filterUnits, unitSearchInput, draggableBuildOrder, compareFiles, lineDiff};
 })();

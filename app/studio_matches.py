@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
-from shutil import copyfileobj
+from shutil import copyfileobj, rmtree
 from typing import Callable
 
 from . import discovery, headless, installation, project_history, settings, studio_experiments, studio_storage
@@ -1433,6 +1433,56 @@ class MatchService:
             experiment["pause_requested"] = paused
             self._experiment_changed.notify_all()
         return self.status()
+
+    def delete_experiments(self, experiment_id: str | None = None) -> dict:
+        directory = self.local_data / "experiments"
+        installation._check_links(self.root, directory)
+        with self._lock, ExitStack() as stack:
+            current = self._state["id"] if self._state["operation"] == "experiment" else None
+            busy = self._state["state"] in ("running", "cancelling")
+            active = current if busy else None
+            if active is not None and experiment_id in (None, active):
+                raise headless.MatchError("Wait for the current experiment to finish before deleting its results.")
+            if not busy:
+                # Exclude an experiment started in another Studio process using this workspace.
+                stack.enter_context(studio_storage.operation_lease(self.root, self.local_data))
+            stack.enter_context(self._history_lock)
+            if experiment_id is None:
+                ids = [workspace.name for workspace in directory.iterdir()
+                       if re.fullmatch(r"[0-9a-f]{32}", workspace.name) and not installation._link(workspace)
+                       ] if directory.is_dir() else []
+            else:
+                ids = [experiment_id]
+            removed = 0
+            failed = []
+            for saved_id in ids:
+                if self._read_experiment(saved_id) is None:
+                    if experiment_id is not None:
+                        raise headless.MatchError("The saved experiment is unavailable.")
+                    continue
+                workspace = self._experiment_workspace(saved_id)
+                record = workspace / "experiment.json"
+                try:
+                    # Keep the history record until all other files are gone so cleanup can be retried.
+                    for child in workspace.iterdir():
+                        if child == record:
+                            continue
+                        if not installation._link(child) and child.is_dir():
+                            rmtree(child)
+                        else:
+                            child.unlink()
+                    record.unlink()
+                except OSError as error:
+                    failed.append({"id": saved_id, "error": str(error)})
+                    continue
+                try:
+                    workspace.rmdir()
+                except OSError:
+                    pass  # An empty directory can remain if another process still has it open.
+                removed += 1
+                if saved_id == current:
+                    self._state = self._empty_state()
+        return {"removed": removed, **({"failed": failed} if failed else {})}
 
     def _experiment_games(self, schedule: list, deadline: float, play: Callable):
         """Yield finished games while keeping eligible tournament slots occupied."""

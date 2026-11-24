@@ -42,6 +42,7 @@ class _Literal:
     text: str
     start: int
     end: int
+    column: int
     script: bool
     adjacent_operator: bool
 
@@ -99,7 +100,8 @@ def _literal(raw: bytes, suffix: str, line: int, column: int) -> _Literal:
             if start <= offset < end:
                 if unary_sign and previous_end != token.start():
                     raise headless.MatchError("Select a script number with its unary sign attached.")
-                return _Literal(text, start, end, script, start > 0 and text[start - 1] in "+-")
+                return _Literal(text, start, end, start - line_start + 1, script,
+                                start > 0 and text[start - 1] in "+-")
         if start > offset:
             break
         if token.lastgroup != "ignored":
@@ -111,6 +113,12 @@ def _literal(raw: bytes, suffix: str, line: int, column: int) -> _Literal:
 def replace_literal(raw: bytes, suffix: str, line: int, column: int, value: int | float) -> bytes:
     """Replace a decimal literal at a one-based line and Unicode column."""
     return _literal(raw, suffix, line, column).write(value)
+
+
+def literal_span(raw: bytes, suffix: str, line: int, column: int) -> dict[str, int]:
+    """Return the one-based column and length of the whole selected token."""
+    literal = _literal(raw, suffix, line, column)
+    return {"column": literal.column, "length": literal.end - literal.start}
 
 
 @dataclass(frozen=True)
@@ -146,6 +154,16 @@ def _path(name: str) -> tuple[str, ...]:
     if len(parts) < 2 or Path(parts[-1]).suffix.lower() != {"config": ".json", "script": ".as"}.get(parts[0]):
         raise headless.MatchError("Select a profile configuration or script file.")
     return parts
+
+
+def preview_literal(profile: Path, path: str, line: int, column: int, sha256: str) -> dict[str, int]:
+    parts = _path(path)
+    with headless.open_artifact(profile, *parts) as source:
+        raw = source.read(projects.MAX_WORKSPACE_FILE_BYTES + 1)
+    projects.check_workspace_size(len(raw), len(raw), 1)
+    if hashlib.sha256(raw).hexdigest() != sha256:
+        raise headless.MatchError("The saved source changed. Reload the profile before selecting a number.")
+    return literal_span(raw, Path(parts[-1]).suffix.lower(), line, column)
 
 
 def _regular_files(root: Path, should_stop: Callable[[], bool]) -> Iterator[tuple[str, ...]]:
@@ -243,6 +261,8 @@ def prepare(
             raise headless.MatchError("The source profile changed while it was being read. Retry the sweep.")
         if path not in files:
             raise headless.MatchError("The selected file is absent from the saved source profile.")
+        if "sha256" in sweep and hashlib.sha256(files[path]).hexdigest() != sweep["sha256"]:
+            raise headless.MatchError("The saved source changed. Reload the profile before starting the sweep.")
         literal = _literal(files[path], Path(path).suffix.lower(), line, column)
         patched_values = [literal.write(value) for value in values]
         headless.artifact_stat(workspace.parent, directory=True)
