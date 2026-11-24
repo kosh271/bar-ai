@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 from typing import Callable
 
+from . import profile_text
+from .control_help import control_help
 from .game_sources import GameSource, GameSourceError, list_game_sources, stock_directory
-from .installation import InstallationError, install, remove
+from .installation import InstallationError, install, list_managed, remove, remove_installed
 from .projects import (
     ProjectError,
     clone_profile,
@@ -25,28 +25,52 @@ from .projects import (
 from .settings import EditorState, SettingsError, load_editor_state, save_editor_state
 
 
-class SourceDialog(simpledialog.Dialog):
+class _ChoiceDialog(simpledialog.Dialog):
+    dialog_title: str
+    choice_label: str
+    choice_help: str
+    choice_error: str
     def __init__(self, parent: tk.Misc, choices: tuple[str, ...], current: str) -> None:
         self.choices = choices
         self.current = current
         self.selected: str | None = None
-        super().__init__(parent, title="Change hard-profile source")
+        super().__init__(parent, title=self.dialog_title)
 
     def body(self, master: tk.Misc) -> ttk.Combobox:
-        ttk.Label(master, text="Installed game version:").pack(anchor="w")
+        ttk.Label(master, text=self.choice_label).pack(anchor="w")
         self.choice = tk.StringVar(value=self.current)
-        combo = ttk.Combobox(master, textvariable=self.choice, values=self.choices, state="readonly", width=65)
+        combo = control_help(
+            ttk.Combobox(master, textvariable=self.choice, values=self.choices, state="readonly", width=65),
+            self.choice_help,
+        )
         combo.pack(fill="x", pady=(6, 0))
         return combo
 
     def validate(self) -> bool:
         if self.choice.get() not in self.choices:
-            messagebox.showerror("Hard-profile source", "Select an installed game version.", parent=self)
+            messagebox.showerror(self.dialog_title, self.choice_error, parent=self)
             return False
         return True
 
     def apply(self) -> None:
         self.selected = self.choice.get()
+
+
+class SourceDialog(_ChoiceDialog):
+    dialog_title = "Change hard-profile source"
+    choice_label = "Installed game version:"
+    choice_help = (
+        "Choose the installed release that supplies the Hard profile. "
+        "This affects which files new projects and profiles start with."
+    )
+    choice_error = "Select an installed game version."
+
+
+class ManagedInstallDialog(_ChoiceDialog):
+    dialog_title = "Managed BAR installations"
+    choice_label = "Installed AI and engine:"
+    choice_help = "Choose which installed AI copy to remove, including copies from deleted projects."
+    choice_error = "Select an installed AI and engine."
 
 
 class ProjectEditor(ttk.Frame):
@@ -72,8 +96,11 @@ class ProjectEditor(ttk.Frame):
         self.project: Path | None = None
         self.profile: Path | None = None
         self.current_file: Path | None = None
+        self.file_bytes = b""
         self.files: list[Path] = []
         self.status = tk.StringVar(value="Create or select an AI project.")
+        self.workspace_issues = tk.StringVar()
+        self.project_issues: list[dict[str, str]] = []
         self._build_ui()
         self._refresh_projects()
         self._restore_selection()
@@ -88,25 +115,56 @@ class ProjectEditor(ttk.Frame):
         controls.columnconfigure(1, weight=1)
         controls.columnconfigure(5, weight=1)
         ttk.Label(controls, text="AI:").grid(row=0, column=0, padx=(0, 4))
-        self.project_box = ttk.Combobox(controls, textvariable=self.project_label, state="readonly")
+        self.project_box = control_help(
+            ttk.Combobox(controls, textvariable=self.project_label, state="readonly"),
+            "Choose the AI project to edit. Its profiles replace the ones currently listed.",
+        )
         self.project_box.grid(row=0, column=1, sticky="ew")
         self.project_box.bind("<<ComboboxSelected>>", self._project_selected)
-        ttk.Button(controls, text="New AI", command=self.new_project).grid(row=0, column=2, padx=5)
-        ttk.Button(controls, text="Delete AI", command=self.delete_project).grid(row=0, column=3, padx=(0, 5))
+        control_help(
+            ttk.Button(controls, text="New AI", command=self.new_project),
+            "Create an editable AI project from the Hard profile in the selected game version.",
+        ).grid(row=0, column=2, padx=5)
+        control_help(
+            ttk.Button(controls, text="Delete AI", command=self.delete_project),
+            "Permanently delete this editable project and all of its profiles after confirmation.",
+        ).grid(row=0, column=3, padx=(0, 5))
         ttk.Label(controls, text="Profile:").grid(row=0, column=4, sticky="e", padx=4)
-        self.profile_box = ttk.Combobox(controls, textvariable=self.profile_label, state="readonly")
+        self.profile_box = control_help(
+            ttk.Combobox(controls, textvariable=self.profile_label, state="readonly"),
+            "Choose the set of AI settings to edit. Save any file changes you want to keep before switching.",
+        )
         self.profile_box.grid(row=0, column=5, sticky="ew")
         self.profile_box.bind("<<ComboboxSelected>>", self._profile_selected)
-        ttk.Button(controls, text="New from hard", command=self.new_hard_profile).grid(row=0, column=6, padx=5)
-        ttk.Button(controls, text="Clone profile", command=self.new_clone).grid(row=0, column=7)
-        ttk.Button(controls, text="Delete profile", command=self.delete_profile).grid(row=0, column=8)
-        ttk.Button(controls, text="Install / update AI", command=self.install_ai).grid(
+        control_help(
+            ttk.Button(controls, text="New from hard", command=self.new_hard_profile),
+            "Add a fresh copy of the selected game's Hard profile to this project.",
+        ).grid(row=0, column=6, padx=5)
+        control_help(
+            ttk.Button(controls, text="Clone profile", command=self.new_clone),
+            "Copy the saved profile so you can try changes separately.",
+        ).grid(row=0, column=7)
+        control_help(
+            ttk.Button(controls, text="Delete profile", command=self.delete_profile),
+            "Permanently delete this editable profile after confirmation. Install the project again to update BAR's profile list.",
+        ).grid(row=0, column=8)
+        control_help(
+            ttk.Button(controls, text="Install / update AI", command=self.install_ai),
+            "Copy this saved AI to the selected engine. Restart BAR afterward to refresh its AI list.",
+        ).grid(
             row=1, column=1, sticky="w", pady=(8, 0)
         )
-        ttk.Button(controls, text="Remove installed AI", command=self.remove_ai).grid(
+        control_help(
+            ttk.Button(controls, text="Remove installed AI", command=self.remove_ai),
+            "Remove the installed AI from the selected engine. The editable project stays in the editor.",
+        ).grid(
             row=1, column=4, sticky="w", pady=(8, 0)
         )
         ttk.Label(controls, text="Close BAR first.").grid(row=1, column=5, columnspan=2, pady=(8, 0))
+        control_help(
+            ttk.Button(controls, text="Managed installs…", command=self.manage_installed_ais),
+            "Find editor-managed AI copies in every engine, even if the editable project has been deleted.",
+        ).grid(row=1, column=7, columnspan=2, sticky="e", pady=(8, 0))
 
         source_row = ttk.Frame(frame)
         source_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -119,7 +177,10 @@ class ProjectEditor(ttk.Frame):
             source_row, textvariable=self.source_display, wraplength=600, style=self.source_display_style
         )
         self.source_display_label.grid(row=0, column=1, sticky="w")
-        ttk.Button(source_row, text="Change...", command=self.change_source).grid(row=0, column=2, padx=(6, 0))
+        control_help(
+            ttk.Button(source_row, text="Change...", command=self.change_source),
+            "Choose the installed game used as the source for new copies of the Hard profile.",
+        ).grid(row=0, column=2, padx=(6, 0))
         ttk.Label(source_row, textvariable=self.source_status, wraplength=800).grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(4, 0)
         )
@@ -128,9 +189,15 @@ class ProjectEditor(ttk.Frame):
         file_frame.grid(row=3, column=0, sticky="nsew", padx=(0, 8))
         file_frame.rowconfigure(0, weight=1)
         file_frame.columnconfigure(0, weight=1)
-        self.file_list = tk.Listbox(file_frame, width=34, exportselection=False)
+        self.file_list = control_help(
+            tk.Listbox(file_frame, width=34, exportselection=False),
+            "Choose a settings or script file from the current profile. The editor displays one file at a time.",
+        )
         self.file_list.grid(row=0, column=0, sticky="nsew")
-        file_scrollbar = ttk.Scrollbar(file_frame, orient="vertical", command=self.file_list.yview)
+        file_scrollbar = control_help(
+            ttk.Scrollbar(file_frame, orient="vertical", command=self.file_list.yview),
+            "Scroll the profile file list.",
+        )
         file_scrollbar.grid(row=0, column=1, sticky="ns")
         self.file_list.configure(yscrollcommand=file_scrollbar.set)
         self.file_list.bind(
@@ -141,16 +208,31 @@ class ProjectEditor(ttk.Frame):
         editor_frame.grid(row=3, column=1, sticky="nsew")
         editor_frame.rowconfigure(0, weight=1)
         editor_frame.columnconfigure(0, weight=1)
-        self.text = tk.Text(editor_frame, undo=True, wrap="none", state="disabled", height=16)
+        self.text = control_help(
+            tk.Text(editor_frame, undo=True, wrap="none", state="disabled", height=16),
+            "Edit the selected file directly. Save this file before switching files or installing the AI.",
+        )
         self.text.grid(row=0, column=0, sticky="nsew")
-        vertical = ttk.Scrollbar(editor_frame, orient="vertical", command=self.text.yview)
+        vertical = control_help(
+            ttk.Scrollbar(editor_frame, orient="vertical", command=self.text.yview),
+            "Scroll up or down through the source file.",
+        )
         vertical.grid(row=0, column=1, sticky="ns")
-        horizontal = ttk.Scrollbar(editor_frame, orient="horizontal", command=self.text.xview)
+        horizontal = control_help(
+            ttk.Scrollbar(editor_frame, orient="horizontal", command=self.text.xview),
+            "Scroll sideways to read long source lines.",
+        )
         horizontal.grid(row=1, column=0, sticky="ew")
         self.text.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        ttk.Button(frame, text="Save file", command=self.save_file).grid(row=4, column=1, sticky="e", pady=(8, 0))
+        control_help(
+            ttk.Button(frame, text="Save file", command=self.save_file),
+            "Write this file to the editable profile. Install the AI afterward if you want BAR to run the change.",
+        ).grid(row=4, column=1, sticky="e", pady=(8, 0))
         ttk.Label(frame, textvariable=self.status, wraplength=800).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(frame, textvariable=self.workspace_issues, wraplength=800).grid(
+            row=6, column=0, columnspan=2, sticky="w"
         )
 
     def set_installation(self, data: Path | None, unpacked: Path | None) -> None:
@@ -268,17 +350,21 @@ class ProjectEditor(ttk.Frame):
 
     def _clear_file(self) -> None:
         self.current_file = None
+        self.file_bytes = b""
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.edit_modified(False)
         self.text.configure(state="disabled")
 
     def _refresh_projects(self, select: str = "") -> None:
+        issues: list[dict[str, str]] = []
         try:
-            projects = list_projects(self.projects_root)
+            projects = list_projects(self.projects_root, issues=issues)
         except (ProjectError, OSError) as error:
             self._show_error(error)
             return
+        self.project_issues = issues
+        self._show_workspace_issues(issues)
         self.project_choices = {f"{name} ({key})": key for key, name in projects}
         self.project_box["values"] = tuple(self.project_choices)
         for label, key in self.project_choices.items():
@@ -287,13 +373,21 @@ class ProjectEditor(ttk.Frame):
                 self._load_project(key)
                 break
 
+    def _show_workspace_issues(self, issues: list[dict[str, str]]) -> None:
+        self.workspace_issues.set("\n".join(
+            f"{issue['project']}/{issue['profile']}: {issue['message']}"
+            if "profile" in issue else f"{issue['project']}: {issue['message']}" for issue in issues
+        ))
+
     def _load_project(self, key: str) -> bool:
         project = self.projects_root / key
+        issues = self.project_issues.copy()
         try:
-            profiles = list_profiles(project)
+            profiles = list_profiles(project, issues=issues)
         except (ProjectError, OSError) as error:
             self._show_error(error)
             return False
+        self._show_workspace_issues(issues)
         self.project = project
         self.profile = None
         self.profile_label.set("")
@@ -374,8 +468,9 @@ class ProjectEditor(ttk.Frame):
                 self.file_list.selection_set(index)
             return False
         try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
+            raw = profile_text.read(path)
+            text = profile_text.normalized_newlines(raw.decode("utf-8"))
+        except (OSError, UnicodeError, ProjectError) as error:
             self._show_error(error)
             self.file_list.selection_clear(0, "end")
             if self.current_file is not None:
@@ -383,6 +478,7 @@ class ProjectEditor(ttk.Frame):
                 self.file_list.selection_set(index)
             return False
         self.current_file = path
+        self.file_bytes = raw
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.insert("1.0", text)
@@ -455,28 +551,17 @@ class ProjectEditor(ttk.Frame):
         self.status.set(f"Created profile {name.strip()}.")
 
     def save_file(self) -> None:
-        if self.current_file is None:
+        if self.current_file is None or self.profile is None:
             self._show_error(ProjectError("Select a file first."))
             return
-        temporary: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", newline="", dir=self.current_file.parent,
-                delete=False, suffix=".tmp",
-            ) as output:
-                temporary = output.name
-                output.write(self.text.get("1.0", "end-1c"))
-            os.replace(temporary, self.current_file)
-            temporary = None
-        except (OSError, UnicodeError) as error:
+            edited = self.text.get("1.0", "end-1c")
+            encoded = profile_text.restore_newlines(self.file_bytes.decode("utf-8"), edited).encode("utf-8")
+            profile_text.replace(self.profile, [(self.current_file, profile_text.digest(self.file_bytes), encoded)])
+        except (OSError, UnicodeError, ProjectError) as error:
             self._show_error(error)
             return
-        finally:
-            if temporary is not None:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
+        self.file_bytes = encoded
         self.text.edit_modified(False)
         self.status.set(f"Saved {self.current_file.name}")
 
@@ -516,6 +601,33 @@ class ProjectEditor(ttk.Frame):
             return
         try:
             target = remove(*selection, self._confirm_deployment)
+        except (InstallationError, OSError, UnicodeError) as error:
+            self._show_error(error)
+            return
+        self.status.set(f"Removed {target}. Restart BAR to refresh the AI list.")
+
+    def manage_installed_ais(self) -> None:
+        if self.data is None:
+            self._show_error(InstallationError("Inspect a BAR installation first."))
+            return
+        try:
+            engines = tuple(sorted(path.name for path in (self.data / "engine").iterdir() if path.is_dir()))
+            installations, issues = list_managed(self.data, engines)
+            if issues:
+                messagebox.showwarning(ManagedInstallDialog.dialog_title, "\n".join(issues),
+                                       parent=self.winfo_toplevel())
+            if not installations:
+                self.status.set("There are no editor-managed installations in this BAR folder.")
+                return
+            choices = {f"{entry['name']} ({entry['project']}) · {entry['engine']}": entry
+                       for entry in installations}
+            dialog = ManagedInstallDialog(self.winfo_toplevel(), tuple(choices), next(iter(choices)))
+            selected = choices.get(dialog.selected)
+            if selected is None or not self._confirm_deployment(
+                f"Remove {selected['name']} from {selected['engine']}?\n\n{selected['path']}"
+            ):
+                return
+            target = remove_installed(selected["project"], self.data, selected["engine"], self._confirm_deployment)
         except (InstallationError, OSError, UnicodeError) as error:
             self._show_error(error)
             return

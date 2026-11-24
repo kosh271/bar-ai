@@ -23,7 +23,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import (
-    discovery, game_sources, installation, profile_exchange, project_archive, project_history, projects, unit_icons,
+    discovery, game_sources, installation, profile_exchange, profile_text, project_archive, project_history,
+    projects, unit_icons,
 )
 from .headless import MatchError
 from .settings import (Settings, SettingsError, load_settings, load_studio_preferences, save_settings,
@@ -35,7 +36,13 @@ PROJECTS_ROOT = APP_ROOT / "projects"
 SETTINGS_PATH = APP_ROOT / "data" / "settings.json"
 STUDIO_ROOT = APP_ROOT / "web" / "studio"
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
-MAX_FILES_PER_SAVE = 1000
+# JSON escape sequences can occupy six bytes per decoded byte. Leave room for
+# each file's path, digest, and JSON fields as well as the profile envelope.
+MAX_SAVE_REQUEST_BYTES = (
+    6 * projects.MAX_WORKSPACE_BYTES
+    + (6 * projects.MAX_WORKSPACE_PATH + 256) * projects.MAX_WORKSPACE_ENTRIES
+    + 4096
+)
 CLIENT_HEARTBEAT_TIMEOUT = 120
 CLIENT_SHUTDOWN_DELAY = 5
 
@@ -142,13 +149,11 @@ class StudioServer(ThreadingHTTPServer):
         with self._client_lock:
             self._cancel_timer_locked("_client_expiry_timer")
             self._cancel_timer_locked("_shutdown_timer")
-        if self.match_service.is_busy("experiment"):
-            try:
-                self.match_service.cancel()
-            except MatchError:
-                # The experiment may have finished before cancellation acquired its lock.
-                pass
-        super().server_close()
+        try:
+            if not self.match_service.shutdown():
+                print("Studio engine workers did not finish before the shutdown deadline.", file=sys.stderr)
+        finally:
+            super().server_close()
 
     def handle_error(self, request: object, client_address: object) -> None:
         error = sys.exc_info()[1]
@@ -177,8 +182,10 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/state" and not parsed.query:
                 try:
                     default_bar_root = discovery.default_root()
+                    issues: list[dict[str, str]] = []
                     return self._json(200, {
-                        "projects": self._state_projects(),
+                        "projects": self._state_projects(issues),
+                        "project_issues": issues,
                         "settings": self._settings(),
                         "preferences": load_studio_preferences(self._preferences_path()),
                         "game_capacity": self.server.match_service.capacity(),
@@ -208,9 +215,19 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/experiment/history":
                 try:
                     if parsed.query:
-                        query = self._query_fields(parsed.query, "id")
-                        return self._json(200, {"experiment": self.server.match_service.experiment_details(query["id"])})
+                        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+                        if set(query) == {"id"} and len(query["id"]) == 1:
+                            return self._json(200, {"experiment": self.server.match_service.experiment_details(query["id"][0])})
+                        offset, limit = self._page_values(query)
+                        return self._json(200, self.server.match_service.experiment_history_page(offset=offset, limit=limit))
                     return self._json(200, {"experiments": self.server.match_service.experiment_history()})
+                except Exception as error:
+                    return self._handle_error(error)
+            if parsed.path == "/api/storage":
+                try:
+                    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+                    offset, limit = self._page_values(query)
+                    return self._json(200, self.server.match_service.storage(offset=offset, limit=limit))
                 except Exception as error:
                     return self._handle_error(error)
             if parsed.path == "/api/match/history":
@@ -219,7 +236,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                         urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
                         if parsed.query else {}
                     )
-                    allowed = {"project", "profile", "map", "checkpoint", "limit"}
+                    allowed = {"project", "profile", "map", "checkpoint", "limit", "offset"}
                     if not set(query) <= allowed or any(len(values) != 1 for values in query.values()):
                         raise ValueError("Unsupported or duplicate history query parameter.")
                     limit = 100
@@ -228,13 +245,17 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                         if not raw_limit.isdecimal():
                             raise ValueError("limit must be a positive integer.")
                         limit = int(raw_limit)
-                    return self._json(200, {"history": self.server.match_service.history(
+                    paging = {}
+                    if "offset" in query:
+                        paging = {"offset": self._page_values({"offset": query["offset"]})[0]}
+                    result = self.server.match_service.history(
                         project=query["project"][0] or None if "project" in query else None,
                         profile=query["profile"][0] or None if "profile" in query else None,
                         map_name=query["map"][0] or None if "map" in query else None,
                         checkpoint=query["checkpoint"][0] or None if "checkpoint" in query else None,
-                        limit=limit,
-                    )})
+                        limit=limit, **paging,
+                    )
+                    return self._json(200, result if paging else {"history": result})
                 except Exception as error:
                     return self._handle_error(error)
             if parsed.path == "/api/install-status":
@@ -273,10 +294,12 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
                     if set(query) != {"project", "profile"} or any(len(values) != 1 for values in query.values()):
                         raise ValueError("project and profile query values are required exactly once.")
-                    return self._json(200, {"files": self._profile({
-                        "project": query["project"][0],
-                        "profile": query["profile"][0],
-                    })})
+                    with self.server.write_lock:
+                        files = self._profile({
+                            "project": query["project"][0],
+                            "profile": query["profile"][0],
+                        })
+                    return self._json(200, {"files": files})
                 except Exception as error:
                     return self._handle_error(error)
             if parsed.path in {"/api/project/export", "/api/profile/export"}:
@@ -363,16 +386,26 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             "/api/project/manage", "/api/project/import",
             "/api/profile/merge-preview", "/api/profile/merge",
             "/api/preferences",
-            "/api/install", "/api/remove", "/api/settings", "/api/match/cache", "/api/match/scan",
+            "/api/install", "/api/remove", "/api/installations/managed", "/api/settings",
+            "/api/match/cache", "/api/match/scan",
             "/api/catalog/start", "/api/catalog/cancel",
             "/api/match/start", "/api/match/cancel", "/api/match/cancel-game", "/api/match/replay/copy", "/api/match/parallel",
-            "/api/experiment/start", "/api/experiment/pause", "/api/experiment/promote",
+            "/api/experiment/start", "/api/experiment/pause", "/api/experiment/promote", "/api/storage",
         }:
             return self._error(404, "Unknown API endpoint.")
         try:
             if parsed.path == "/api/project/import":
                 return self._json(200, self._import_project())
-            payload = self._read_json(allow_empty=parsed.path == "/api/match/cancel")
+            payload = self._read_json(
+                allow_empty=parsed.path == "/api/match/cancel",
+                limit=MAX_SAVE_REQUEST_BYTES if parsed.path == "/api/save" else MAX_REQUEST_BYTES,
+            )
+            if parsed.path == "/api/storage":
+                if payload.get("action") == "pin" and set(payload) == {"action", "id", "pinned"}:
+                    return self._json(200, self.server.match_service.pin_run(payload["id"], payload["pinned"]))
+                if payload.get("action") == "cleanup" and set(payload) == {"action", "ids"}:
+                    return self._json(200, self.server.match_service.cleanup_runs(payload["ids"]))
+                raise ValueError("Choose a valid artifact storage action.")
             if parsed.path in {"/api/client/heartbeat", "/api/client/close"}:
                 self._require_fields(payload, ("client_id",))
                 client_id = self._string(payload["client_id"], "client_id")
@@ -452,12 +485,21 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     return self._json(200, self._create_project(payload))
             if parsed.path == "/api/inspect":
                 return self._json(200, self._inspect(payload))
+            if parsed.path == "/api/installations/managed":
+                self._require_fields(payload, ("bar_root",))
+                root = Path(self._string(payload["bar_root"], "bar_root")).expanduser()
+                with self.server.write_lock:
+                    found = discovery.discover(root)
+                    entries, issues = installation.list_managed(found.data, found.engines)
+                return self._json(200, {"installations": entries, "issues": issues})
             if parsed.path in {"/api/install", "/api/remove"}:
                 with self.server.write_lock:
                     if self.server.match_service.is_busy("experiment"):
                         raise MatchError("Wait for the experiment to finish before changing installed AIs.")
                     if self.server.match_service.is_busy("match"):
                         raise MatchError("Wait for the test queue to finish before changing installed AIs.")
+                    if self.server.match_service.is_busy("scan"):
+                        raise MatchError("Wait for the installed-content scan to finish before changing installed AIs.")
                     change = self._install if parsed.path == "/api/install" else self._remove
                     return self._json(200, change(payload))
             if parsed.path == "/api/match/cache":
@@ -468,10 +510,11 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 )})
             if parsed.path == "/api/match/scan":
                 self._require_fields(payload, ("bar_root", "engine"))
-                return self._json(200, self.server.match_service.scan(
-                    self._string(payload["bar_root"], "bar_root"),
-                    self._string(payload["engine"], "engine"),
-                ))
+                with self.server.write_lock:
+                    return self._json(200, self.server.match_service.scan(
+                        self._string(payload["bar_root"], "bar_root"),
+                        self._string(payload["engine"], "engine"),
+                    ))
             if parsed.path == "/api/catalog/start":
                 self._require_fields(payload, ("bar_root", "engine", "game"))
                 return self._json(200, self.server.match_service.catalog(
@@ -502,7 +545,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                         payload["minutes"],
                         payload["skip_smoke"],
                         series=payload.get("series"), record_demo=record_demo, extra_units=extra_units,
-                        parallel_games=payload.get("parallel_games"),
+                        parallel_games=payload.get("parallel_games"), start_options=payload.get("start_options"),
                     ))
             if parsed.path == "/api/match/cancel-game":
                 self._require_fields(payload, ("id", "game_index"))
@@ -530,7 +573,8 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 with self.server.write_lock:
                     return self._json(200, self.server.match_service.start_experiment(
                         *(payload[field] for field in fields), sweep=payload.get("sweep"),
-                        parallel_games=payload.get("parallel_games"),
+                        parallel_games=payload.get("parallel_games"), start_options=payload.get("start_options"),
+                        **({"seed": payload["seed"]} if "seed" in payload else {}),
                     ))
             if parsed.path == "/api/experiment/pause":
                 self._require_fields(payload, ("id", "paused"))
@@ -621,8 +665,8 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         supplied = self.headers.get("X-Workshop-Token", "")
         return bool(supplied) and hmac.compare_digest(supplied, self.server.session_token)
 
-    def _read_json(self, *, allow_empty: bool = False) -> dict[str, Any]:
-        length = self._body_length(MAX_REQUEST_BYTES, allow_empty=allow_empty)
+    def _read_json(self, *, allow_empty: bool = False, limit: int = MAX_REQUEST_BYTES) -> dict[str, Any]:
+        length = self._body_length(limit, allow_empty=allow_empty)
         body = self.rfile.read(length)
         if len(body) != length:
             raise ValueError("Incomplete request body.")
@@ -671,16 +715,26 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             return str(error)
         return None
 
-    def _state_projects(self) -> list[dict[str, Any]]:
+    def _state_projects(self, issues: list[dict[str, str]] | None = None) -> list[dict[str, Any]]:
         result = []
+        if issues is None:
+            issues = []
+        root = self.server.projects_root
         with self.server.write_lock:
-            for key, name in projects.list_projects(self.server.projects_root):
-                project = self._project(key)
-                profiles = projects.list_profiles(project)
+            for key, name in projects.list_projects(root, issues=issues):
+                project = root / key
+                try:
+                    default = projects.project_metadata(project)["default_profile"]
+                    profiles = projects.list_profiles(project, issues=issues)
+                    if default not in dict(profiles):
+                        issues.append({"project": key, "profile": default, "message": "Default profile is unavailable."})
+                except (projects.ProjectError, OSError) as error:
+                    issues.append({"project": key, "message": str(error)})
+                    continue
                 result.append({
                     "key": key,
                     "name": name,
-                    "default_profile": projects.project_metadata(project)["default_profile"],
+                    "default_profile": default,
                     "history_error": self._initialize_history(project),
                     "profiles": [{"key": profile_key, "name": profile_name}
                                  for profile_key, profile_name in profiles],
@@ -702,6 +756,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         source = self._project(self._string(payload["project"], "project"))
         name = self._string(payload["name"], "name").strip()
         key = projects._key(name, project=True)
+        projects.validate_deploy_name(key)
         root = self.server.projects_root
         if _is_link(root):
             raise ValueError("Projects directory cannot be a link.")
@@ -789,11 +844,11 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         self._require_fields(payload, ("project", "action"))
         project = self._project(self._string(payload["project"], "project"))
         action = self._string(payload["action"], "action")
-        self._check_project_tree(project)
         profile = ""
         if action in ("delete_project", "delete_profile") and payload.get("confirm") is not True:
             raise ValueError("Confirm the deletion before proceeding.")
         if action == "delete_project":
+            self._check_project_tree(project)
             projects.delete_project(self.server.projects_root, project.name)
             return {"project": "", "profile": ""}
         if action == "rename_project":
@@ -818,6 +873,13 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         else:
             raise ValueError("Unknown project management action.")
         return {"project": project.name, "profile": profile}
+
+    @staticmethod
+    def _page_values(query: dict[str, list[str]]) -> tuple[int, int]:
+        if (not set(query) <= {"offset", "limit"}
+                or any(len(values) != 1 or not re.fullmatch(r"[0-9]{1,10}", values[0]) for values in query.values())):
+            raise ValueError("Provide a nonnegative offset and a positive page limit.")
+        return int(query.get("offset", ["0"])[0]), int(query.get("limit", ["25"])[0])
 
     @staticmethod
     def _query_fields(query: str, *fields: str) -> dict[str, str]:
@@ -895,39 +957,29 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             raise projects.ProjectError(str(error)) from error
 
     def _project(self, key: str) -> Path:
-        if not key.isascii() or not all(char.isalnum() for char in key) or not key:
-            raise ValueError("Invalid project key.")
         if _is_link(self.server.projects_root):
             raise ValueError("Projects directory cannot be a link.")
-        root = self.server.projects_root.resolve()
-        project = root / key
-        if self._path_has_link(root, project) or not project.is_dir():
-            raise ValueError("Project not found.")
-        if not project.resolve().is_relative_to(root):
-            raise ValueError("Project path is outside the projects directory.")
-        available = dict(projects.list_projects(root))
-        if key not in available:
-            raise ValueError("Project not found.")
-        return project
+        return projects.project_path(self.server.projects_root.resolve(), key)
 
     def _profile(self, payload: dict[str, Any]) -> list[dict[str, str]]:
         self._require_fields(payload, ("project", "profile"))
         project_dir = self._project(self._string(payload["project"], "project"))
         profile_key = self._string(payload["profile"], "profile")
-        available = dict(projects.list_profiles(project_dir))
-        if profile_key not in available or not profile_key.isascii() or not all(
-            char.isalnum() or char in "-_" for char in profile_key
-        ):
-            raise ValueError("Profile not found.")
-        profile = project_dir / "profiles" / profile_key
-        if self._path_has_link(project_dir, profile):
-            raise ValueError("Profile paths cannot contain links.")
+        profile = projects._profile_path(project_dir, profile_key)
         result = []
-        for relative in projects.profile_files(profile):
+        files = projects.profile_files(profile)
+        total = (profile / "profile.json").stat().st_size
+        count = len(files) + 1
+        projects.check_workspace_size(total, total, count)
+        for relative in files:
             path = profile / relative
             if self._path_has_link(profile, path):
                 raise ValueError("Profile files cannot be links.")
-            raw = path.read_bytes()
+            size = path.stat().st_size
+            projects.check_workspace_size(size, total + size, count)
+            raw = profile_text.read(path)
+            total += len(raw)
+            projects.check_workspace_size(len(raw), total, count)
             text = raw.decode("utf-8")
             result.append({
                 "path": relative.as_posix(),
@@ -940,25 +992,24 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         self._require_fields(payload, ("project", "profile", "files"))
         project_dir = self._project(self._string(payload["project"], "project"))
         profile_key = self._string(payload["profile"], "profile")
-        profile = project_dir / "profiles" / profile_key
-        if profile_key not in dict(projects.list_profiles(project_dir)) or self._path_has_link(project_dir, profile):
-            raise ValueError("Profile not found.")
+        profile = projects._profile_path(project_dir, profile_key)
         submitted = payload["files"]
-        if not isinstance(submitted, list) or not submitted or len(submitted) > MAX_FILES_PER_SAVE:
-            raise ValueError("files must be a non-empty list of at most 1000 files.")
+        if not isinstance(submitted, list) or not submitted or len(submitted) > projects.MAX_WORKSPACE_ENTRIES:
+            raise ValueError(f"files must be a non-empty list of at most {projects.MAX_WORKSPACE_ENTRIES} files.")
 
-        known = {path.as_posix() for path in projects.profile_files(profile)}
-        validated: list[tuple[str, Path, str, str, bytes, bytes]] = []
+        known = {path.as_posix(): profile / path for path in projects.profile_files(profile)}
+        edits: list[tuple[Path, str, bytes]] = []
         seen: set[str] = set()
+        edited_size = (profile / "profile.json").stat().st_size
+        count = len(known) + 1
+        projects.check_workspace_size(edited_size, edited_size, count)
         for entry in submitted:
             if not isinstance(entry, dict) or not all(field in entry for field in ("path", "text", "sha256")):
                 raise ValueError("Each file must include path, text, and sha256.")
             relative_name = self._string(entry["path"], "file path")
-            relative = PurePosixPath(relative_name)
-            if (relative.is_absolute() or "\\" in relative_name or ":" in relative_name
-                    or any(part in ("", ".", "..") for part in relative.parts)
-                    or relative_name not in known):
+            if relative_name not in known:
                 raise ValueError("Only existing profile files may be saved.")
+            projects.workspace_path_parts(relative_name)
             identity = relative_name.casefold()
             if identity in seen:
                 raise ValueError("Duplicate file paths are not allowed.")
@@ -967,74 +1018,20 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             expected_hash = entry["sha256"]
             if not isinstance(text, str) or not isinstance(expected_hash, str) or not re_full_sha256(expected_hash):
                 raise ValueError("File text and a valid sha256 value are required.")
-            path = profile.joinpath(*relative.parts)
-            if self._path_has_link(profile, path) or not path.is_file():
-                raise ValueError("Profile files cannot be links or missing.")
-            original = path.read_bytes()
-            if not hmac.compare_digest(hashlib.sha256(original).hexdigest(), expected_hash.lower()):
-                raise ValueError(f"File changed outside the editor: {relative_name}")
             try:
                 new_bytes = text.encode("utf-8", errors="strict")
             except UnicodeError as error:
                 raise ValueError(f"File is not valid UTF-8 text: {relative_name}") from error
-            validated.append((relative_name, path, text, expected_hash.lower(), original, new_bytes))
-
-        staged: list[tuple[Path, Path, bytes, int]] = []
-        try:
-            for name, path, _text, _expected_hash, original, new_bytes in validated:
-                if hashlib.sha256(path.read_bytes()).hexdigest() != _expected_hash:
-                    raise ValueError(f"File changed outside the editor: {name}")
-                temporary = path.with_name(f".{path.name}.studio-{secrets.token_hex(8)}.tmp")
-                mode = path.stat().st_mode
-                staged.append((temporary, path, original, mode))
-                with temporary.open("xb") as output:
-                    output.write(new_bytes)
-                    output.flush()
-                    os.fsync(output.fileno())
-            for _temporary, path, _original, _mode in staged:
-                if self._path_has_link(profile, path) or not path.is_file():
-                    raise ValueError("Profile files cannot be links or missing.")
-                item = next(item for item in validated if item[1] == path)
-                name, expected_hash = item[0], item[3]
-                if hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
-                    raise ValueError(f"File changed outside the editor: {name}")
-            replaced: list[tuple[Path, bytes, int]] = []
-            try:
-                for temporary, path, original, mode in staged:
-                    if self._path_has_link(profile, path) or not path.is_file():
-                        raise ValueError("Profile files cannot be links or missing.")
-                    item = next(item for item in validated if item[1] == path)
-                    if hashlib.sha256(path.read_bytes()).hexdigest() != item[3]:
-                        raise ValueError(f"File changed outside the editor: {item[0]}")
-                    os.chmod(temporary, mode)
-                    os.replace(temporary, path)
-                    replaced.append((path, original, mode))
-            except (OSError, ValueError) as error:
-                rollback_error: OSError | None = None
-                for path, original, mode in reversed(replaced):
-                    backup = path.with_name(f".{path.name}.studio-rollback-{secrets.token_hex(8)}.tmp")
-                    try:
-                        with backup.open("xb") as output:
-                            output.write(original)
-                            output.flush()
-                            os.fsync(output.fileno())
-                        os.chmod(backup, mode)
-                        os.replace(backup, path)
-                    except OSError as failure:
-                        rollback_error = failure
-                        try:
-                            backup.unlink()
-                        except OSError:
-                            pass
-                if rollback_error:
-                    raise OSError(f"Save failed ({error}); rollback failed ({rollback_error}).") from error
-                raise
-        finally:
-            for temporary, _path, _original, _mode in staged:
-                try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
+            edited_size += len(new_bytes)
+            projects.check_workspace_size(len(new_bytes), edited_size, count)
+            edits.append((known[relative_name], expected_hash.lower(), new_bytes))
+        edited_paths = {path for path, _revision, _text in edits}
+        for path in known.values():
+            if path not in edited_paths:
+                size = path.stat().st_size
+                edited_size += size
+                projects.check_workspace_size(size, edited_size, count)
+        profile_text.replace(profile, edits)
         return self._profile({"project": payload["project"], "profile": profile_key})
 
     def _inspect(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1087,7 +1084,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             cache_updated = self.server.match_service.sync_installed_ai(
                 bar_root, engine, short_name, installation.VERSION, name, profiles,
             )
-        except (MatchError, SettingsError):
+        except (MatchError, SettingsError, installation.InstallationError):
             cache_updated = False
         return {
             "path": str(result.path),
@@ -1128,11 +1125,11 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 "message": str(error),
             }
 
-    def _remove(self, payload: dict[str, Any]) -> dict[str, str]:
+    def _remove(self, payload: dict[str, Any]) -> dict[str, Any]:
         if "confirm" in payload:
             raise ValueError("The confirm boolean is no longer supported; send confirmations.")
         self._require_fields(payload, ("project", "bar_root", "engine", "confirmations"))
-        project_dir = self._project(self._string(payload["project"], "project"))
+        short_name = self._string(payload["project"], "project")
         bar_root = Path(self._string(payload["bar_root"], "bar_root")).expanduser()
         engine = self._string(payload["engine"], "engine")
         confirmations = payload["confirmations"]
@@ -1150,10 +1147,16 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             return True
 
         try:
-            target = installation.remove(project_dir, found.data, engine, confirm)
+            target = installation.remove_installed(short_name, found.data, engine, confirm)
         except ConfirmationRequired as challenge:
             return {"confirmation": challenge.message}
-        return {"path": str(target), "project": project_dir.name, "engine": engine}
+        try:
+            cache_updated = self.server.match_service.sync_removed_ai(
+                bar_root, engine, short_name, installation.VERSION,
+            )
+        except (MatchError, SettingsError, installation.InstallationError):
+            cache_updated = False
+        return {"path": str(target), "project": short_name, "engine": engine, "cache_updated": cache_updated}
 
     def _unit_icon_catalog_game(self) -> str:
         try:

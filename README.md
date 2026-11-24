@@ -8,8 +8,9 @@ python -m app
 ```
 
 The app opens a browser and prints its local URL. It binds only to localhost
-and stops automatically after the last open Studio tab closes; press Ctrl+C to
-stop it manually. No web service is required. Unit icons additionally require Pillow:
+and stops automatically when all Studio tabs are closed and the current operation
+finishes. Press Ctrl+C to stop it manually. No web service is required.
+Unit icons additionally require Pillow:
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -39,6 +40,9 @@ download them.
    AI list. **Test match** scans installed content and can run a smoke test
    followed by a headless match.
 
+**Managed installations** lists deployed copies across engines under the saved
+BAR installation. You can remove copies left behind by deleted projects.
+
 The defense and placement walkthroughs use a BARbarIAn Hard profile.
 
 - [Shield Advanced Fusion Reactors](docs/fusion-shields.md)
@@ -50,13 +54,34 @@ For air production and interception, see [fighter sweeps](docs/fighter-swarms.md
 [bomber waves](docs/bomber-swarms.md), [fighter quick-reaction forces](docs/fighter-reserve.md),
 and [late-game bomber reserves](docs/bomber-qrf.md).
 
-During a test, the indicator beside **Start match** shows the current stage
-and its elapsed real time. Running status is checked against the engine process;
+Choose **Queue match** or **Queue N-game series**. The status below the scan
+controls reports queued and active games, and the tracker shows game progress.
+Running status is checked against the engine process;
 an exited engine or an unavailable status connection is reported instead.
 Process liveness alone does not prove that the simulation is making progress.
 Installed-content scan results are saved per BAR installation and engine and
 restored when Studio opens. They can be stale after changing the installation
 or updating games, maps or AIs; use **Refresh installed content** to rescan.
+
+Under **Starting conditions**, set the starting metal and energy and toggle
+**Starter base** and **Base Builder Turret** independently. **Apply Quickstart
+defaults** sets 2,000 metal and 5,000 energy and enables both options. BAR
+deducts up to 800 metal and 400 energy to fund the starter base. Test match and
+round-robin tournament drafts remember their own starting conditions. Parameter
+sweeps also have separate starting conditions. The selected settings apply to
+the smoke test and every game in the run. The results show the recorded settings.
+
+Tournaments schedule the same map and factions on both starting sides before
+moving to the next pairing. Results show how much of the full schedule ran,
+the seed used to resolve random factions, and the exact planned games. A sweep
+variant needs at least two clean, decided pairs and a paired score above 50%
+to qualify for promotion. Draws count as half a point. Saved results include
+engine and installed AI fingerprints and the game and map checksums reported
+by the engine when available.
+
+Under **Artifact storage** below Match history, review disk use or select
+unprotected runs for cleanup. Pin any run whose artifacts you want to keep.
+Studio protects replays automatically and pauses cleanup during active operations.
 
 Studio automatically initializes a local Git repository and baseline for each
 project when the workspace loads. **Project history** lists checkpoints and
@@ -228,8 +253,25 @@ a game that does not confirm the scheduled command within two minutes is
 stopped and reported as an error. An unconfirmed engine exit is reported as
 unknown, not a win. Engine diagnostics are reported alongside the result.
 
-Run the test suite from this directory:
+## Testing
+
+Run the Python tests from this directory:
 
 ```powershell
 python -m unittest discover -s tests
+```
+
+Run the Studio JavaScript tests with Node.js 22 or later:
+
+```powershell
+node --test 'tests/*.test.js'
+```
+
+The optional Chromium suite loads Studio with fixture data for keyboard
+interaction, the live status poll, and profile saves:
+
+```powershell
+npm install --no-save --no-package-lock playwright@1.61.1
+npx playwright install chromium
+node --test tests/studio.browser.cjs
 ```

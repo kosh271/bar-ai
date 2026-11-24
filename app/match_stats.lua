@@ -13,6 +13,8 @@ local fields = {
     "unitsProduced", "unitsKilled", "unitsDied",
 }
 
+local gameOver = false
+
 local function report(frame, logTotals)
     if frame <= 0 then
         return
@@ -48,15 +50,22 @@ local function report(frame, logTotals)
 end
 
 function widget:GameFrame(frame)
-    if frame % 450 == 1 then
+    if not gameOver and frame % 450 == 1 then
         report(frame, frame > 1 and frame % 900 == 1)
     end
 end
 
 function widget:GameOver()
-    report(Spring.GetGameFrame(), true)
+    if not gameOver then
+        gameOver = true
+        local frame = Spring.GetGameFrame()
+        Spring.Echo("Studio match GameOver frame: " .. frame)
+        report(frame, true)
+    end
 end
 
 function widget:Shutdown()
-    report(Spring.GetGameFrame(), true)
+    if not gameOver then
+        report(Spring.GetGameFrame(), true)
+    end
 end

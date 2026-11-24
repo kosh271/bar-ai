@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
-from .settings import _content_valid
+from .settings import SettingsError, _content_valid, validate_start_options
 
 
 class MatchError(Exception):
@@ -31,6 +31,7 @@ UDP_RECEIVE_SIZE = 65535
 SMOKE_MINUTES = 2
 SMOKE_TIMEOUT = 600
 GAME_OVER_GRACE = 30
+CHILD_STOP_WAIT = 3
 _ARCHIVE_CACHE_LOCK = threading.Lock()
 
 
@@ -52,6 +53,65 @@ class MatchProgress:
     message: str = ""
     run_id: str | None = None
     live: dict | None = None
+    terminal: MatchTerminal | None = None
+
+
+@dataclass(frozen=True)
+class MatchTerminal:
+    cause: Literal["game_over", "simulated_limit", "failed", "cancelled"]
+    finished_at: float
+    winning_sides: tuple[int, ...] | None = None
+
+
+class ProcessStop(threading.Event):
+    """Track the native child owned by a cancellable Studio operation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.process: subprocess.Popen | None = None
+
+    def kill_child(self) -> None:
+        process = self.process
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                if process.poll() is None:
+                    raise
+
+
+def _launch_child(stop: threading.Event, *args, **kwargs) -> subprocess.Popen:
+    process = subprocess.Popen(*args, **kwargs)
+    if isinstance(stop, ProcessStop):
+        stop.process = process
+    return process
+
+
+def _stop_child(process: subprocess.Popen | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=CHILD_STOP_WAIT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=CHILD_STOP_WAIT)
+    except OSError:
+        if process.poll() is None:
+            raise
+
+
+def _release_child(stop: threading.Event, process: subprocess.Popen | None) -> None:
+    if isinstance(stop, ProcessStop) and process is not None and process.poll() is not None:
+        stop.process = None
+
+
+def _write_result(run: Path, metadata: dict, summary: str) -> str:
+    try:
+        (run / "result.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    except OSError as error:
+        return f"{summary}\nCould not save result metadata: {error}"
+    return summary
 
 
 def artifact_stat(base: Path, *parts: str, directory: bool = False) -> os.stat_result:
@@ -171,8 +231,10 @@ def _content_query(
     process: subprocess.Popen | None = None
     try:
         with (write / "scan-output.txt").open("w", encoding="utf-8") as log:
-            process = subprocess.Popen(
-                command, cwd=Path(__file__).resolve().parent.parent,
+            if stop.is_set():
+                raise MatchError(f"{label} cancelled.")
+            process = _launch_child(
+                stop, command, cwd=Path(__file__).resolve().parent.parent,
                 stdout=log, stderr=subprocess.STDOUT,
             )
             started = time.monotonic()
@@ -187,9 +249,8 @@ def _content_query(
     except (OSError, subprocess.SubprocessError) as error:
         raise MatchError(f"Cannot run {label.lower()}: {error}") from error
     finally:
-        if process is not None and process.poll() is None:
-            process.terminate()
-            process.wait(timeout=10)
+        _stop_child(process)
+        _release_child(stop, process)
     if code or not output.is_file():
         details = (write / "scan-output.txt").read_text(encoding="utf-8", errors="replace")
         raise MatchError(f"{label} failed (exit {code}):\n{details[-3000:]}")
@@ -221,7 +282,7 @@ def _section(name: str, values: dict[str, str | int | dict]) -> str:
 
 
 def build_script(map_name: str, game: str, players: list[Player], minutes: int, record_demo: bool = False, *,
-                 extra_units: bool = False) -> str:
+                 extra_units: bool = False, start_options: dict | None = None) -> str:
     if type(record_demo) is not bool:
         raise MatchError("record_demo must be a boolean.")
     if type(extra_units) is not bool:
@@ -255,6 +316,17 @@ def build_script(map_name: str, game: str, players: list[Player], minutes: int, 
     }
     if extra_units:
         options["experimentalextraunits"] = 1
+    if start_options is not None:
+        try:
+            validate_start_options(start_options)
+        except SettingsError as error:
+            raise MatchError(str(error)) from error
+        options.update({
+            "startmetal": start_options["starting_metal"],
+            "startenergy": start_options["starting_energy"],
+            "quick_start": "enabled" if start_options["starter_base"] else "disabled",
+            "commanderbuildersenabled": "enabled" if start_options["build_turret"] else "disabled",
+        })
     lines.append(_section("MODOPTIONS", options))
     return "\n".join([*lines, "}", ""])
 
@@ -370,7 +442,24 @@ def diagnostic_category(line: str) -> str:
     return "engine_error" if _errors(message) else "other"
 
 
+_ARCHIVE_CHECKSUMS = re.compile(
+    r"^(?:\[t=[^\]\r\n]+\][ \t]*)?\[f=-\d+\][ \t]+\[PreGame::StartServer\][ \t]*\r?\n"
+    r"[ \t]*mod-checksum=([0-9a-f]{8,128})[ \t]*\r?\n"
+    r"[ \t]*map-checksum=([0-9a-f]{8,128})[ \t]*\r?$", re.IGNORECASE | re.MULTILINE,
+)
+
+
+def archive_checksums(log: str) -> dict[str, str]:
+    """Read the checksums of the archives this engine actually opened."""
+    match = _ARCHIVE_CHECKSUMS.search(log)
+    if match is None:
+        return {}
+    return {key: digest.lower() for key, digest in zip(("game", "map"), match.groups())
+            if len(digest) in (8, 64, 128) and any(char != "0" for char in digest)}
+
+
 _FRAMED_LINE = re.compile(r"^(?:\[t=[^\]]+\]\s*)?\[f=(\d{1,10})\]")
+_GAME_OVER_FRAME = re.compile(r"Studio match GameOver frame: (\d{1,10})")
 _END_GAME = re.compile(r"\bgame\s*over\b|\bgame ended\b|\bexecuting debugcommand\s*,?\s+quitforce\b",
                        re.IGNORECASE)
 _DEFEAT = re.compile(r"\bteam\s+\d+\b.{0,32}\bdefeated\b", re.IGNORECASE)
@@ -534,7 +623,7 @@ def match_telemetry(run: Path, players: list[Player], log: str, output: str) -> 
         identities.setdefault(tag, set()).add(index)
     unassigned = _ai_telemetry()
     pending: dict[str, dict] = {}
-    terminal = defeated = last = None
+    game_over = terminal = defeated = last = None
     end_stats = _end_stats(run)
     timestamp = re.compile(r"^\[t=[^\]]+\]\s*")
     logged = Counter(timestamp.sub("", line.strip()) for line in log.splitlines())
@@ -553,6 +642,9 @@ def match_telemetry(run: Path, players: list[Player], log: str, output: str) -> 
                 frame = int(frame_text[1])
                 source_started = True
                 last = frame if last is None else max(last, frame)
+                if explicit_end := _GAME_OVER_FRAME.fullmatch(message):
+                    if int(explicit_end[1]) == frame:
+                        game_over = frame if game_over is None else min(game_over, frame)
                 if _END_GAME.search(message):
                     terminal = frame if terminal is None else min(terminal, frame)
                 if _DEFEAT.search(message):
@@ -595,12 +687,15 @@ def match_telemetry(run: Path, players: list[Player], log: str, output: str) -> 
             unassigned.update(script_path=events["script_path"], profile_loaded=events["profile_loaded"])
     for team in teams:
         team["stats"].update(end_stats.get(team["team"], {}))
-    end_frame = next((frame for frame in (terminal, defeated, last) if frame is not None), None)
+    end_frame = next((frame for frame in (game_over, terminal, defeated, last) if frame is not None), None)
     duration = None
     if end_frame is not None:
         minutes, seconds = divmod(end_frame // 30, 60)
         duration = f"{minutes:02d}:{seconds:02d}" if minutes < 60 else f"{minutes // 60:02d}:{minutes % 60:02d}:{seconds:02d}"
-    end_frame_source = "game_end" if terminal is not None else "team_defeat" if defeated is not None else "last_log_frame"
+    end_frame_source = (
+        "game_over" if game_over is not None else "game_end" if terminal is not None
+        else "team_defeat" if defeated is not None else "last_log_frame"
+    )
     return {"end_frame": end_frame, "end_frame_source": end_frame_source if end_frame is not None else None,
             "duration": duration, "teams": teams, "unassigned_ai": unassigned,
             "ai_script_errors": sum(team["ai_script_errors"] for team in [*teams, unassigned]),
@@ -637,8 +732,9 @@ def _run_smoke(
     engine: Path, data: Path, local_data: Path, map_name: str, game: str,
     players: list[Player], stop: threading.Event, *,
     process_started: Callable[[subprocess.Popen], None] | None = None, extra_units: bool = False,
+    start_options: dict | None = None,
 ) -> tuple[bool, str, Path]:
-    script = build_script(map_name, game, players, SMOKE_MINUTES, extra_units=extra_units)
+    script = build_script(map_name, game, players, SMOKE_MINUTES, extra_units=extra_units, start_options=start_options)
     if not (engine / "spring-headless.exe").is_file():
         raise MatchError(f"Headless engine not found: {engine}")
     runs = local_data / "matches"
@@ -658,7 +754,7 @@ def _run_smoke(
         with (run / "stdout.txt").open("w", encoding="utf-8") as output:
             if stop.is_set():
                 raise MatchError(f"Stopped before the smoke engine started; files: {run}")
-            process = subprocess.Popen(command, cwd=engine, env=env, stdout=output, stderr=subprocess.STDOUT)
+            process = _launch_child(stop, command, cwd=engine, env=env, stdout=output, stderr=subprocess.STDOUT)
             if process_started is not None:
                 process_started(process)
             started = time.monotonic()
@@ -670,15 +766,13 @@ def _run_smoke(
                     timed_out = True
                     break
             if stopped or timed_out:
-                process.terminate()
-                process.wait(timeout=10)
+                _stop_child(process)
             code = process.wait()
     except (OSError, subprocess.SubprocessError) as error:
         raise MatchError(f"Smoke run failed; files: {run}\n{error}") from error
     finally:
-        if process is not None and process.poll() is None:
-            process.terminate()
-            process.wait(timeout=10)
+        _stop_child(process)
+        _release_child(stop, process)
     if code == 0:
         _copy_archive_cache(run / "cache", archive_cache, atomic=True)
 
@@ -716,10 +810,12 @@ def _run_smoke(
                if passed else "Smoke test failed; match not started:\n" + "\n".join(failures))
     if warning:
         summary += "\n" + warning
-    (run / "result.json").write_text(json.dumps({
+    summary = _write_result(run, {
         "smoke_passed": passed, "engine_exit": code, "failures": failures,
         "engine_diagnostics": diagnostics, "telemetry": match_telemetry(run, players, log, output),
-    }, indent=2) + "\n", encoding="utf-8")
+        "archive_checksums": archive_checksums(log) or archive_checksums(output),
+        "start_options": start_options,
+    }, summary)
     return passed, summary, run
 
 
@@ -729,8 +825,10 @@ def _run_match(
     process_started: Callable[[subprocess.Popen], None] | None = None, record_demo: bool = False,
     extra_units: bool = False, capture_stats: bool = False,
     progress: Callable[[MatchProgress], None] | None = None,
+    start_options: dict | None = None,
 ) -> tuple[str, Path]:
-    script = build_script(map_name, game, players, minutes, record_demo, extra_units=extra_units)
+    script = build_script(map_name, game, players, minutes, record_demo,
+                          extra_units=extra_units, start_options=start_options)
     if not (engine / "spring-headless.exe").is_file():
         raise MatchError(f"Headless engine not found: {engine}")
     runs = local_data / "matches"
@@ -759,11 +857,22 @@ def _run_match(
         winner: list[int] | None = None
         forced = False
         limit_failure = False
+
+        def record_game_over(at: float) -> None:
+            nonlocal game_over_at
+            if winner is None or game_over_at is not None:
+                return
+            game_over_at = at
+            if progress is not None and all(side in (0, 1) for side in winner) and len(set(winner)) == len(winner):
+                progress(MatchProgress(
+                    "match", "Finished", terminal=MatchTerminal("game_over", at, tuple(winner)),
+                ))
+
         try:
             with (run / "stdout.txt").open("w", encoding="utf-8") as output:
                 if stop.is_set():
                     raise MatchError(f"Stopped before the engine started; files: {run}")
-                process = subprocess.Popen(command, cwd=engine, env=env, stdout=output, stderr=subprocess.STDOUT)
+                process = _launch_child(stop, command, cwd=engine, env=env, stdout=output, stderr=subprocess.STDOUT)
                 if process_started is not None:
                     process_started(process)
                 peer = None
@@ -787,6 +896,7 @@ def _run_match(
                         if address == peer and packet[0] == 3 and len(packet) >= 3 and packet[1] == len(packet):
                             winner = list(packet[3:])
                     now = time.monotonic()
+                    record_game_over(now)
                     if capture_stats and progress is not None and now - sampled_at >= 0.5:
                         sampled_at = now
                         sample = live_match_sample(run, players)
@@ -799,8 +909,6 @@ def _run_match(
                         if sample is not None and sample != last_sample:
                             last_sample = sample
                             progress(MatchProgress("match", "Telemetry", live=sample))
-                    if winner is not None and game_over_at is None:
-                        game_over_at = now
                     if game_started is not None and not limit_registered and now - checked_at >= 2:
                         checked_at = now
                         text = (run / "stdout.txt").read_text(encoding="utf-8", errors="replace")
@@ -818,10 +926,10 @@ def _run_match(
                         if peer is not None:
                             host.sendto(b"/kill", peer)
                     if termination_started is not None and time.monotonic() - termination_started > 10:
-                        process.terminate()
                         forced = True
-                        process.wait(timeout=10)
+                        _stop_child(process)
                 code = process.wait()
+                finished_at = time.monotonic()
                 host.setblocking(False)
                 while True:
                     try:
@@ -832,12 +940,12 @@ def _run_match(
                         peer = address
                     if address == peer and packet and packet[0] == 3 and len(packet) >= 3 and packet[1] == len(packet):
                         winner = list(packet[3:])
+                record_game_over(finished_at)
         except (OSError, subprocess.SubprocessError) as error:
             raise MatchError(f"Headless run failed; files: {run}\n{error}") from error
         finally:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                process.wait(timeout=10)
+            _stop_child(process)
+            _release_child(stop, process)
     log_path = run / "infolog.txt"
     try:
         log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
@@ -845,17 +953,20 @@ def _run_match(
     except OSError as error:
         raise MatchError(f"Cannot read match logs in {run}: {error}") from error
     text = log + "\n" + output
-    errors = _diagnostics(log, output)
+    cause = "failed"
     if was_stopped:
         result = "Stopped by user."
+        cause = "cancelled"
     elif limit_failure:
         result = "Stopped: the game did not confirm the requested time limit."
     elif winner is not None and (any(side not in (0, 1) for side in winner) or len(set(winner)) != len(winner)):
         result = f"Invalid winning sides reported: {winner}"
     elif winner is not None:
         result = "Draw." if not winner or len(winner) == 2 else f"Winner: side {winner[0] + 1}."
+        cause = "game_over"
     elif re.search(r"Executing debugcommand\s*,?\s+quitforce\b", text):
         result = f"Time limit reached ({minutes} game minutes)."
+        cause = "simulated_limit"
     elif code and not forced:
         result = f"Engine failed (exit {code}); inspect the logs."
     else:
@@ -864,15 +975,26 @@ def _run_match(
         winner is not None or re.search(r"Executing debugcommand\s*,?\s+quitforce\b", text)
     ):
         result += f"\nEngine failed (exit {code}); inspect the logs."
+        cause = "failed"
+    if progress is not None:
+        progress(MatchProgress(
+            "match", "Finished", terminal=MatchTerminal(
+                cause, game_over_at or finished_at, tuple(winner) if cause == "game_over" else None,
+            ),
+        ))
+    errors = _diagnostics(log, output)
     if errors:
         result += f"\nMatch reported {len(errors)} diagnostics:\n" + _diagnostic_preview(errors, 10)
     if forced:
         result += "\nThe engine did not shut down gracefully and was terminated."
-    (run / "result.json").write_text(json.dumps({
+    result = _write_result(run, {
         "result": result, "engine_exit": code, "winning_sides": winner, "errors": errors,
         "telemetry": match_telemetry(run, players, log, output),
+        "archive_checksums": archive_checksums(log) or archive_checksums(output),
         "replays": replay_files(run) if record_demo else [],
-    }, indent=2) + "\n", encoding="utf-8")
+        "start_options": start_options,
+        "finish_cause": cause,
+    }, result)
     return result, run
 
 
@@ -881,9 +1003,9 @@ def run_match(
     players: list[Player], minutes: int, stop: threading.Event,
     progress: Callable[[MatchProgress], None] | None = None, *, skip_smoke: bool = False,
     process_started: Callable[[subprocess.Popen], None] | None = None, record_demo: bool = False,
-    extra_units: bool = False, capture_stats: bool = False,
+    extra_units: bool = False, capture_stats: bool = False, start_options: dict | None = None,
 ) -> tuple[str, Path]:
-    build_script(map_name, game, players, minutes, record_demo, extra_units=extra_units)
+    build_script(map_name, game, players, minutes, record_demo, extra_units=extra_units, start_options=start_options)
     if stop.is_set():
         raise MatchError("Stopped before the match started.")
     if skip_smoke:
@@ -896,7 +1018,7 @@ def run_match(
         try:
             passed, summary, smoke_path = _run_smoke(
                 engine, data, local_data, map_name, game, players, stop, process_started=process_started,
-                extra_units=extra_units,
+                extra_units=extra_units, start_options=start_options,
             )
         except (MatchError, OSError, ValueError) as error:
             if progress is not None:
@@ -922,7 +1044,8 @@ def run_match(
     try:
         result, match_path = _run_match(engine, data, local_data, map_name, game, players, minutes, stop,
                                         archive_cache=cache, process_started=process_started, record_demo=record_demo,
-                                        extra_units=extra_units, capture_stats=capture_stats, progress=progress)
+                                        extra_units=extra_units, capture_stats=capture_stats, progress=progress,
+                                        start_options=start_options)
     except (MatchError, OSError, ValueError) as error:
         if progress is not None:
             progress(MatchProgress("match", "Stopped" if stop.is_set() else "Failed",

@@ -15,13 +15,14 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import closing, nullcontext
+from contextlib import ExitStack, closing, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from itertools import islice
@@ -29,7 +30,7 @@ from pathlib import Path
 from shutil import copyfileobj
 from typing import Callable
 
-from . import discovery, headless, installation, project_history, settings, studio_experiments
+from . import discovery, headless, installation, project_history, settings, studio_experiments, studio_storage
 from .unit_catalog import valid_catalog
 from .system_capacity import game_capacity
 
@@ -37,6 +38,8 @@ from .system_capacity import game_capacity
 _operation_lock = threading.Lock()
 _MAX_MATCH_SECONDS = 6 * 60 * 60
 _MAX_QUEUE_GAMES = 500
+_SHUTDOWN_GRACE_SECONDS = 15
+_SHUTDOWN_REAP_SECONDS = 4
 # The raw-byte and row limits keep even a fully JSON-escaped page below 256 KiB.
 _LOG_PAGE_BYTES = 32 * 1024
 _LOG_PAGE_LINES = 512
@@ -65,9 +68,11 @@ class MatchBatch:
     skip_smoke: bool
     record_demo: bool
     extra_units: bool
+    start_options: dict | None
     series: dict | None
     projects: list[dict]
     players: list[headless.Player]
+    provenance: dict = field(default_factory=dict)
     submitted: float = field(default_factory=time.monotonic)
     games: list[QueuedGame] = field(default_factory=list)
     completion: tuple[dict, dict, str] | None = None
@@ -77,7 +82,7 @@ class MatchBatch:
 @dataclass(kw_only=True)
 class GameExecution:
     row: dict = field(default_factory=dict)
-    stop: threading.Event = field(default_factory=threading.Event)
+    stop: headless.ProcessStop = field(default_factory=headless.ProcessStop)
     cancel_requested: bool = False
     started: float | None = None
     phase: str | None = None
@@ -86,6 +91,8 @@ class GameExecution:
     events: list[dict] = field(default_factory=list)
     logs: dict = field(default_factory=dict)
     live: dict | None = None
+    terminal: headless.MatchTerminal | None = None
+    finish_cause: str | None = None
 
 
 @dataclass
@@ -122,7 +129,12 @@ class MatchService:
         self._accept_matches = False
         self._admitting_to_queue: str | None = None
         self._history_lock = threading.Lock()
-        self._stop = threading.Event()
+        self._legacy_run_index: dict[Path, tuple[tuple, dict]] = {}
+        self._artifact_lock = threading.Lock()
+        self._closed = False
+        self._operation_done = threading.Event()
+        self._operation_done.set()
+        self._stop = headless.ProcessStop()
         self._state: dict = self._empty_state()
         self._content: dict | None = None
         self._scan_key: tuple[Path, str] | None = None
@@ -222,22 +234,40 @@ class MatchService:
                     raise headless.MatchError("The experiment has already finished.")
                 if expected_id is not None and self._state["id"] != expected_id:
                     raise headless.MatchError("The requested operation is no longer running.")
-                self._state["state"] = "cancelling"
-                self._state["cancel_requested"] = True
-                self._state["message"] = "Cancelling..."
-                self._stop.set()
-                while self._pending_games:
-                    task = self._pending_games.popleft()
-                    task.outcome = "cancelled"
-                    task.row["state"] = "not_run"
-                for task in self._active_games.values():
-                    task.cancel_requested = True
-                    task.stop.set()
-                self._queue_changed.notify_all()
-                self._experiment_changed.notify_all()
+                self._request_cancel_locked()
             elif not (expected_id == self._state["id"] and self._state["operation"] == "scan"):
                 raise headless.MatchError("No scan or match is running.")
         return self.status()
+
+    def _request_cancel_locked(self) -> None:
+        self._state.update(state="cancelling", cancel_requested=True, message="Cancelling...")
+        self._stop.set()
+        while self._pending_games:
+            task = self._pending_games.popleft()
+            task.outcome = "cancelled"
+            task.row["state"] = "not_run"
+        for task in self._active_games.values():
+            if task.terminal is None:
+                task.cancel_requested = True
+            task.stop.set()
+        self._queue_changed.notify_all()
+        self._experiment_changed.notify_all()
+
+    def shutdown(self) -> bool:
+        """Close admission and wait for the active operation and its native children."""
+        with self._lock:
+            self._closed = True
+            if self._state["state"] in ("running", "cancelling"):
+                self._request_cancel_locked()
+            children = [self._stop, *(task.stop for task in self._active_games.values())]
+        if self._operation_done.wait(_SHUTDOWN_GRACE_SECONDS):
+            return True
+        for stop in children:
+            try:
+                stop.kill_child()
+            except OSError as error:
+                print(f"Could not stop a Studio engine process: {error}", file=sys.stderr)
+        return self._operation_done.wait(_SHUTDOWN_REAP_SECONDS)
 
     def cancel_game(self, queue_id: str, index: int) -> dict:
         with self._lock:
@@ -245,6 +275,8 @@ class MatchService:
                 raise headless.MatchError("The requested game is no longer in this test queue.")
             task = self._active_games.get(index)
             if task is not None:
+                if task.terminal is not None:
+                    raise headless.MatchError("The requested game has already finished.")
                 task.cancel_requested = True
                 task.stop.set()
             else:
@@ -262,20 +294,31 @@ class MatchService:
             self._launch_locked(operation, work)
         return self.status()
 
+    def _acquire_operation_lease(self) -> ExitStack:
+        with ExitStack() as stack:
+            if not _operation_lock.acquire(blocking=False):
+                raise headless.MatchError("Another workshop scan or match is already running.")
+            stack.callback(_operation_lock.release)
+            stack.enter_context(studio_storage.operation_lease(self.root, self.local_data))
+            return stack.pop_all()
+
     def _launch_locked(self, operation: str, work: Callable[[], tuple[dict, dict, str]]) -> None:
+        if self._closed:
+            raise headless.MatchError("Studio is shutting down.")
         if self._state["state"] in ("running", "cancelling"):
             raise headless.MatchError("A scan or match is already running.")
-        if not _operation_lock.acquire(blocking=False):
-            raise headless.MatchError("Another workshop scan or match is already running.")
-        self._stop = threading.Event()
-        self._batches.clear()
-        self._accept_matches = False
-        self._state = self._empty_state()
-        self._state.update(
+        stop = headless.ProcessStop()
+        state = self._empty_state()
+        state.update(
             id=uuid.uuid4().hex, operation=operation, state="running",
             phase="preparing", message=f"Preparing {operation}...",
             _started=time.monotonic(),
         )
+        lease = self._acquire_operation_lease()
+        self._stop, self._state = stop, state
+        self._operation_done.clear()
+        self._batches.clear()
+        self._accept_matches = False
         if operation == "scan":
             self._content = None
             self._scan_key = None
@@ -314,21 +357,27 @@ class MatchService:
                                 state="failed", error="Operation worker stopped unexpectedly.",
                                 message="Operation worker stopped unexpectedly.",
                             )
-                        _operation_lock.release()
-                        if operation == "match":
-                            self._queue_changed.notify_all()
+                        try:
+                            lease.close()
+                        finally:
+                            self._operation_done.set()
+                            if operation == "match":
+                                self._queue_changed.notify_all()
 
         try:
             threading.Thread(target=worker, name=f"studio-{operation}", daemon=True).start()
-        except Exception:
-            _operation_lock.release()
-            self._state.update(state="failed", error="Cannot start worker thread.")
-            self._state.pop("_started", None)
+        except BaseException:
+            try:
+                lease.close()
+            finally:
+                self._operation_done.set()
+                self._state.update(state="failed", error="Cannot start worker thread.")
+                self._state.pop("_started", None)
             raise
 
     def _publish_result(self, operation: str, result: dict, logs: dict, outcome: str) -> None:
         """Publish the result while holding the service lock."""
-        if outcome == "completed" and self._state["cancel_requested"]:
+        if outcome == "completed" and self._state["cancel_requested"] and operation != "match":
             outcome = "cancelled"
         if operation == "scan":
             cache_info = result.pop("_content_cache", None)
@@ -399,13 +448,48 @@ class MatchService:
             raise headless.MatchError("Invalid match or smoke run ID.")
         return run_id
 
+    def storage(self, *, offset: int = 0, limit: int = 25) -> dict:
+        studio_storage.check_page(offset, limit)
+        # New runs do not publish an ID until their phase produces an artifact.
+        active = self.is_busy()
+        with self._artifact_lock:
+            folder = self._matches_dir()
+            rows = [studio_storage.inspect_run(child, active=active)
+                    for child in sorted(folder.iterdir(), key=lambda path: path.name)
+                    if _RUN_ID.fullmatch(child.name) and not installation._link(child) and child.is_dir()
+                    ] if folder.is_dir() else []
+        return {"total_bytes": sum(row["bytes"] for row in rows), "total_runs": len(rows),
+                "protected_runs": sum(row["protected"] for row in rows), "runs": rows[offset:offset + limit],
+                "next_offset": offset + limit if offset + limit < len(rows) else None}
+
+    def pin_run(self, run_id: str, pinned: bool) -> dict:
+        if type(pinned) is not bool:
+            raise headless.MatchError("Pinned must be true or false.")
+        run_id = self._run_id(run_id)
+        with studio_storage.artifact_mutation_lease(self.root, self.local_data), self._artifact_lock:
+            run = studio_storage.run_directory(self._matches_dir(), run_id)
+            studio_storage.set_pin(run, pinned)
+        return {"id": run_id, "pinned": pinned}
+
+    def cleanup_runs(self, run_ids: list[str]) -> dict:
+        if not isinstance(run_ids, list) or not 1 <= len(run_ids) <= 100:
+            raise headless.MatchError("Select 1 to 100 run directories to clean up.")
+        run_ids = list(dict.fromkeys(self._run_id(run_id) for run_id in run_ids))
+        with (self._submission_lock, self._acquire_operation_lease(),
+              studio_storage.artifact_mutation_lease(self.root, self.local_data), self._artifact_lock):
+            folder = self._matches_dir()
+            paths = [studio_storage.run_directory(folder, run_id) for run_id in run_ids]
+            return studio_storage.cleanup(paths)
+
     def read_log(self, run_id: str, filename: str, offset: int = 0) -> dict:
         run_id = self._run_id(run_id)
         if (not isinstance(filename, str) or filename not in _LOG_FILES
                 or type(offset) is not int or not 0 <= offset <= 2**63 - 1):
             raise headless.MatchError("Invalid log file or byte offset.")
         try:
-            with headless.open_artifact(self.root, "data", "studio-matches", "matches", run_id, filename) as stream:
+            with self._artifact_lock, headless.open_artifact(
+                self.root, "data", "studio-matches", "matches", run_id, filename,
+            ) as stream:
                 stream.seek(offset)
                 raw = stream.read(_LOG_PAGE_BYTES + 1)
         except FileNotFoundError:
@@ -431,7 +515,9 @@ class MatchService:
 
     def _artifact_metadata(self, run_id: str) -> dict:
         try:
-            with headless.open_artifact(self.root, "data", "studio-matches", "matches", run_id, "result.json") as stream:
+            with self._artifact_lock, headless.open_artifact(
+                self.root, "data", "studio-matches", "matches", run_id, "result.json",
+            ) as stream:
                 raw = stream.read(_RESULT_METADATA_BYTES + 1)
             metadata = json.loads(raw) if len(raw) <= _RESULT_METADATA_BYTES else None
         except (OSError, ValueError, RecursionError, headless.MatchError):
@@ -505,16 +591,29 @@ class MatchService:
         with self._lock:
             if (root, engine) in self._invalidated_scans:
                 return None
-        data = root / "data"
-        path = self._content_cache_path(data, engine)
-        installation._check_links(self.root, path)
-        return settings.load_content_cache(path, data, engine)
+            if self._scan_key == (root, engine) and self._content is not None:
+                return copy.deepcopy(self._content)
+            data = root / "data"
+            path = self._content_cache_path(data, engine)
+            installation._check_links(self.root, path)
+            return settings.load_content_cache(path, data, engine)
 
     def sync_installed_ai(
         self, bar_root: str | Path, engine: str, short_name: str,
         version: str, display_name: str, profiles: list[dict[str, str]],
     ) -> bool:
-        """Update cached AI display name and profiles after an installation without full rescan."""
+        """Update the scan's AI choices after a successful installation."""
+        return self._sync_ai(bar_root, engine, short_name, version, {
+            "short_name": short_name, "version": version, "name": display_name, "profiles": profiles,
+        })
+
+    def sync_removed_ai(self, bar_root: str | Path, engine: str, short_name: str, version: str) -> bool:
+        return self._sync_ai(bar_root, engine, short_name, version, None)
+
+    def _sync_ai(
+        self, bar_root: str | Path, engine: str, short_name: str, version: str,
+        installed: dict | None,
+    ) -> bool:
         if not isinstance(bar_root, (str, Path)) or not str(bar_root).strip():
             raise headless.MatchError("BAR root is required.")
         if not isinstance(engine, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", engine) or engine in (".", ".."):
@@ -524,28 +623,41 @@ class MatchService:
         cache_path = self._content_cache_path(data, engine)
         installation._check_links(self.root, cache_path)
         with self._lock:
-            if self._content is not None and self._scan_key == (root, engine):
+            key = (root, engine)
+            if key in self._invalidated_scans:
+                return False
+            current_scan = self._content is not None and self._scan_key == key
+            if current_scan:
                 content = copy.deepcopy(self._content)
             else:
                 content = settings.load_content_cache(cache_path, data, engine)
             if content is None:
                 return False
-            matches = [
-                ai for ai in content["ais"]
-                if ai["short_name"] == short_name and ai["version"] == version
-            ]
-            if len(matches) != 1:
+            ais = content["ais"]
+            matches = [index for index, ai in enumerate(ais)
+                       if (ai["short_name"], ai["version"]) == (short_name, version)]
+            if installed is None and not matches:
                 return False
-            matches[0]["name"] = display_name
-            matches[0]["profiles"] = [
-                {"key": str(item["key"]), "name": str(item["name"])}
-                for item in profiles
-            ]
+            if matches:
+                for index in reversed(matches):
+                    del ais[index]
+            if installed is not None:
+                ais.insert(matches[0] if matches else len(ais), copy.deepcopy(installed))
             if not settings._content_valid(content):
                 raise headless.MatchError("Updated AI profile metadata is invalid.")
-            if self._scan_key == (root, engine) and self._content is not None:
-                self._content = copy.deepcopy(content)
-        settings.save_content_cache(cache_path, data, engine, content)
+            scan_result = self._state["result"] if current_scan and self._state["operation"] == "scan" else None
+            if current_scan:
+                self._content = content
+                if scan_result and "content" in scan_result:
+                    scan_result["content"] = content
+            try:
+                settings.save_content_cache(cache_path, data, engine, content)
+            except settings.SettingsError:
+                if not current_scan:
+                    raise
+                if scan_result and "content" in scan_result:
+                    scan_result["summary"] += " Updated AI choices could not be saved for the next session."
+                    self._state["message"] = scan_result["summary"]
         return True
 
     def _save_catalog(self, catalog: dict) -> None:
@@ -772,39 +884,49 @@ class MatchService:
         rel = self._relative_run_dir(path)
         if rel is None:
             return
-        result_file = path / "result.json"
-        if installation._link(result_file) or not result_file.is_file():
-            return
+        with self._artifact_lock:
+            try:
+                with headless.open_artifact(
+                    self.root, "data", "studio-matches", "matches", rel, "result.json",
+                ) as source:
+                    raw = source.read(_RESULT_METADATA_BYTES + 1)
+            except FileNotFoundError:
+                return
+            existing = json.loads(raw) if len(raw) <= _RESULT_METADATA_BYTES else None
+            if not isinstance(existing, dict):
+                raise headless.MatchError(f"Invalid result metadata in {rel}.")
+            existing.update(metadata)
+            descriptor, temp_name = tempfile.mkstemp(prefix=".result-", dir=path)
+            temporary = Path(temp_name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                    json.dump(existing, output, indent=2, ensure_ascii=False)
+                    output.write("\n")
+                os.replace(temporary, path / "result.json")
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def _result_annotation_warning(self, path: Path | None, metadata: dict) -> str | None:
         try:
-            existing = json.loads(result_file.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return
-        if not isinstance(existing, dict):
-            return
-        existing.update(metadata)
-        descriptor, temp_name = tempfile.mkstemp(prefix=".result-", dir=path)
-        temporary = Path(temp_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-                json.dump(existing, output, indent=2, ensure_ascii=False)
-                output.write("\n")
-            os.replace(temporary, result_file)
-        finally:
-            temporary.unlink(missing_ok=True)
+            self._enrich_result_json(path, metadata)
+        except (OSError, ValueError, RecursionError, headless.MatchError) as error:
+            return f"Could not annotate result for {path.name}: {error}"
+        return None
 
     def _load_history_entries_unlocked(self) -> list[dict]:
         matches_dir = self._matches_dir()
         history_path = matches_dir / "history.json"
         installation._check_links(self.root, history_path)
-        if not history_path.exists():
-            return []
         try:
             data = json.loads(history_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise headless.MatchError(f"Cannot read match history {history_path}: {error}") from error
-        if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        if (not isinstance(data, dict) or data.get("version", 1) != 1 or not isinstance(data.get("entries"), list)
+                or any(not isinstance(entry, dict) for entry in data["entries"])):
             raise headless.MatchError(f"Invalid match history format in {history_path}.")
-        return [entry for entry in data["entries"] if isinstance(entry, dict)]
+        return data["entries"]
 
     def _append_history(self, entry: dict) -> None:
         with self._history_lock:
@@ -812,10 +934,7 @@ class MatchService:
             self.local_data.mkdir(parents=True, exist_ok=True)
             matches_dir.mkdir(exist_ok=True)
             history_path = matches_dir / "history.json"
-            try:
-                entries = self._load_history_entries_unlocked()
-            except headless.MatchError:
-                entries = []
+            entries = self._load_history_entries_unlocked()
             entries.insert(0, entry)
             descriptor, temp_name = tempfile.mkstemp(prefix=".history-", dir=matches_dir)
             temporary = Path(temp_name)
@@ -880,13 +999,14 @@ class MatchService:
         if installation._link(result_file) or not result_file.is_file():
             return None
         try:
-            payload = json.loads(result_file.read_text(encoding="utf-8"))
+            with self._artifact_lock:
+                payload = json.loads(result_file.read_text(encoding="utf-8"))
+                mtime = datetime.fromtimestamp(result_file.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
         except (OSError, UnicodeError, json.JSONDecodeError):
             return None
         if not isinstance(payload, dict):
             return None
         script_map, script_game, script_players = self._parse_legacy_script(directory / "script.txt")
-        mtime = datetime.fromtimestamp(result_file.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
         timestamp = payload.get("timestamp") if isinstance(payload.get("timestamp"), str) else mtime
         game_name = payload.get("game") if isinstance(payload.get("game"), str) else script_game
         map_name = payload.get("map") if isinstance(payload.get("map"), str) else script_map
@@ -934,19 +1054,25 @@ class MatchService:
             "players": players,
             "projects": projects,
             "sweep_source": payload.get("sweep_source"),
+            "start_options": payload.get("start_options"),
+            "provenance": payload.get("provenance"),
             "series": None,
         }
 
     def history(
         self, *, project: str | None = None, profile: str | None = None,
         map_name: str | None = None, checkpoint: str | None = None, limit: int = 100,
-    ) -> list[dict]:
+        offset: int | None = None,
+    ) -> list[dict] | dict:
         """Return persistent match and series history entries, safely bounded within local_data."""
         if type(limit) is not int or not 1 <= limit <= 500:
             raise headless.MatchError("History limit must be an integer between 1 and 500.")
+        if offset is not None:
+            studio_storage.check_page(offset, limit, maximum=500)
         with self._history_lock:
             entries = self._load_history_entries_unlocked()
             matches_dir = self._matches_dir()
+            legacy_index: dict[Path, tuple[tuple, dict]] = {}
             indexed_dirs: set[str] = set()
             for entry in entries:
                 if isinstance(entry.get("run_dir"), str) and entry["run_dir"]:
@@ -964,9 +1090,22 @@ class MatchService:
                     installation._check_links(matches_dir, child)
                     if not child.is_dir() or not child.resolve().is_relative_to(resolved_matches):
                         continue
-                    legacy = self._legacy_entry_from_dir(child)
+                    try:
+                        result = headless.artifact_stat(child, "result.json")
+                    except (OSError, headless.MatchError):
+                        continue
+                    try:
+                        script = headless.artifact_stat(child, "script.txt")
+                    except (OSError, headless.MatchError):
+                        script = None
+                    revision = (result.st_mtime_ns, result.st_size,
+                                script.st_mtime_ns if script else None, script.st_size if script else None)
+                    cached = self._legacy_run_index.get(child)
+                    legacy = cached[1] if cached and cached[0] == revision else self._legacy_entry_from_dir(child)
                     if legacy is not None:
+                        legacy_index[child] = (revision, legacy)
                         entries.append(legacy)
+            self._legacy_run_index = legacy_index
 
         filtered = []
         for entry in entries:
@@ -1001,16 +1140,29 @@ class MatchService:
             filtered.append(entry)
 
         filtered.sort(key=lambda item: str(item.get("timestamp", "")), reverse=True)
-        return copy.deepcopy(filtered[:limit])
+        if offset is None:
+            return copy.deepcopy(filtered[:limit])
+        end = offset + limit
+        return {"history": copy.deepcopy(filtered[offset:end]),
+                "next_offset": end if end < len(filtered) else None}
 
     def _classify_game_outcome(
         self, summary: str, path: Path | None, timed_out: bool,
-        cancelled: bool, swapped: bool, events: list[dict],
+        cancelled: bool, swapped: bool, events: list[dict], *, terminal: headless.MatchTerminal | None = None,
     ) -> tuple[str, bool]:
         if cancelled:
             return "cancelled", False
         if timed_out:
             return "timeout", True
+        if terminal is not None:
+            if terminal.cause == "game_over":
+                winning = terminal.winning_sides
+                if winning is not None and len(winning) == 1:
+                    return ("side2" if ((winning[0] == 0) == swapped) else "side1"), False
+                return "draw", False
+            if terminal.cause == "simulated_limit":
+                return "timeout", False
+            return terminal.cause, terminal.cause == "failed"
         failed = any(event.get("summary") == "Failed" for event in events) or any(
             marker in summary for marker in _FAILURE_MARKERS
         )
@@ -1044,6 +1196,7 @@ class MatchService:
         self, engine_dir: Path, data: Path, map_name: str, game: str, players: list[headless.Player],
         minutes: int, *, skip_smoke: bool, task: GameExecution, record_demo: bool = False,
         extra_units: bool = False, real_time_deadline: float | None = None,
+        start_options: dict | None = None,
     ) -> tuple[str, Path, bool, bool, list[dict]]:
         game_stop = task.stop
         phase = "match" if skip_smoke else "smoke"
@@ -1060,17 +1213,20 @@ class MatchService:
             timed_out.set()
             game_stop.set()
 
-        budget = min(_MAX_MATCH_SECONDS, 600 + minutes * 60)
+        deadline = time.monotonic() + min(_MAX_MATCH_SECONDS, 600 + minutes * 60)
         if real_time_deadline is not None:
-            budget = min(budget, max(0, real_time_deadline - time.monotonic()))
-            if budget == 0:
-                timeout()
+            deadline = min(deadline, real_time_deadline)
+        budget = max(0.0, deadline - time.monotonic())
+        if budget == 0:
+            timeout()
         timer = threading.Timer(budget, timeout)
         timer.daemon = True
         timer.start()
-
         def progress(event: headless.MatchProgress) -> None:
             with self._lock:
+                if event.terminal is not None:
+                    task.terminal = event.terminal
+                    return
                 if event.live is not None:
                     task.live = event.live
                     return
@@ -1093,16 +1249,25 @@ class MatchService:
             summary, path = headless.run_match(
                 engine_dir, data, self.local_data, map_name, game, players, minutes, game_stop,
                 progress, skip_smoke=skip_smoke, process_started=process_started, record_demo=record_demo,
-                extra_units=extra_units, capture_stats=True,
+                extra_units=extra_units, capture_stats=True, start_options=start_options,
             )
         except Exception as error:
             if timed_out.is_set():
+                task.finish_cause = "wall_timeout"
                 raise headless.MatchError("Match exceeded its real-time deadline.") from error
             raise
         finally:
             timer.cancel()
         with self._lock:
-            return summary, path, timed_out.is_set(), task.cancel_requested, list(task.events)
+            terminal = task.terminal
+            wall_timeout = terminal.finished_at >= deadline if terminal is not None else timed_out.is_set()
+            if wall_timeout:
+                task.finish_cause = "wall_timeout"
+            elif terminal is not None:
+                task.finish_cause = terminal.cause
+            elif "Time limit reached (" in summary:
+                task.finish_cause = "simulated_limit"
+            return summary, path, wall_timeout, task.cancel_requested, list(task.events)
 
     def _experiment_workspace(self, experiment_id: str) -> Path:
         if not isinstance(experiment_id, str) or not re.fullmatch(r"[0-9a-f]{32}", experiment_id):
@@ -1123,6 +1288,14 @@ class MatchService:
                 os.replace(temporary, path)
             finally:
                 temporary.unlink(missing_ok=True)
+            summary = workspace / "summary.json"
+            try:
+                installation._check_links(self.root, summary)
+                settings._save_json(summary, {"record_mtime_ns": path.stat().st_mtime_ns,
+                                              "entry": self._experiment_summary(experiment)}, "experiment summary")
+            except (OSError, installation.InstallationError, settings.SettingsError):
+                # The full experiment is authoritative and can supply a missing summary.
+                pass
 
     def _read_experiment(self, experiment_id: str) -> dict | None:
         self._experiment_workspace(experiment_id)
@@ -1156,16 +1329,39 @@ class MatchService:
             entry = self._experiment_history_entry(experiment_id, active)
         if entry is None:
             raise headless.MatchError("The saved experiment is unavailable.")
+        self._hydrate_experiment_artifacts(entry)
+        if entry.get("mode") == "sweep" and "promotion_policy" not in entry:
+            self._refresh_legacy_promotion(entry)
+        return entry
+
+    def _hydrate_experiment_artifacts(self, entry: dict) -> None:
         # Read legacy artifacts only for the selected experiment.
         games = entry.get("games")
         for game in games[:100] if isinstance(games, list) else ():
             if not isinstance(game, dict):
                 continue
             run_id = game.get("run_id")
-            if "side_totals" not in game and isinstance(run_id, str) and _RUN_ID.fullmatch(run_id):
+            if (("side_totals" not in game or (entry.get("mode") == "sweep" and "telemetry_verified" not in game))
+                    and isinstance(run_id, str) and _RUN_ID.fullmatch(run_id)):
                 metadata = self._artifact_metadata(run_id)
-                game["side_totals"] = studio_experiments.telemetry_metrics(metadata)["side_totals"]
-        return entry
+                metrics = studio_experiments.telemetry_metrics(metadata)
+                game.setdefault("side_totals", metrics["side_totals"])
+                game.setdefault("telemetry_verified", metrics["telemetry_verified"])
+
+    @staticmethod
+    def _refresh_legacy_promotion(entry: dict) -> None:
+        ranked = []
+        for row in entry.get("rankings", []):
+            valid_pairs, score = studio_experiments.paired_score(row["id"], entry.get("games", []))
+            row["valid_pairs"], row["paired_win_rate"] = valid_pairs, score
+            row["promotable"] = (entry.get("state") == "completed" and row.get("promotable") is True
+                                 and valid_pairs >= studio_experiments.MIN_PROMOTION_PAIRS
+                                 and score is not None and score > 0.5)
+            if row["promotable"]:
+                ranked.append(row)
+        best = max(ranked, key=lambda row: (row["paired_win_rate"], row["valid_pairs"]), default=None)
+        entry["best_candidate_id"] = best["id"] if best else None
+        entry["promotable"] = best is not None
 
     def experiment_history(self) -> list[dict]:
         directory = self.local_data / "experiments"
@@ -1183,6 +1379,47 @@ class MatchService:
                 if entry is not None:
                     entries.append(entry)
         return sorted(entries, key=lambda entry: str(entry.get("started_at", "")), reverse=True)[:100]
+
+    @staticmethod
+    def _experiment_summary(experiment: dict) -> dict:
+        keys = ("id", "mode", "state", "started_at", "completed_at", "game", "scheduled_games", "completed_games",
+                "coverage", "stop_reason", "best_candidate_id", "promotable")
+        return {key: experiment[key] for key in keys if key in experiment}
+
+    def experiment_history_page(self, *, offset: int, limit: int) -> dict:
+        studio_storage.check_page(offset, limit)
+        directory = self.local_data / "experiments"
+        installation._check_links(self.root, directory)
+        with self._lock:
+            active = self._state["id"] if self._state["state"] in ("running", "cancelling") else None
+        entries = []
+        with self._history_lock:
+            for workspace in directory.iterdir() if directory.is_dir() else ():
+                if not re.fullmatch(r"[0-9a-f]{32}", workspace.name) or installation._link(workspace):
+                    continue
+                try:
+                    path = workspace / "experiment.json"
+                    installation._check_links(self.root, path)
+                    mtime = path.stat().st_mtime_ns
+                    with headless.open_artifact(self.root, "data", "studio-matches", "experiments",
+                                                workspace.name, "summary.json") as stream:
+                        saved = json.loads(stream.read(16384))
+                    entry = saved.get("entry") if isinstance(saved, dict) and saved.get("record_mtime_ns") == mtime else None
+                    if not isinstance(entry, dict) or entry.get("id") != workspace.name:
+                        entry = None
+                except (OSError, ValueError, RecursionError, headless.MatchError, installation.InstallationError):
+                    entry = None
+                if entry is None:
+                    full = self._experiment_history_entry(workspace.name, active)
+                    if full is None:
+                        continue
+                    entry = self._experiment_summary(full)
+                if entry.get("state") == "running" and workspace.name != active:
+                    entry.update(state="interrupted", stop_reason="interrupted", promotable=False, best_candidate_id=None)
+                entries.append(entry)
+        entries.sort(key=lambda entry: (str(entry.get("started_at", "")), entry["id"]), reverse=True)
+        end = offset + limit
+        return {"experiments": entries[offset:end], "next_offset": end if end < len(entries) else None}
 
     def pause_experiment(self, paused: bool, expected_id: str | None = None) -> dict:
         if type(paused) is not bool:
@@ -1248,7 +1485,7 @@ class MatchService:
     def start_experiment(
         self, bar_root: str | Path, engine: str, game: str, maps: list[str], minutes: int,
         game_limit: int, seconds_limit: int, mode: str, players: list[dict], sweep: dict | None = None,
-        *, parallel_games: int | None = None,
+        *, parallel_games: int | None = None, start_options: dict | None = None, seed: int | None = None,
     ) -> dict:
         if parallel_games is not None:
             self._validate_parallel_games(parallel_games)
@@ -1256,6 +1493,9 @@ class MatchService:
             raise headless.MatchError("Choose tournament or sweep mode.")
         if type(game_limit) is not int or not 1 <= game_limit <= 100:
             raise headless.MatchError("The game count budget must be an integer from 1 to 100.")
+        if seed is not None and (type(seed) is not int or not 0 <= seed < 2**32):
+            raise headless.MatchError("Choose an experiment seed from 0 to 4294967295.")
+        seed = seed if seed is not None else int.from_bytes(os.urandom(4), "big")
         if type(seconds_limit) is not int or not 1 <= seconds_limit <= _MAX_MATCH_SECONDS:
             raise headless.MatchError(f"The real-time budget must be an integer from 1 to {_MAX_MATCH_SECONDS} seconds.")
         if type(minutes) is not int or not 0 < minutes <= 2147483647 // 1800:
@@ -1267,6 +1507,9 @@ class MatchService:
             raise headless.MatchError("Choose 2 to 16 AI variants.")
         if mode == "sweep" and (len(players) != 2 or not isinstance(sweep, dict)):
             raise headless.MatchError("Provide a source profile and opponent for the sweep.")
+        if start_options is not None:
+            settings.validate_start_options(start_options)
+            start_options = start_options.copy()
         maps, players, sweep = list(maps), copy.deepcopy(players), copy.deepcopy(sweep)
 
         def work() -> tuple[dict, dict, str]:
@@ -1281,7 +1524,13 @@ class MatchService:
                 "game_limit": game_limit, "seconds_limit": seconds_limit, "scheduled_games": 0,
                 "completed_games": 0, "elapsed_seconds": 0.0, "paused": False, "pause_requested": False,
                 "stop_reason": None, "rankings": [], "games": [], "promotable": False, "best_candidate_id": None,
+                "seed": seed,
             }
+            if start_options is not None:
+                experiment["start_options"] = start_options
+            if mode == "sweep":
+                experiment["promotion_policy"] = {"minimum_valid_pairs": studio_experiments.MIN_PROMOTION_PAIRS,
+                                                  "score_to_beat": 0.5}
             with self._lock:
                 self._state["experiment"] = copy.deepcopy(experiment)
             workspace = self._experiment_workspace(experiment_id)
@@ -1364,13 +1613,29 @@ class MatchService:
                         ]
                     total_games = (len(candidates) * (len(candidates) - 1) if mode == "tournament"
                                    else 2 * (len(candidates) - 1)) * len(maps)
-                    experiment["scheduled_games"] = min(total_games, game_limit)
+                    games_to_schedule = max(1, game_limit - game_limit % 2)
+                    schedule = list(islice(studio_experiments.matrix(candidates, maps, mode, seed=seed),
+                                           games_to_schedule))
+                    experiment["scheduled_games"] = len(schedule)
+                    experiment["schedule"] = [
+                        {"index": index, "pair_index": (index + 1) // 2, "map": map_name,
+                         "side1": first.id, "side2": second.id,
+                         "players": [asdict(replace(first.player, ally=0)), asdict(replace(second.player, ally=1))]}
+                        for index, (map_name, first, second) in enumerate(schedule, 1)
+                    ]
+                    experiment["coverage"] = {"full_pairs": total_games // 2, "scheduled_pairs": len(schedule) // 2,
+                                              "completed_pairs": 0, "scheduled_games": len(schedule),
+                                              "completed_games": 0}
+                    launch_provenance = studio_experiments.run_provenance(
+                        engine_dir, maps, [candidate.player for candidate in candidates],
+                        should_stop=lambda: self._stop.is_set() or time.monotonic() >= deadline,
+                    )
+                    experiment["provenance"] = copy.deepcopy(launch_provenance)
                     experiment["rankings"] = studio_experiments.rankings(candidates, [])
                     with self._lock:
-                        for key in ("scheduled_games", "rankings"):
+                        for key in ("scheduled_games", "schedule", "coverage", "provenance", "rankings"):
                             self._state["experiment"][key] = copy.deepcopy(experiment[key])
                     self._save_experiment(workspace, experiment, promotion)
-                    schedule = list(islice(studio_experiments.matrix(candidates, maps, mode), game_limit))
 
                     def play(index, map_name, first, second, task):
                         match_players = [replace(first.player, ally=0), replace(second.player, ally=1)]
@@ -1381,16 +1646,18 @@ class MatchService:
                             summary, run, timed_out, cancelled, events = self._run_game(
                                 engine_dir, selected.data, map_name, game, match_players, minutes,
                                 skip_smoke=False, real_time_deadline=deadline,
-                                task=task,
+                                task=task, start_options=start_options,
                             )
-                            outcome, _ = self._classify_game_outcome(summary, run, timed_out, cancelled, False, events)
+                            outcome, _ = self._classify_game_outcome(
+                                summary, run, timed_out, cancelled, False, events, terminal=task.terminal,
+                            )
                         except Exception as error:
                             summary = str(error) or type(error).__name__
                             outcome = ("cancelled" if self._stop.is_set() else "timeout"
                                        if "real-time deadline" in summary else "failed")
                         if outcome == "completed":
                             outcome = "failed"
-                        simulated_limit = outcome == "timeout" and "Time limit reached (" in summary
+                        simulated_limit = outcome == "timeout" and task.finish_cause == "simulated_limit"
                         run_id = None
                         metadata = {}
                         if run is not None:
@@ -1398,23 +1665,33 @@ class MatchService:
                             run_id = logs.get("run_id")
                             if run_id:
                                 metadata = self._artifact_metadata(run_id)
+                            game_provenance = copy.deepcopy(launch_provenance)
+                            studio_experiments.record_archive_checksums(game_provenance, map_name,
+                                                                       metadata.get("archive_checksums"))
                             history = {
                                 "experiment_id": experiment_id, "experiment_game_index": index,
                                 "game": game, "map": map_name, "engine": engine,
                                 "players": [asdict(player) for player in match_players], "projects": snapshots,
+                                "provenance": game_provenance,
                                 "outcome": outcome, "simulated_limit": simulated_limit,
                                 "elapsed_seconds": round(time.monotonic() - task.started, 2),
                             }
+                            if task.finish_cause is not None:
+                                history["finish_cause"] = task.finish_cause
                             if prepared:
                                 history["sweep_source"] = {"project": sweep["project"], "profile": sweep["profile"]}
-                            self._enrich_result_json(run, history)
+                            warning = self._result_annotation_warning(run, history)
+                            if warning:
+                                summary = f"{summary[:3500]}\n{warning}"
                         metrics = studio_experiments.telemetry_metrics(metadata)
                         if outcome == "failed" and "smoke_passed" not in metadata:
                             metrics["engine_error"] = True
                         return {
-                            "index": index, "map": map_name, "side1": first.id, "side2": second.id,
+                            "index": index, "pair_index": (index + 1) // 2, "map": map_name,
+                            "side1": first.id, "side2": second.id,
                             "side_labels": [first.label, second.label],
                             "factions": [player.faction for player in match_players],
+                            "archive_checksums": metadata.get("archive_checksums", {}),
                             "outcome": outcome, "run_id": run_id, "summary": summary[:4000],
                             "simulated_limit": simulated_limit,
                             "elapsed_seconds": round(time.monotonic() - task.started, 2), **metrics,
@@ -1426,16 +1703,23 @@ class MatchService:
                                 last_logs = logs
                             experiment["games"].append(result)
                             experiment["games"].sort(key=lambda row: row["index"])
+                            studio_experiments.record_archive_checksums(experiment["provenance"], result["map"],
+                                                                       result["archive_checksums"])
                             experiment["completed_games"] += int(result["outcome"] != "cancelled")
+                            finished = {row["index"] for row in experiment["games"] if row["outcome"] != "cancelled"}
+                            experiment["coverage"].update(
+                                completed_games=len(finished),
+                                completed_pairs=sum(index + 1 in finished for index in finished if index % 2),
+                            )
                             experiment["rankings"] = studio_experiments.rankings(candidates, experiment["games"])
                             experiment["elapsed_seconds"] = round(time.monotonic() - started, 2)
                             self._save_experiment(workspace, experiment, promotion)
                             with self._lock:
-                                for key in ("scheduled_games", "games", "rankings", "completed_games", "elapsed_seconds"):
+                                for key in ("coverage", "provenance", "games", "rankings", "completed_games", "elapsed_seconds"):
                                     self._state["experiment"][key] = copy.deepcopy(experiment[key])
                     if reason is None:
                         reason = ("time_limit" if time.monotonic() >= deadline else
-                                  "game_limit" if game_limit < total_games else "completed")
+                                  "game_limit" if len(schedule) < total_games else "completed")
                     if all(item["outcome"] == "failed" for item in experiment["games"]) and experiment["games"]:
                         reason = "failed"
                         error_message = experiment["games"][-1]["summary"].splitlines()[0]
@@ -1451,7 +1735,7 @@ class MatchService:
                     for row in experiment["rankings"]:
                         row["promotable"] = False
                 winner = max((row for row in experiment["rankings"] if row["promotable"]),
-                             key=lambda row: row["paired_win_rate"], default=None)
+                             key=lambda row: (row["paired_win_rate"], row["valid_pairs"]), default=None)
                 best = winner["id"] if winner else None
                 experiment.update(state=outcome, stop_reason=reason, completed_at=stamp(),
                                   elapsed_seconds=round(time.monotonic() - started, 2), paused=False,
@@ -1479,6 +1763,11 @@ class MatchService:
             if saved is None or not isinstance(saved.get("promotion"), dict):
                 raise headless.MatchError("The experiment has no saved variant to promote.")
             experiment = saved["experiment"]
+            if "promotion_policy" not in experiment:
+                self._hydrate_experiment_artifacts(experiment)
+            pairs, rate = studio_experiments.paired_score(candidate_id, experiment.get("games", []))
+            if pairs < studio_experiments.MIN_PROMOTION_PAIRS or rate is None or rate <= 0.5:
+                raise headless.MatchError("Promotion needs a majority from at least two clean mirrored pairs.")
             if experiment.get("state") != "completed" or not any(
                 row.get("id") == candidate_id and row.get("promotable") is True
                 for row in experiment.get("rankings", [])
@@ -1490,7 +1779,7 @@ class MatchService:
     def _prepare_batch(
         self, bar_root: str | Path, engine: str, game: str, map_name: str,
         players: list[dict], minutes: int, skip_smoke: bool, series: dict | None,
-        record_demo: bool, extra_units: bool,
+        record_demo: bool, extra_units: bool, start_options: dict | None,
     ) -> MatchBatch:
         selected, engine_dir = self._selected(bar_root, engine)
         missing = discovery.engine_readiness(selected, engine)
@@ -1513,8 +1802,9 @@ class MatchService:
         self._prepare_storage(engine_dir, selected.data)
         projects = self._capture_project_snapshots(roster, selected.data, engine)
         batch = MatchBatch(uuid.uuid4().hex, engine_dir, selected.data, engine, game, minutes,
-                           skip_smoke, record_demo, extra_units, series, projects, roster)
+                           skip_smoke, record_demo, extra_units, start_options, series, projects, roster)
         maps = series["maps"] if series else [map_name]
+        batch.provenance = studio_experiments.run_provenance(engine_dir, maps, roster)
         pairs = series["faction_pairs"] if series else []
         for idx in range(series["games"] if series else 1):
             pair = pairs[idx % len(pairs)] if pairs else None
@@ -1525,7 +1815,8 @@ class MatchService:
                 for player in roster
             ]
             game_map = maps[idx % len(maps)]
-            headless.build_script(game_map, game, game_players, minutes, record_demo, extra_units=extra_units)
+            headless.build_script(game_map, game, game_players, minutes, record_demo,
+                                  extra_units=extra_units, start_options=start_options)
             row = {
                 "batch_id": batch.id, "batch_game": idx + 1, "batch_size": series["games"] if series else 1,
                 "game": game, "map": game_map, "swapped": swapped,
@@ -1540,19 +1831,25 @@ class MatchService:
         self, bar_root: str | Path, engine: str, game: str, map_name: str,
         players: list[dict], minutes: int, skip_smoke: bool = False,
         series: dict | None = None, *, record_demo: bool = False, extra_units: bool = False,
-        parallel_games: int | None = None,
+        parallel_games: int | None = None, start_options: dict | None = None,
     ) -> dict:
         """Queue a match or benchmark series from the last successful scan."""
         if type(record_demo) is not bool:
             raise headless.MatchError("record_demo must be a boolean.")
         if type(extra_units) is not bool:
             raise headless.MatchError("extra_units must be a boolean.")
+        if start_options is not None:
+            settings.validate_start_options(start_options)
+            start_options = start_options.copy()
         if parallel_games is not None:
             self._validate_parallel_games(parallel_games)
         with self._submission_lock:
             with self._queue_changed:
-                while self._state["operation"] == "match" and self._state["state"] == "running" and not self._accept_matches:
+                while (not self._closed and self._state["operation"] == "match"
+                       and self._state["state"] == "running" and not self._accept_matches):
                     self._queue_changed.wait()
+                if self._closed:
+                    raise headless.MatchError("Studio is shutting down.")
                 if self._state["state"] in ("running", "cancelling"):
                     if self._state["operation"] != "match" or self._state["state"] != "running":
                         raise headless.MatchError("Wait for the current operation to finish before queuing games.")
@@ -1560,7 +1857,7 @@ class MatchService:
             try:
                 try:
                     batch = self._prepare_batch(bar_root, engine, game, map_name, players, minutes, skip_smoke,
-                                                series, record_demo, extra_units)
+                                                series, record_demo, extra_units, start_options)
                 except (headless.MatchError, OSError, ValueError) as error:
                     if self._admitting_to_queue or self.is_busy():
                         raise
@@ -1571,6 +1868,8 @@ class MatchService:
                     return self._launch("match", rejected)
 
                 with self._queue_changed:
+                    if self._closed:
+                        raise headless.MatchError("Studio is shutting down.")
                     if self._admitting_to_queue:
                         if self._state["id"] != self._admitting_to_queue or self._state["state"] != "running":
                             raise headless.MatchError("The test queue was cancelled before the games could be added.")
@@ -1641,10 +1940,13 @@ class MatchService:
             summary, path, timed_out, cancelled, events = self._run_game(
                 batch.engine_dir, batch.data, row["map"], batch.game, task.players, batch.minutes,
                 skip_smoke=batch.skip_smoke, record_demo=batch.record_demo, extra_units=batch.extra_units, task=task,
+                start_options=batch.start_options,
             )
             if timed_out:
                 summary = (summary + "\nMatch exceeded its real-time deadline.").strip()
-            outcome, _ = self._classify_game_outcome(summary, path, timed_out, cancelled, row["swapped"], events)
+            outcome, _ = self._classify_game_outcome(
+                summary, path, timed_out, cancelled, row["swapped"], events, terminal=task.terminal,
+            )
             logs, telemetry = self._run_artifacts(path, events)
         except (Exception, SystemExit) as error:
             summary = str(error) or "Operation worker stopped unexpectedly."
@@ -1661,6 +1963,8 @@ class MatchService:
                 elapsed_seconds=max(0.0, time.monotonic() - task.started),
                 summary=summary, logs=logs, telemetry=telemetry,
             )
+            if task.finish_cause is not None:
+                row["finish_cause"] = task.finish_cause
             task.path, task.outcome = path, outcome
             self._active_games.pop(row["game_index"])
             self._state.update(phase=task.phase, progress=task.events, logs=logs)
@@ -1717,7 +2021,15 @@ class MatchService:
         latest = max((task.started + (task.row["elapsed_seconds"] or 0) for task in batch.games
                       if task.started is not None), default=time.monotonic())
         duration = round(max(0.0, latest - batch.submitted), 2)
-        base = {"timestamp": timestamp, "engine": batch.engine, "game": batch.game, "projects": batch.projects}
+        for task in batch.games:
+            run_id = self._relative_run_dir(task.path)
+            if run_id is not None:
+                metadata = self._artifact_metadata(run_id)
+                studio_experiments.record_archive_checksums(batch.provenance, task.row["map"],
+                                                           metadata.get("archive_checksums"))
+        base = {"timestamp": timestamp, "engine": batch.engine, "game": batch.game, "projects": batch.projects,
+                "start_options": batch.start_options, "provenance": batch.provenance}
+        warnings = []
         if series is not None:
             cancelled = any(task.outcome == "cancelled" for task in batch.games)
             state = "cancelled" if cancelled else "failed" if series["failures"] == len(batch.games) else "completed"
@@ -1734,11 +2046,14 @@ class MatchService:
                 if task.path is None:
                     continue
                 row = task.row
-                self._enrich_result_json(task.path, {
+                warning = self._result_annotation_warning(task.path, {
                     **base, "map": row["map"], "players": row["players"], "outcome": task.outcome,
                     "elapsed_seconds": round(row["elapsed_seconds"], 2), "series_id": batch.id,
                     "game_index": row["batch_game"], "swapped": row["swapped"],
+                    **({"finish_cause": task.finish_cause} if task.finish_cause is not None else {}),
                 })
+                if warning:
+                    warnings.append(warning)
             maps = series["maps"]
         else:
             state = (
@@ -1755,16 +2070,26 @@ class MatchService:
                 else "Cancelled" if state == "cancelled" else summary.splitlines()[0] if summary else last.outcome
             )
             maps = [last.row["map"]]
-            self._enrich_result_json(last.path, {
+            warning = self._result_annotation_warning(last.path, {
                 **base, "map": maps[0], "players": last.row["players"], "outcome": outcome, "elapsed_seconds": duration,
+                **({"finish_cause": last.finish_cause} if last.finish_cause is not None else {}),
             })
-        self._append_history({
-            **base, "id": batch.id, "kind": "series" if series is not None else "match", "state": state,
-            "map": ", ".join(dict.fromkeys(maps)), "maps": list(maps), "minutes": batch.minutes,
-            "skip_smoke": batch.skip_smoke, "outcome": outcome, "elapsed_seconds": duration, "summary": summary,
-            "run_dir": self._relative_run_dir(last.path), "players": [asdict(player) for player in batch.players],
-            "series": series,
-        })
+            if warning:
+                warnings.append(warning)
+        try:
+            self._append_history({
+                **base, "id": batch.id, "kind": "series" if series is not None else "match", "state": state,
+                "map": ", ".join(dict.fromkeys(maps)), "maps": list(maps), "minutes": batch.minutes,
+                "skip_smoke": batch.skip_smoke, "outcome": outcome, "elapsed_seconds": duration, "summary": summary,
+                "run_dir": self._relative_run_dir(last.path), "players": [asdict(player) for player in batch.players],
+                "series": series,
+            })
+        except (OSError, ValueError, RecursionError, headless.MatchError, installation.InstallationError) as error:
+            warnings.append(f"Could not save match history: {error}")
+        if warnings:
+            with self._lock:
+                batch.history_error = "\n".join(warnings)
+            summary = "\n".join([summary, *warnings])
         result = {"summary": summary, "path": str(last.path) if last.path is not None else ""}
         if series is not None:
             result["series"] = series

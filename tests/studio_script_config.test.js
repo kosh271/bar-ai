@@ -12,6 +12,7 @@ require("../web/studio/openings.js");
 
 const scripts = window.StudioScripts;
 const config = window.StudioConfig;
+const localProfiles = process.env.STUDIO_TEST_PROFILE_ROOT || path.join(__dirname, "..", "projects", "Willtest", "profiles");
 
 function readProfileFiles(profileDir) {
     const out = [];
@@ -118,9 +119,31 @@ test("discoverScriptParameters collects numeric constants across files and skips
     assert.equal(params[0].value, 10);
 });
 
-test("readInitLayers and writeInitLayers edit Hard init.as while preserving logs and comments", () => {
-    const hardDir = path.join(__dirname, "..", "projects", "Willtest", "profiles", "hard");
-    const files = readProfileFiles(hardDir);
+test("readInitLayers and writeInitLayers edit conditional startup layers while preserving logs and comments", () => {
+    const files = [
+        {path: "script/init.as", text: `namespace Init {
+SInitInfo AiInit() {
+    //dictionary@ mo = aiSetupMgr.GetModOptions();
+    SInitInfo data;
+    @data.profile = @(array<string> = {"behaviour", "block_map", "build_chain", "commander", "economy", "factory", "response"});
+    if (string(aiSetupMgr.GetModOptions()["experimentallegionfaction"]) == "1") {
+        AiLog("Inserting Legion");
+        Side::LEGION = aiSideMasker.GetTypeMask("legion");
+        data.profile.insertAt(data.profile.length(), {"behaviour_leg"});
+    }
+    if (string(aiSetupMgr.GetModOptions()["scavunitsforplayers"]) == "1") {
+        data.profile.insertAt(data.profile.length(), {"behaviour_scav_units"});
+    }
+    if (string(aiSetupMgr.GetModOptions()["experimentalextraunits"]) == "1") {
+        data.profile.insertAt(data.profile.length(), {"behaviour_extra_units"});
+    }
+    return data;
+}
+}`},
+        ...["behaviour", "block_map", "build_chain", "commander", "economy", "factory", "response",
+            "behaviour_leg", "behaviour_scav_units", "behaviour_extra_units"].map(layer =>
+            ({path: `config/${layer}.json`, text: "{}"}))
+    ];
     const model = scripts.readInitLayers(files);
 
     assert.deepEqual(model.base, [
@@ -169,11 +192,23 @@ test("readInitLayers follows a forwarding include", () => {
     assert.match(next, /\{"economy", "factory"\}/);
 });
 
-test("readRecruitRules and writeRecruitRules round-trip on Hard factory.as and validate cleanly", () => {
-    const hardDir = path.join(__dirname, "..", "projects", "Willtest", "profiles", "hard");
-    const files = readProfileFiles(hardDir);
-    const factoryFile = files.find(f => f.path === "script/manager/factory.as");
-    assert.ok(factoryFile);
+test("recruit rule edits preserve factory switching hooks and round-trip exactly", () => {
+    const factoryFile = {path: "script/manager/factory.as", text: `namespace Factory {
+IUnitTask@ AiMakeTask(CCircuitUnit@ unit)
+{
+    return aiFactoryMgr.DefaultMakeTask(unit);
+}
+void AiTaskRemoved(IUnitTask@ task, bool done)
+{
+}
+bool ShouldSwitch() {
+    int switchDelay = AiRandom(90, 120) * SECOND;
+    float change = pow((ai.frame - lastSwitchFrame), 0.9);
+    return change > (aiEconomyMgr.metal.current * 7) && ai.frame > switchDelay;
+}
+}
+`};
+    const files = [factoryFile];
 
     const fighter = {
         factory: "armap", unit: "armfig", target: 30, startMinutes: 2,
@@ -246,9 +281,12 @@ test("writeRecruitRules preserves CRLF line endings when factory.as uses CRLF", 
     assert.equal(scripts.writeRecruitRules([{path: "script/manager/factory.as", text: edited}], []), crlfFactory);
 });
 
-test("real Hard and defensive-wk2 scripts parse cleanly with inspectScript", () => {
+test("real Hard and defensive-wk2 scripts parse cleanly with inspectScript", {
+    skip: !["hard", "defensive-wk2"].every(profile => fs.existsSync(path.join(localProfiles, profile, "script"))) &&
+        "Optional local Willtest profiles are unavailable"
+}, () => {
     for (const profile of ["hard", "defensive-wk2"]) {
-        const dir = path.join(__dirname, "..", "projects", "Willtest", "profiles", profile);
+        const dir = path.join(localProfiles, profile);
         const files = readProfileFiles(dir).filter(f => f.path.endsWith(".as"));
         assert.ok(files.length > 0);
         for (const file of files) {
@@ -260,8 +298,10 @@ test("real Hard and defensive-wk2 scripts parse cleanly with inspectScript", () 
     }
 });
 
-test("Hard profile scripts match all exposed scriptSettings patterns uniquely", () => {
-    const hardDir = path.join(__dirname, "..", "projects", "Willtest", "profiles", "hard");
+test("Hard profile scripts match all exposed scriptSettings patterns uniquely", {
+    skip: !fs.existsSync(path.join(localProfiles, "hard", "script")) && "Optional local Willtest Hard profile is unavailable"
+}, () => {
+    const hardDir = path.join(localProfiles, "hard");
     const files = readProfileFiles(hardDir);
     const num = "(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][+-]?\\d+)?[fF]?";
     const checks = [

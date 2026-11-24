@@ -21,6 +21,9 @@ _DEVICES = {"CON", "PRN", "AUX", "NUL"} | {
 }
 _RESERVED_PATH = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\..*)?\Z", re.I)
 MAX_WORKSPACE_FILE_BYTES = 8 * 1024 * 1024
+MAX_WORKSPACE_BYTES = 64 * 1024 * 1024
+MAX_WORKSPACE_ENTRIES = 5000
+MAX_WORKSPACE_PATH = 512
 
 
 def is_private_path_name(name: str) -> bool:
@@ -30,7 +33,7 @@ def is_private_path_name(name: str) -> bool:
 
 def workspace_path_parts(name: str) -> tuple[str, ...]:
     parts = tuple(name.removesuffix("/").split("/"))
-    if len(name) > 512 or any(
+    if len(name) > MAX_WORKSPACE_PATH or any(
         not part or part in {".", ".."} or part.endswith((" ", ".")) or is_private_path_name(part)
         or _RESERVED_PATH.fullmatch(part) or re.search(r'[\x00-\x1f\x7f<>:"\\|?*]', part)
         for part in parts
@@ -40,7 +43,7 @@ def workspace_path_parts(name: str) -> tuple[str, ...]:
 
 
 def check_workspace_size(size: int, total: int, count: int) -> None:
-    if size > MAX_WORKSPACE_FILE_BYTES or total > 64 * 1024 * 1024 or count > 5000:
+    if size > MAX_WORKSPACE_FILE_BYTES or total > MAX_WORKSPACE_BYTES or count > MAX_WORKSPACE_ENTRIES:
         raise ProjectError("Project files exceed their count or size limit.")
 
 
@@ -96,49 +99,111 @@ def _read_metadata(path: Path, fields: tuple[str, ...]) -> dict[str, str]:
     return result
 
 
-def list_projects(root: Path) -> list[tuple[str, str]]:
+def list_projects(root: Path, *, issues: list[dict[str, str]] | None = None) -> list[tuple[str, str]]:
     if _is_link(root):
         raise ProjectError("Projects directory cannot be a link.")
     if not root.exists():
         return []
     result = []
     for path in root.iterdir():
-        if not path.is_dir() or path.name.startswith("."):
+        if path.name.startswith("."):
             continue
-        if _is_link(path) or _is_link(path / "project.json"):
-            raise ProjectError(f"Project paths cannot contain links: {path}")
-        metadata = _read_metadata(path / "project.json", ("name", "short_name"))
-        if path.name != metadata["short_name"]:
-            raise ProjectError(f"Project folder does not match its short name: {path}")
-        result.append((path.name, metadata["name"]))
+        try:
+            if not (path.is_dir() or _is_link(path)):
+                continue
+            metadata = _project_entry(path)
+            result.append((path.name, metadata["name"]))
+        except (ProjectError, OSError) as error:
+            if issues is None:
+                raise
+            issues.append({"project": path.name, "message": str(error)})
     return sorted(result, key=lambda item: item[1].casefold())
 
 
-def list_profiles(project: Path) -> list[tuple[str, str]]:
+def _profiles_root(project: Path) -> Path:
     root = project / "profiles"
     if _is_link(project) or _is_link(root) or not root.is_dir():
         raise ProjectError(f"Profile directory not found: {root}")
+    return root
+
+
+def list_profiles(project: Path, *, issues: list[dict[str, str]] | None = None) -> list[tuple[str, str]]:
+    root = _profiles_root(project)
     result = []
     for path in root.iterdir():
-        if not path.is_dir() or path.name.startswith("."):
+        if path.name.startswith("."):
             continue
-        if _is_link(path) or _is_link(path / "profile.json"):
-            raise ProjectError(f"Profile paths cannot contain links: {path}")
-        metadata = _read_metadata(path / "profile.json", ("name",))
-        result.append((path.name, metadata["name"]))
+        try:
+            if not (path.is_dir() or _is_link(path)):
+                continue
+            metadata = _profile_entry(path)
+            result.append((path.name, metadata["name"]))
+        except (ProjectError, OSError) as error:
+            if issues is None:
+                raise
+            issues.append({"project": project.name, "profile": path.name, "message": str(error)})
     return sorted(result, key=lambda item: item[1].casefold())
 
 
+def _project_entry(path: Path) -> dict[str, str]:
+    if _is_link(path) or _is_link(path / "project.json"):
+        raise ProjectError(f"Project paths cannot contain links: {path}")
+    metadata = project_metadata(path)
+    if path.name != metadata["short_name"]:
+        raise ProjectError(f"Project folder does not match its short name: {path}")
+    if _key(path.name, project=True) != path.name:
+        raise ProjectError(f"Invalid project folder name: {path.name}")
+    return metadata
+
+
+def _profile_entry(path: Path) -> dict[str, str]:
+    if _is_link(path) or _is_link(path / "profile.json"):
+        raise ProjectError(f"Profile paths cannot contain links: {path}")
+    validate_profile_key(path.name)
+    metadata = _read_metadata(path / "profile.json", ("name",))
+    for directory in (path / "config", path / "script"):
+        if _is_link(directory) or not directory.is_dir():
+            raise ProjectError(f"Required regular profile directory not found: {directory}")
+    return metadata
+
+
+def validate_deploy_name(short_name: str) -> None:
+    if _key(short_name, project=True) != short_name or short_name.casefold() == "barb":
+        raise ProjectError(f"Invalid AI identifier or conflict with the stock BARbarIAn: {short_name}")
+
+
+def validate_profile_key(key: str) -> None:
+    if not re.fullmatch(r"[a-z0-9]+(?:[-_][a-z0-9]+)*", key) or len(key) > 64:
+        raise ProjectError(f"Invalid profile folder name: {key}")
+
+
+def validate_deploy_metadata(metadata: dict[str, str], profile_keys: set[str]) -> None:
+    validate_deploy_name(metadata["short_name"])
+    _key(metadata["name"], project=True)
+    if metadata["default_profile"] not in profile_keys:
+        raise ProjectError("The project's default profile does not exist.")
+    for key in sorted(profile_keys):
+        validate_profile_key(key)
+
+
 def _files(root: Path, extension: str) -> list[Path]:
-    if root.is_symlink():
+    if _is_link(root):
         raise ProjectError(f"Symbolic links are not supported: {root}")
     if not root.is_dir():
         raise ProjectError(f"Required directory not found: {root}")
-    paths = list(root.rglob("*"))
-    link = next((path for path in paths if path.is_symlink()), None)
-    if link:
-        raise ProjectError(f"Symbolic links are not supported: {link}")
-    return sorted(path for path in paths if path.is_file() and path.suffix.lower() == extension)
+
+    def walk_error(error: OSError) -> None:
+        raise error
+
+    result = []
+    for directory, subdirs, filenames in os.walk(root, onerror=walk_error):
+        parent = Path(directory)
+        for name in subdirs + filenames:
+            if _is_link(parent / name):
+                raise ProjectError(f"Symbolic links are not supported: {parent / name}")
+        result.extend(parent / name for name in filenames
+                      if Path(name).suffix.lower() == extension and (parent / name).is_file())
+    return sorted(result)
 
 
 def _copy_profile(
@@ -219,6 +284,7 @@ def _copy_profile(
 
 def create_project(root: Path, name: str, stock: Path, *, source_label: str = "") -> Path:
     key = _key(name, project=True)
+    validate_deploy_name(key)
     root.mkdir(parents=True, exist_ok=True)
     target = _unique_child(root, key)
     with tempfile.TemporaryDirectory(prefix=".staging-", dir=root) as temporary:
@@ -242,16 +308,11 @@ def _create_profile(
     project: Path, name: str, *, stock: Path | None = None,
     source_key: str = "", source_label: str = "",
 ) -> Path:
-    root = project / "profiles"
-    if not root.is_dir():
-        raise ProjectError(f"Profile directory not found: {root}")
+    root = _profiles_root(project)
     key = _key(name, project=False)
     target = _unique_child(root, key)
     if stock is None:
-        available = dict(list_profiles(project))
-        if source_key not in available:
-            raise ProjectError(f"Source profile is not available: {source_key}")
-        source = root / source_key
+        source = _profile_path(project, source_key)
         _files(source, ".as")
         _files(source / "config", ".json")
         _files(source / "script", ".as")
@@ -303,9 +364,15 @@ def _existing_child(parent: Path, key: str) -> Path:
 
 
 def _profile_path(project: Path, key: str) -> Path:
-    if _is_link(project):
-        raise ProjectError("Project paths cannot contain links.")
-    return _existing_child(project / "profiles", key)
+    path = _existing_child(_profiles_root(project), key)
+    _profile_entry(path)
+    return path
+
+
+def project_path(root: Path, key: str) -> Path:
+    path = _existing_child(root, key)
+    _project_entry(path)
+    return path
 
 
 def _replace_metadata(path: Path, data: dict[str, str]) -> None:
@@ -366,7 +433,7 @@ def _delete_tree(path: Path) -> None:
 def delete_profile(project: Path, profile_key: str) -> None:
     """Delete a profile from a project."""
     path = _profile_path(project, profile_key)
-    if len(list_profiles(project)) <= 1:
+    if len(list_profiles(project, issues=[])) <= 1:
         raise ProjectError("A project must keep at least one profile.")
     if project_metadata(project)["default_profile"].casefold() == profile_key.casefold():
         raise ProjectError("Choose another default profile before deleting this one.")

@@ -49,6 +49,10 @@
 .match-tracker { margin: 18px 0 22px; }
 .match-tracker-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .match-tracker-toolbar .field { min-width: 155px; }
+.match-start-options { min-width: 0; border: 1px solid var(--line); border-radius: 8px; margin: 14px 0; padding: 12px; }
+.match-start-options legend { padding: 0 5px; }
+.match-start-options .row > label { min-width: 105px; }
+.match-start-options p { margin-top: 8px; }
 .match-tracker-filtered { display: none; }
 .match-tracker .table-wrap { border: 1px solid var(--line); border-radius: 8px; }
 .match-tracker-table { min-width: 710px; }
@@ -106,6 +110,11 @@
 .badge-clean{background:#1b322a;border:1px solid #3f6d5c;color:var(--mint)}
 .badge-dirty{background:#342619;border:1px solid #8a6234;color:#f0c486}
 .experiment-form { border: 0; padding: 0; margin: 0; min-width: 0; }
+.experiment-progress:empty,.panel p[role="status"]:empty{margin:0}
+.inline-error{color:#f2d3ae}
+.artifact-fingerprints{padding:0 12px}
+.artifact-fingerprints dt{font-weight:600}
+.artifact-fingerprints dd{margin:0 0 8px;overflow-wrap:anywhere;font-family:monospace}
 .experiment-form > * + * { margin-top: 12px; }
 .experiment-choices summary { cursor: pointer; }
 .tournament-profiles { max-height: 18rem; overflow: auto; padding: 0 12px; }
@@ -406,6 +415,9 @@ dialog.viewer #dialog-content{flex:1;min-height:0;display:flex;flex-direction:co
 .logv-status.error{color:var(--red)}
 .logv-section-nav{display:flex;gap:6px}
 .logv [hidden]{display:none}
+.logv-range{display:flex;flex-wrap:wrap;align-items:end;gap:8px;border:1px solid var(--line);border-radius:6px;margin:0;padding:6px 8px}
+.logv-range label{display:grid;gap:3px}
+.logv-range input{width:8ch}
 .rep.fold{border:1px solid var(--line);font-family:var(--font);cursor:pointer;line-height:1.4}
 .rep.fold:hover{border-color:var(--orange)}
 
@@ -422,4 +434,20 @@ dialog.viewer #dialog-content{flex:1;min-height:0;display:flex;flex-direction:co
     .logv{gap:5px}
     .logv-body{min-height:64px}
     .logv-option-list{max-height:160px;overflow:auto}
+}
+.control-tooltip {
+  position: fixed;
+  z-index: 10000;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: min(22rem, calc(100vw - 16px));
+  padding: 8px 11px;
+  border: 1px solid #61738a;
+  border-radius: 6px;
+  background: #142235;
+  color: #f4f8ff;
+  box-shadow: 0 5px 18px #0005;
+  font: 400 13px/1.45 system-ui, sans-serif;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }

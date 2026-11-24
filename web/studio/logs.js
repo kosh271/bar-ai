@@ -223,18 +223,42 @@ window.StudioLogs = (() => {
         if (text !== undefined) node.textContent = text;
         return node;
     }
+    const logTips = {
+        "↑": "Go to the previous search hit, or search the previous section if needed. Shift+Enter does the same in the search box.",
+        "↓": "Go to the next search hit, or search the next section if needed. Enter does the same in the search box.",
+        All: "Show every message type. Search still highlights matching text.",
+        Errors: "Show messages marked as errors. Add context lines to see what happened nearby.",
+        Warnings: "Show messages marked as warnings. Some warnings are expected during startup.",
+        "AI / AngelScript": "Show messages classified as AI or script output, including messages about the AI's rules.",
+        Other: "Show messages outside the named error, warning, and AI groups.",
+        "▲ Error": "Jump to the previous visible error in this section. The current filter controls which errors are visible.",
+        "▼ Error": "Jump to the next visible error in this section. The current filter controls which errors are visible.",
+        "Wrap lines": "Fit long messages to the pane width. Each message can take up more vertical space.",
+        Timestamps: "Show the time or simulation frame printed by the engine when available.",
+        "Collapse repeats": "Show consecutive identical messages once with a repeat count. The saved text still includes every line.",
+        "Fold startup blocks": "Hide the contents of recognized startup blocks to make the log easier to scan. Expand a block when you need its details.",
+        "Copy shown": "Copy visible messages with their original line numbers. If you selected line numbers, copy only the visible messages in that range.",
+        "Save text": "Download the log text, including lines hidden by filters. Large logs are downloaded one section at a time.",
+        Reload: "Read the current log section from disk again so you can see newly written messages.",
+        "Jump to crash": "Open the part of the log where the engine recorded the crash.",
+        "Previous section": "Load the preceding block of the log. Search and filters apply to the section you are viewing.",
+        "Next section": "Load the following block of the log. Search and filters apply to the section you are viewing.",
+        "Clear filters": "Show all message types and clear the search so hidden lines can appear again."
+    };
+    function logTip(node, text) { return window.StudioTips?.set(node, text) || node; }
+
     function actionButton(label, onClick, cls = "button") {
         const node = el("button", cls, label);
         node.type = "button";
         node.addEventListener("click", onClick);
-        return node;
+        return logTip(node, logTips[label]);
     }
     function toggle(label, checked, onChange) {
         const wrap = el("label", "logv-toggle"), input = el("input");
         input.type = "checkbox";
         input.checked = checked;
         input.addEventListener("change", () => onChange(input.checked));
-        wrap.append(input, document.createTextNode(" " + label));
+        wrap.append(logTip(input, logTips[label]), document.createTextNode(" " + label));
         return wrap;
     }
     function loadPrefs() {
@@ -265,7 +289,7 @@ window.StudioLogs = (() => {
         fileGroup.setAttribute("aria-label", "Log file");
         const fileButtons = sources.map(([name, label]) => {
             const node = actionButton(label, () => switchFile(name));
-            node.title = name;
+            logTip(node, `Read ${name} for this run. Search and filters use the selected file.`);
             fileGroup.append(node);
             return [name, node];
         });
@@ -274,11 +298,12 @@ window.StudioLogs = (() => {
         search.type = "search"; search.placeholder = "Find in log"; search.autocomplete = "off"; search.spellcheck = false;
         search.id = "logv-search-" + Math.random().toString(36).slice(2, 8);
         searchLabel.htmlFor = search.id;
+        logTip(search, "Find text in the log. Use Enter or Shift+Enter to move through hits. For a large log, navigation can load a neighboring section.");
         const hitCounter = el("span", "logv-count", "");
+        hitCounter.setAttribute("role", "status");
         const previousHit = actionButton("↑", () => goHit(-1));
         const nextHit = actionButton("↓", () => goHit(1));
         previousHit.setAttribute("aria-label", "Previous match"); nextHit.setAttribute("aria-label", "Next match");
-        previousHit.title = "Previous match (Shift+Enter)"; nextHit.title = "Next match (Enter)";
         const pillButtons = FILTERS.map(([kind, label]) => [kind, label, actionButton(label, () => {
             filter = kind; notice = ""; selectionReset(); render(); startHit();
         })]);
@@ -290,9 +315,11 @@ window.StudioLogs = (() => {
         }
         contextSelect.value = String(prefs.context);
         contextSelect.setAttribute("aria-label", "Context lines around filtered results");
+        logTip(contextSelect, "Show this many neighboring lines on each side of a filtered result, even if those lines are a different message type.");
         contextSelect.addEventListener("change", () => { prefs.context = Number(contextSelect.value); savePrefs(prefs); render(); });
         const jumpSelect = el("select");
         jumpSelect.setAttribute("aria-label", "Jump to");
+        logTip(jumpSelect, "Go directly to a location such as game start or the first error. The viewer may load a different section.");
         for (const [value, label] of [["", "Jump to…"], ["top", "Top"], ["start", "Game start"], ["error", "First error"], ["end", "End"]]) {
             const option = el("option", "", label);
             option.value = value;
@@ -301,20 +328,51 @@ window.StudioLogs = (() => {
         jumpSelect.addEventListener("change", () => { jump(jumpSelect.value); jumpSelect.value = ""; });
         const previousError = actionButton("▲ Error", () => goProblem(-1));
         const nextError = actionButton("▼ Error", () => goProblem(1));
-        previousError.title = "Previous error (Shift+E)"; nextError.title = "Next error (E)";
         const wrapToggle = toggle("Wrap lines", prefs.wrap, value => { prefs.wrap = value; savePrefs(prefs); applyClasses(); });
         const timeToggle = toggle("Timestamps", prefs.times, value => { prefs.times = value; savePrefs(prefs); applyClasses(); render(); });
         const collapseToggle = toggle("Collapse repeats", prefs.collapse, value => { prefs.collapse = value; savePrefs(prefs); render(); });
         const foldToggle = toggle("Fold startup blocks", prefs.fold, value => { prefs.fold = value; savePrefs(prefs); render(); });
         const copy = actionButton("Copy shown", copyLines), download = actionButton("Save text", downloadFile);
+        const range = el("fieldset", "logv-range");
+        range.hidden = true;
+        function lineInput(label) {
+            const field = el("label", "", label), input = el("input");
+            Object.assign(input, {type: "number", min: 1, step: 1, required: true});
+            field.append(input);
+            range.append(field);
+            return input;
+        }
+        range.append(el("legend", "", "Log line range"));
+        const fromLine = lineInput("First line"), toLine = lineInput("Last line");
+        range.append(actionButton("Select range", () => {
+            if (!fromLine.reportValidity() || !toLine.reportValidity()) return;
+            if (fromLine.valueAsNumber > toLine.valueAsNumber) {
+                announce("First line must be at or before last line.");
+                fromLine.focus();
+                return;
+            }
+            anchor = selStart = fromLine.valueAsNumber;
+            selEnd = toLine.valueAsNumber;
+            notice = "";
+            paintSelection();
+            updateStatus();
+        }));
+        const rangeToggle = actionButton("Select lines", () => {
+            range.hidden = !range.hidden;
+            rangeToggle.setAttribute("aria-expanded", String(!range.hidden));
+            if (!range.hidden) fromLine.focus();
+        });
+        rangeToggle.setAttribute("aria-expanded", "false");
+        range.id = search.id + "-range";
+        rangeToggle.setAttribute("aria-controls", range.id);
         const reload = actionButton("Reload", () => loadFile(section));
         const crash = actionButton("Jump to crash", jumpToCrash, "button logv-crash");
         crash.hidden = true;
-        copy.title = "Copy log lines with their original line numbers";
         const options = el("details", "logv-options");
         const optionList = el("div", "logv-option-list");
         optionList.append(wrapToggle, timeToggle, collapseToggle, foldToggle, previousError, nextError, download, reload);
-        options.append(el("summary", "button", "View"), optionList);
+        options.append(logTip(el("summary", "button", "View"),
+            "Open display options, error navigation, and commands for saving or reloading log text."), optionList);
 
         const bar1 = el("div", "logv-bar"), bar2 = el("div", "logv-bar");
         const findGroup = el("div", "logv-find");
@@ -323,7 +381,7 @@ window.StudioLogs = (() => {
         const pills = el("div", "logv-pills");
         pills.append(...pillButtons.map(([, , node]) => node));
         const spacer = el("span", "logv-spacer");
-        bar2.append(pills, crash, spacer, contextSelect, jumpSelect, options, copy);
+        bar2.append(pills, crash, spacer, contextSelect, jumpSelect, options, rangeToggle, copy);
         const banner = el("div", "logv-banner");
         banner.hidden = true;
         const body = el("div", "logv-body"), scroller = el("div", "logv-scroll"), rowsBox = el("div", "logv-rows");
@@ -331,6 +389,8 @@ window.StudioLogs = (() => {
         scroller.tabIndex = 0;
         scroller.setAttribute("role", "region");
         scroller.setAttribute("aria-label", "Log lines");
+        logTip(scroller, "Use Select lines to set a range by line number, or click and shift-click the line numbers.");
+        logTip(map, "Click the overview strip to scroll to that part of the visible log section.");
         map.setAttribute("aria-hidden", "true");
         scroller.append(rowsBox);
         body.append(scroller, map);
@@ -342,7 +402,7 @@ window.StudioLogs = (() => {
         const forwardSection = actionButton("Next section", () => moveSection(1));
         sectionNav.append(backSection, forwardSection);
         foot.append(status, sectionNav);
-        root.append(bar1, bar2, banner, body, foot);
+        root.append(bar1, bar2, range, banner, body, foot);
 
         function applyClasses() {
             root.classList.toggle("wrap", prefs.wrap);
@@ -444,6 +504,15 @@ window.StudioLogs = (() => {
         function announce(text) { notice = text; updateStatus(); }
 
         function selectionReset() { anchor = selStart = selEnd = null; }
+        function updateRange() {
+            const first = entries[0]?.n ?? 1;
+            const last = entries.at(-1)?.n ?? first;
+            for (const [input, value] of [[fromLine, selStart ?? first], [toLine, selEnd ?? last]]) {
+                input.min = first;
+                input.max = last;
+                input.value = value;
+            }
+        }
         function paintSelection() {
             for (const node of rowEls) {
                 if (node._n === undefined) continue;
@@ -458,6 +527,7 @@ window.StudioLogs = (() => {
             else if (selStart === n && selEnd === n) selectionReset();
             else { anchor = n; selStart = selEnd = n; }
             notice = "";
+            updateRange();
             paintSelection();
             updateStatus();
         });
@@ -533,10 +603,14 @@ window.StudioLogs = (() => {
             }
             if (item.fold) {
                 const fold = actionButton(item.fold.open ? "▾ fold" : `▸ ${item.fold.count.toLocaleString()} lines folded`, () => {
+                    const restoreFocus = document.activeElement === fold;
                     if (expanded.has(item.fold.index)) expanded.delete(item.fold.index); else expanded.add(item.fold.index);
                     render();
+                    if (restoreFocus) (rowsBox.querySelector(`[data-fold-line="${entry.n}"]`) || scroller).focus({preventScroll: true});
                 }, "rep fold");
-                fold.title = item.fold.open ? "Fold this block again" : "Show the lines in this block";
+                fold.dataset.foldLine = entry.n;
+                logTip(fold, item.fold.open ? "Hide the contents of this startup block. The original lines stay in the log." :
+                    "Reveal the hidden startup messages in this block.");
                 fold.setAttribute("aria-expanded", String(item.fold.open));
                 message.append(fold);
             }
@@ -612,8 +686,12 @@ window.StudioLogs = (() => {
             nextHit.disabled = !pattern || loading || !(hitEls.length || nextSection);
             previousError.disabled = nextError.disabled = !errorEls.length;
             copy.disabled = !view.rows.some(item => !item.gap);
+            rangeToggle.disabled = !idle;
+            range.disabled = !idle;
             download.disabled = !rawLines.length;
-            download.title = section.offset || nextSection ? "Save this section as text" : "Save this log as text";
+            logTip(download, section.offset || nextSection
+                ? "Download all lines in this section as text, including lines hidden by filters. Other sections are separate."
+                : "Download the full log as text, including lines hidden by filters.");
             jumpSelect.disabled = contextSelect.disabled = !idle;
             reload.disabled = loading;
             crash.hidden = crashLine === null;
@@ -675,6 +753,7 @@ window.StudioLogs = (() => {
                 failure = error instanceof Error ? error.message : String(error);
             }
             loading = false;
+            updateRange();
             render();
             startHit();
             if (jumpOnOpen && !search.value && filter === "all") jumpToCrash();

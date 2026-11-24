@@ -89,8 +89,7 @@ def write_archive(profile: Path, output: BinaryIO) -> None:
 
 
 def _destination(project: Path, name: str) -> Path:
-    projects.list_profiles(project)
-    return projects._unique_child(project / "profiles", projects._key(name, project=False))
+    return projects._unique_child(projects._profiles_root(project), projects._key(name, project=False))
 
 
 def load_archive(project: Path, name: str, source: BinaryIO) -> Path:

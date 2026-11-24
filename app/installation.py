@@ -12,7 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .projects import ProjectError, _key, _read_metadata, list_profiles, profile_files
+from .projects import (
+    ProjectError, _is_link, list_profiles, profile_files, project_metadata,
+    validate_deploy_metadata, validate_deploy_name,
+)
 
 
 class InstallationError(Exception):
@@ -45,8 +48,7 @@ BASE = (
 
 
 def _link(path: Path) -> bool:
-    is_junction = getattr(path, "is_junction", None)
-    return path.is_symlink() or (is_junction is not None and is_junction())
+    return _is_link(path)
 
 
 def _check_links(root: Path, path: Path) -> None:
@@ -69,18 +71,11 @@ def _lua(value: str) -> str:
 
 def _metadata(project: Path) -> tuple[str, str, str]:
     try:
-        info = _read_metadata(project / "project.json", ("name", "short_name", "default_profile"))
-        _key(info["name"], project=True)
-        if project.is_symlink() or _key(info["short_name"], project=True) != info["short_name"]:
-            raise InstallationError("Invalid project name or short name.")
-        if project.name != info["short_name"] or info["short_name"].casefold() == "barb":
-            raise InstallationError("The project name conflicts with the stock BARbarIAn.")
+        info = project_metadata(project)
+        if project.name != info["short_name"]:
+            raise InstallationError("Project folder does not match its short name.")
         profiles = dict(list_profiles(project))
-        if info["default_profile"] not in profiles:
-            raise InstallationError("The project's default profile does not exist.")
-        for key in profiles:
-            if not re.fullmatch(r"[a-z0-9]+(?:[-_][a-z0-9]+)*", key) or len(key) > 64:
-                raise InstallationError(f"Invalid profile folder name: {key}")
+        validate_deploy_metadata(info, set(profiles))
         return info["short_name"], info["name"], info["default_profile"]
     except ProjectError as error:
         raise InstallationError(str(error)) from error
@@ -114,6 +109,8 @@ def _snapshot(root: Path) -> dict[str, str] | None:
 
 
 def _managed(target: Path, short_name: str) -> bool:
+    if _link(target / MANIFEST):
+        raise InstallationError(f"Installation metadata cannot be a link: {target}")
     try:
         info = json.loads((target / MANIFEST).read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -396,9 +393,52 @@ def _other_installation(data: Path, engine: str, short_name: str) -> bool:
         if other.name == engine or not other.is_dir():
             continue
         target = other / "AI" / "Skirmish" / short_name / VERSION
-        if target.exists() and _managed(target, short_name):
-            return True
+        if target.exists():
+            _check_links(data, target)
+            if _managed(target, short_name):
+                return True
     return False
+
+
+def list_managed(data: Path, engines: tuple[str, ...]) -> tuple[list[dict[str, str]], list[str]]:
+    """List deployments by their on-disk manifests, including deleted projects."""
+    entries = []
+    issues = []
+    names = {}
+    try:
+        lobby = data / LOBBY_FILE
+        _check_links(data, lobby)
+        _base, names = _lobby_entries(_read_lobby(lobby) or BASE)
+    except (OSError, InstallationError, UnicodeError) as error:
+        issues.append(str(error))
+    for engine in engines:
+        directory = data / "engine" / engine / "AI" / "Skirmish"
+        try:
+            _check_links(data, directory)
+            if not directory.is_dir():
+                continue
+            children = sorted(directory.iterdir(), key=lambda item: item.name.casefold())
+        except (OSError, InstallationError) as error:
+            issues.append(f"{engine}: {error}")
+            continue
+        for parent in children:
+            target = parent / VERSION
+            manifest = target / MANIFEST
+            try:
+                _check_links(data, target)
+                if not manifest.exists() and not _link(manifest):
+                    continue
+                _check_links(data, manifest)
+                validate_deploy_name(parent.name)
+                if not _managed(target, parent.name):
+                    continue
+                entries.append({
+                    "project": parent.name, "name": names.get(f"{parent.name} {VERSION}", parent.name),
+                    "engine": engine, "path": str(target),
+                })
+            except (OSError, InstallationError, ProjectError) as error:
+                issues.append(f"{engine}: {error}")
+    return entries, issues
 
 
 def install(project: Path, data: Path, engine: str, confirm: Callable[[str], bool]) -> InstallResult:
@@ -462,7 +502,20 @@ def install(project: Path, data: Path, engine: str, confirm: Callable[[str], boo
 
 
 def remove(project: Path, data: Path, engine: str, confirm: Callable[[str], bool]) -> Path:
-    short_name, _name, _default = _metadata(project)
+    try:
+        short_name = project_metadata(project)["short_name"]
+    except ProjectError as error:
+        raise InstallationError(str(error)) from error
+    if project.name != short_name:
+        raise InstallationError("Project folder does not match its short name.")
+    return remove_installed(short_name, data, engine, confirm)
+
+
+def remove_installed(short_name: str, data: Path, engine: str, confirm: Callable[[str], bool]) -> Path:
+    try:
+        validate_deploy_name(short_name)
+    except ProjectError as error:
+        raise InstallationError(str(error)) from error
     _stock, target = _target(data, engine, short_name)
     if not target.is_dir() or not _managed(target, short_name):
         raise InstallationError(f"No editor-managed installation found at {target}.")

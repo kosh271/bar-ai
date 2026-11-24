@@ -1,14 +1,65 @@
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.game_sources import GameSource
 from app.installation import InstallResult
+from app import profile_text
 from app.project_editor import ProjectEditor
 from app.settings import EditorState
 
 
 class SourceSelectionTests(unittest.TestCase):
+    def test_existing_mixed_endings_survive_insertion_among_repeated_lines(self):
+        lines = ["same\r\n" if index % 2 == 0 else "same\n" for index in range(350)]
+        original = "".join(lines) + "tail\r\n"
+        edited = "same\n" * 199 + "new\n" + "same\n" * 151 + "changed\n"
+        expected = "".join(lines[:199]) + "new\r\n" + "".join(lines[199:]) + "changed\r\n"
+        self.assertEqual(profile_text.restore_newlines(original, edited), expected)
+
+    def test_shared_save_rolls_back_if_second_replacement_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "first.as", root / "second.as"
+            first.write_bytes(b"original one\r\n")
+            second.write_bytes(b"original two\r\n")
+            before = {path: path.read_bytes() for path in (first, second)}
+            replace = os.replace
+
+            def replace_or_fail(source, target):
+                if target == second:
+                    raise PermissionError("file is locked")
+                replace(source, target)
+
+            with patch("app.profile_text.os.replace", side_effect=replace_or_fail):
+                with self.assertRaises(PermissionError):
+                    profile_text.replace(root, [
+                        (path, profile_text.digest(data), b"edited\r\n") for path, data in before.items()
+                    ])
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+            self.assertEqual(set(root.iterdir()), {first, second})
+
+    def test_legacy_save_retains_newlines_and_detects_another_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            relative = Path("script") / "main.as"
+            path = Path(directory) / relative
+            path.parent.mkdir()
+            path.write_bytes(b"first\r\nsecond\n")
+            editor = MagicMock(profile=Path(directory), current_file=None)
+            editor._discard_changes.return_value = True
+            self.assertTrue(ProjectEditor._open_file(editor, relative))
+            editor.text.get.return_value = "changed\nsecond\n"
+            ProjectEditor.save_file(editor)
+            self.assertEqual(path.read_bytes(), b"changed\r\nsecond\n")
+
+            path.write_bytes(b"external\r\nsecond\n")
+            editor.text.get.return_value = "another\nsecond\n"
+            ProjectEditor.save_file(editor)
+            self.assertEqual(path.read_bytes(), b"external\r\nsecond\n")
+            self.assertIn("changed outside", str(editor._show_error.call_args.args[0]))
+
     def test_suggested_source_shows_game_version_without_package_details(self):
         editor = MagicMock()
         source = GameSource(

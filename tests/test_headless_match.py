@@ -116,10 +116,16 @@ class HeadlessMatchTests(unittest.TestCase):
         self.assertEqual(popen.call_count, 2)
 
     @patch("app.headless.subprocess.Popen")
-    def test_extra_units_pack_applies_to_smoke_and_match(self, popen):
+    def test_custom_game_options_apply_to_smoke_and_match(self, popen):
+        options = {"starting_metal": 2000, "starting_energy": 5000,
+                   "starter_base": True, "build_turret": True}
+
         def launch(command, **kwargs):
             run = Path(command[-1]).parent
-            self.assertIn("experimentalextraunits=1;", (run / "script.txt").read_text(encoding="utf-8"))
+            script = (run / "script.txt").read_text(encoding="utf-8")
+            for line in ("experimentalextraunits=1;", "startmetal=2000;", "startenergy=5000;",
+                         "quick_start=enabled;", "commanderbuildersenabled=enabled;"):
+                self.assertIn(line, script)
             (run / "infolog.txt").write_text(
                 "Skirmish AI <AI-1>: Load script: script/hard/main.as\n"
                 "[f=0001800] Executing debugcommand, quitforce\n", encoding="utf-8"
@@ -133,7 +139,10 @@ class HeadlessMatchTests(unittest.TestCase):
             root = Path(directory)
             (root / "spring-headless.exe").touch()
             self.assertNotIn("experimentalextraunits=", headless.build_script("Map", "Game", self.players, 1))
-            run_match(root, root, root, "Map", "Game", self.players, 1, self.stop, extra_units=True)
+            _, run = run_match(root, root, root, "Map", "Game", self.players, 1, self.stop,
+                               extra_units=True, start_options=options)
+            result = json.loads((run / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["start_options"], options)
         self.assertEqual(popen.call_count, 2)
 
     def test_match_telemetry_associates_startup_and_explicit_team_events(self):

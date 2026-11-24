@@ -79,7 +79,7 @@ window.StudioEditors = (() => {
             const handle = document.createElement("span");
             handle.className = "build-order-drag-handle";
             handle.draggable = true;
-            handle.title = "Drag to reorder";
+            window.StudioTips?.set(handle, "Drag this defense earlier or later in the build order. Use the arrow buttons to do the same with a keyboard.");
             handle.setAttribute("aria-hidden", "true");
             handle.addEventListener("dragstart", event => {
                 draggedRow = row;

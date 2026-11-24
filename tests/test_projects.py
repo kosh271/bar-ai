@@ -1,4 +1,5 @@
 import io
+import json
 import stat
 import tempfile
 import unittest
@@ -44,6 +45,22 @@ class ProjectTests(unittest.TestCase):
         (self.stock / "script" / "hard" / "manager" / "work.as").write_text(
             '#include "../../unit.as"\n', encoding="utf-8"
         )
+
+    def test_project_import_refuses_undeployable_identifiers(self):
+        for short_name, profile_key in (("Example", "Hard"), ("Example", "hard--fast"), ("BARb", "hard")):
+            with self.subTest(short_name=short_name, profile_key=profile_key):
+                bundle = io.BytesIO()
+                with zipfile.ZipFile(bundle, "w") as archive:
+                    archive.writestr("project.json", json.dumps({
+                        "name": "Example", "short_name": short_name, "default_profile": profile_key,
+                    }))
+                    prefix = f"profiles/{profile_key}"
+                    archive.writestr(f"{prefix}/profile.json", '{"name":"Hard"}')
+                    for name, data in (("config/settings.json", "{}"), ("script/init.as", ""), ("script/main.as", "")):
+                        archive.writestr(f"{prefix}/{name}", data)
+                with self.assertRaises(ProjectError):
+                    project_archive.load(self.projects, bundle)
+                self.assertFalse((self.projects / short_name).exists())
 
     def test_create_clones_shared_files_and_rewrites_includes(self):
         project = create_project(self.projects, "My AI", self.stock)

@@ -103,11 +103,8 @@ def load(root: Path, source: BinaryIO) -> Path:
             raise projects.ProjectError(f"Invalid project ZIP: {error}") from error
         metadata = projects.project_metadata(staged)
         key = metadata["short_name"]
-        if projects._key(key, project=True) != key:
-            raise projects.ProjectError("Invalid AI identifier in project ZIP.")
         profiles = dict(projects.list_profiles(staged))
-        if metadata["default_profile"] not in profiles:
-            raise projects.ProjectError("The project ZIP is missing its default profile.")
+        projects.validate_deploy_metadata(metadata, set(profiles))
         for profile_key in profiles:
             profile = projects._profile_path(staged, profile_key)
             files = {path.as_posix(): path for path in projects.profile_files(profile)}

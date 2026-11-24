@@ -3,7 +3,7 @@
 function experimentNumber(label, value, min, max) {
     const wrap = element("label", "field", label), input = element("input");
     Object.assign(input, {type: "number", value, min, max, step: "1", required: true});
-    wrap.append(input);
+    wrap.append(describeControl(input, StudioTips.field(label)));
     return [wrap, input];
 }
 
@@ -13,7 +13,7 @@ function tournamentProfiles(choices, savedPlayers, changed) {
     const options = new Map(choices);
     const selected = new Map(savedPlayers.map(({ai, faction}) => [JSON.stringify(ai), faction])
         .filter(([key]) => options.has(key)));
-    const summary = element("summary");
+    const summary = describeControl(element("summary"), "Show the installed profiles available for this tournament. Each added profile introduces more matchups.");
     const list = element("div", "tournament-profiles");
     const checks = [];
     details.append(summary, list);
@@ -26,11 +26,12 @@ function tournamentProfiles(choices, savedPlayers, changed) {
         const label = element("label", "tournament-profile-choice"), input = element("input");
         input.type = "checkbox";
         input.checked = selected.has(key);
+        describeControl(input, "Enter this installed profile in the tournament. Adding a profile increases the number of pairings competing for the game budget.");
         checks.push(input);
         const faction = dropdown("Faction", tournamentFactionOptions, selected.get(key) || "Armada", value => {
             selected.set(key, value);
             changed();
-        });
+        }, "Pick a fixed faction, cycle through factions with Rotate, or select Random. Both games in a mirrored pair use the same factions.");
         const select = faction.querySelector("select");
         select.setAttribute("aria-label", `Faction for ${text}`);
         faction.hidden = !input.checked;
@@ -51,7 +52,7 @@ function tournamentProfiles(choices, savedPlayers, changed) {
     }
     updateCount();
     details.append(element("p", "muted tournament-faction-help",
-        "Select 2–16 profiles. Rotate cycles through Armada, Cortex, and Legion. Random rolls independently each game."));
+        "Select 2–16 profiles. Rotate cycles through Armada, Cortex, and Legion. Random draws a faction for each mirrored pair and keeps it for both starting sides."));
     return [details, selected];
 }
 
@@ -129,6 +130,9 @@ function experimentMapPicker(maps, initial, changed = () => {}) {
             (next && !next.disabled ? next : search).focus({preventScroll: true});
         });
         control.setAttribute("aria-label", `${action} ${name}`);
+        describeControl(control, action === "Add"
+            ? "Include this map in the experiment. Map terrain can change which strategies do well."
+            : "Take this map out of the experiment pool. It stays installed and can be added again.");
         control.disabled = disabled;
         row.append(element("span", "", name), control);
         list.append(row);
@@ -168,7 +172,8 @@ function experimentForm(content) {
     const saved = state.experiments.tournament;
     const defaultGame = content.games.includes(state.match.game) ? state.match.game : content.games[0];
     const defaults = {game: defaultGame, minutes: Math.min(state.match.minutes, 120), game_limit: 24, seconds_limit: 1200};
-    const setups = {tournament: {...defaults, ...saved}, sweep: {...defaults}};
+    const setups = {tournament: {...defaults, start_options: QUICKSTART_DEFAULTS, ...saved},
+        sweep: {...defaults, start_options: QUICKSTART_DEFAULTS}};
     if (!content.games.includes(setups.tournament.game)) setups.tournament.game = defaultGame;
     let mode = "tournament";
     const tournament = tournamentMapPool(content.maps, state.match.map, saved?.maps);
@@ -183,10 +188,14 @@ function experimentForm(content) {
     const [gamesLabel, games] = experimentNumber("Game limit", setups.tournament.game_limit, 1, 100);
     const [secondsLabel, seconds] = experimentNumber("Real-time limit (seconds)", setups.tournament.seconds_limit, 1, 21600);
     const limits = {minutes, game_limit: games, seconds_limit: seconds};
+    const starting = startingConditions(setups.tournament.start_options, options => {
+        setups[mode].start_options = options;
+        saveTournament();
+    });
     function saveTournament() {
         if (mode !== "tournament") return;
-        const {game, minutes, game_limit, seconds_limit} = setups.tournament;
-        const tournament = {game, minutes, game_limit, seconds_limit, maps: [...tournamentMaps],
+        const {game, minutes, game_limit, seconds_limit, start_options} = setups.tournament;
+        const tournament = {game, minutes, game_limit, seconds_limit, start_options, maps: [...tournamentMaps],
             players: Array.from(candidates, ([key, faction]) => ({ai: JSON.parse(key), faction}))};
         state.experiments.tournament = tournament;
         rememberPreference({tournament});
@@ -208,7 +217,7 @@ function experimentForm(content) {
     let detectedParams = [];
     const paramWrap = element("label", "field", "Detected script parameter (optional)");
     const paramSelect = element("select");
-    paramWrap.append(paramSelect);
+    paramWrap.append(describeControl(paramSelect, "Pick a number Studio found in the script. It fills in the line and column so you can identify the number without counting characters."));
     paramWrap.hidden = true;
     paramSelect.addEventListener("change", () => {
         const chosen = detectedParams[Number(paramSelect.value)];
@@ -254,7 +263,7 @@ function experimentForm(content) {
         }),
         paramWrap, lineLabel, columnLabel, sourceLine, valuesLabel,
         dropdown("Baseline opponent", choices, baseline, value => { baseline = value; }),
-        element("p", "muted", "Each value plays both starting sides on the same map. Only decided pairs count toward promotion.")
+        element("p", "muted", "Each value plays both starting sides on the same map. Promotion needs at least two clean, decided pairs and a paired score above 50%. Draws count as half a point.")
     );
     refreshScriptParams();
     showLine();
@@ -269,6 +278,7 @@ function experimentForm(content) {
         tournamentPicker.hidden = mode !== "tournament";
         sweepPicker.hidden = mode !== "sweep";
         candidateList.hidden = mode !== "tournament";
+        starting.reset(setups[mode].start_options);
         sweepFields.hidden = sweepFields.disabled = mode !== "sweep";
     }
     displayMode(mode);
@@ -279,15 +289,25 @@ function experimentForm(content) {
     );
     const budgets = element("div", "row");
     budgets.append(minutesLabel, gamesLabel, secondsLabel);
+    const [seedLabel, seed] = experimentNumber("Schedule seed (optional)", "", 0, 4294967295);
+    describeControl(seed, "Leave blank for a generated seed. To repeat the schedule, use the saved seed with the same maps and profiles in the same order.");
+    seed.required = false;
+    budgets.append(seedLabel);
+    const feedback = element("p", "inline-error");
+    feedback.setAttribute("role", "status");
     const start = button("Start experiment", async () => {
+        feedback.textContent = "";
         if (!form.reportValidity()) return;
         const maps = mode === "tournament" ? tournamentMaps : sweepMaps;
         const payload = {...state.settings, game: setups[mode].game, maps: [...maps], minutes: Number(minutes.value),
             game_limit: Number(games.value), seconds_limit: Number(seconds.value), mode};
         if (maps.size < 1 || maps.size > experimentMapLimit) {
-            message(`Choose 1 to ${experimentMapLimit} installed maps.`, true);
+            feedback.textContent = `Choose 1 to ${experimentMapLimit} installed maps.`;
             return;
         }
+        payload.start_options = starting.read();
+        if (!payload.start_options) return;
+        if (seed.value !== "") payload.seed = seed.valueAsNumber;
         try {
             if (mode === "tournament") {
                 if (candidates.size < 2 || candidates.size > 16) throw Error("Select 2 to 16 distinct profiles.");
@@ -315,30 +335,77 @@ function experimentForm(content) {
             pollMatch(true);
         } catch (error) {
             fields.disabled = false;
-            message(errorText(error), true);
+            feedback.textContent = errorText(error);
         }
     }, "button primary");
     form.addEventListener("submit", event => { event.preventDefault(); start.click(); });
     fields.append(element("h2", "", "New experiment"), row, tournamentPicker, sweepPicker,
-        candidateList, sweepFields, budgets, start);
+        candidateList, starting.fields, sweepFields, budgets, start, feedback);
     fields.id = "experiment-form";
     return form;
 }
 
-function experimentResults(experiment, gamesOpen = true) {
+function experimentResults(experiment, openSections = null) {
     const box = element("div");
     if (!experiment) return box;
+    if (experiment.start_options) box.append(element("p", "muted", startingConditionsText(experiment.start_options)));
+    if (experiment.seed !== undefined) box.append(element("p", "muted", `Schedule seed ${experiment.seed}`));
+    const coverage = experiment.coverage;
+    if (coverage) box.append(element("p", "muted",
+        `${coverage.completed_pairs} / ${coverage.scheduled_pairs} mirrored pairs completed · ` +
+        `${coverage.scheduled_pairs} / ${coverage.full_pairs} pairs scheduled across the selected maps`));
+    if (experiment.schedule?.length) {
+        const details = element("details");
+        details.dataset.section = "schedule";
+        details.open = openSections?.has("schedule") ?? false;
+        const table = experimentTable(["Pair", "Game", "Map", "Side 1", "Side 2"]);
+        for (const planned of experiment.schedule) {
+            const team = side => planned.players.filter(player => player.ally === side).map(player =>
+                `${player.name || player.short_name}${player.profile ? "/" + player.profile : ""} (${player.faction})`).join(" + ");
+            const row = table.tBodies[0].insertRow();
+            for (const value of [planned.pair_index, planned.index, planned.map, team(0), team(1)]) {
+                row.append(element("td", "", String(value)));
+            }
+        }
+        details.append(element("summary", "", "Scheduled games"), experimentTableWrap(table));
+        box.append(details);
+    }
+    if (experiment.provenance) {
+        const provenance = experiment.provenance;
+        const details = element("details"), list = element("dl", "artifact-fingerprints");
+        details.dataset.section = "fingerprints";
+        details.open = openSections?.has("fingerprints") ?? false;
+        const checksumSource = provenance.archive_checksum_source === "engine_startup_log"
+            ? "Engine startup log" : provenance.archive_checksum_source;
+        const entries = [["Engine SHA-256", provenance.engine_sha256], ["Unitsync SHA-256", provenance.unitsync_sha256],
+            ["Archive checksum source", checksumSource], ["Game archive checksum", provenance.game_archive_checksum]];
+        if (provenance.archive_conflicts?.length) {
+            entries.push(["Changed during run", provenance.archive_conflicts.join(", ")]);
+        }
+        for (const [map, checksum] of Object.entries(provenance.map_archive_checksums || {})) {
+            entries.push([`${map} archive checksum`, checksum]);
+        }
+        for (const ai of provenance.ais || []) entries.push([`${ai.short_name} ${ai.version} SHA-256`, ai.sha256]);
+        for (const [label, value] of entries) {
+            list.append(element("dt", "", label), element("dd", "", String(value ?? "Unavailable")));
+        }
+        details.append(element("summary", "", "Engine and content fingerprints"), list);
+        box.append(details);
+    }
     const finalists = experiment.rankings || [];
     if (finalists.length) {
         const table = experimentTable(["Profile", "Wins", "Losses", "Draws", "Win rate", "Avg. game",
-            "Script errors", "Engine errors", "Error-free", "Failures", "Timeouts"]);
+            "Script errors", "Engine errors", "Error-free", "Failures", "Timeouts",
+            ...(experiment.mode === "sweep" ? ["Clean decided pairs", "Paired score"] : [])]);
         table.classList.add("experiment-standings");
         for (const row of finalists) {
             const tr = element("tr");
             const rate = typeof row.win_rate === "number" ? `${(100 * row.win_rate).toFixed(1)}%` : "—";
             const average = trackerClock(row.average_duration_seconds);
+            const pairedRate = typeof row.paired_win_rate === "number" ? `${(100 * row.paired_win_rate).toFixed(1)}%` : "—";
+            const pairedValues = experiment.mode === "sweep" ? [row.valid_pairs, pairedRate] : [];
             for (const value of [row.label, row.wins, row.losses, row.draws, rate, average, row.script_errors,
-                row.engine_errors, row.error_free_games, row.failures, row.timeouts]) {
+                row.engine_errors, row.error_free_games, row.failures, row.timeouts, ...pairedValues]) {
                 tr.append(element("td", "", String(value ?? "—")));
             }
             table.tBodies[0].append(tr);
@@ -346,7 +413,8 @@ function experimentResults(experiment, gamesOpen = true) {
         box.append(element("h3", "", "Leaderboard"), experimentTableWrap(table));
         const winner = finalists.find(row => row.id === experiment.best_candidate_id && row.promotable);
         if (experiment.promotable && winner) box.append(button(
-            `Promote ${winner.label} to a profile`, () => experimentPromotion(experiment, winner)
+            `Promote ${winner.label} to a profile`, () => experimentPromotion(experiment, winner), "action",
+            "Copy the winning sweep value into a new editable profile. The source profile remains available, and the new one can be installed after review."
         ));
     }
     const games = experiment.games || [];
@@ -384,7 +452,8 @@ function experimentResults(experiment, gamesOpen = true) {
             table.tBodies[0].append(tr);
         }
         const details = element("details", "experiment-results-details");
-        details.open = gamesOpen;
+        details.dataset.section = "games";
+        details.open = openSections?.has("games") ?? true;
         details.append(element("summary", "", `Game results (${games.length})`), experimentTableWrap(table));
         box.append(details);
     }
@@ -433,56 +502,91 @@ function updateExperimentStatus() {
     const form = $("experiment-form");
     if (form) form.disabled = running;
     const experiment = snapshot?.operation === "experiment" && (snapshot.result?.experiment || snapshot.experiment);
-    const live = target.querySelector(".live-game-tracker") || element("section", "live-game-tracker");
+    const {heading, progress, feedback, controls, live, results, pause, cancel} = target.parts;
     const activeMatchups = experiment && running ? (snapshot.active_matchups || []) : [];
     renderLiveGames(live, activeMatchups.map(game => ({...game, limit: experiment.minutes * 60})));
     const inHistory = experiment && state.experiments.history.some(item => item.id === experiment.id);
-    const signature = JSON.stringify([snapshot?.id, snapshot?.state, snapshot?.message, inHistory,
-        experiment?.paused, experiment?.pause_requested, experiment?.games?.length,
-        snapshot?.active_games, snapshot?.parallel_games, state.match.statusError]);
-    if (target.dataset.signature === signature) return;
-    target.dataset.signature = signature;
-    const gamesOpen = target.querySelector(".experiment-results-details")?.open ?? true;
-    target.replaceChildren();
-    if (state.match.statusError) target.append(notice("Could not refresh experiment status. " + state.match.statusError, true));
-    if (running && !experiment) {
-        target.append(notice(snapshot.operation === "experiment" ? "Preparing experiment…" : "Another Studio operation is running."));
-        if (snapshot.operation !== "experiment") return;
-    }
-    if (!experiment && !running) return;
+    heading.hidden = !experiment;
+    let statusText = "";
+    if (running && !experiment) statusText = snapshot.operation === "experiment"
+        ? "Preparing experiment…" : "Another Studio operation is running.";
     if (experiment) {
-        const progress = `${experiment.completed_games} / ${experiment.scheduled_games} games`;
+        const games = `${experiment.completed_games} / ${experiment.scheduled_games} games`;
         const active = running ? ` · ${snapshot.active_games} active · ${snapshot.parallel_games} parallel limit` : "";
         const draining = (experiment.pause_requested || snapshot.parallel_games === 0) && snapshot.active_games > 0;
         const phase = experiment.paused ? "Paused" : snapshot.state === "running" && draining ? "Draining active games" : snapshot.state;
         const detail = experiment.paused ? " · Real-time budget still running"
             : running && snapshot.state === "running" ? "" : ` · ${snapshot.message || ""}`;
-        target.append(element("h2", "", "Current experiment"),
-            notice(`${phase} · ${progress}${active}${detail}`, snapshot.state === "failed"));
+        statusText = `${phase} · ${games}${active}${detail}`;
     }
-    if (running) {
-        const controls = element("div", "row");
-        const paused = experiment?.paused || experiment?.pause_requested;
-        const action = (label, endpoint, payload) => button(label, async event => {
-            const control = event.currentTarget;
-            control.disabled = true;
-            try {
-                state.match.snapshot = await api(endpoint, {...payload, id: snapshot.id});
+    if (progress.textContent !== statusText) progress.textContent = statusText;
+    const statusError = state.match.statusError ? "Could not refresh experiment status. " + state.match.statusError : "";
+    if (feedback.textContent !== statusError && (statusError || feedback.dataset.statusError)) {
+        feedback.textContent = statusError;
+        feedback.dataset.statusError = statusError;
+    }
+    const canCancel = running && snapshot.state === "running" && snapshot.operation === "experiment";
+    const canPause = canCancel && experiment && snapshot.parallel_games > 0;
+    const active = document.activeElement;
+    const focusAfter = active === pause && !canPause || active === cancel && !canCancel;
+    controls.hidden = !canCancel;
+    pause.hidden = !canPause;
+    cancel.hidden = !canCancel;
+    if (focusAfter) (canCancel ? cancel : progress).focus({preventScroll: true});
+    const pauseLabel = experiment?.paused || experiment?.pause_requested ? "Resume" : "Pause new games";
+    if (pause.textContent !== pauseLabel) {
+        pause.textContent = pauseLabel;
+        describeControl(pause, StudioTips.action(pauseLabel));
+    }
+    const showing = experiment && (running || !inHistory);
+    const signature = JSON.stringify([showing ? experiment.id : null, experiment?.state, experiment?.coverage,
+        experiment?.completed_games, experiment?.games?.length, experiment?.stop_reason,
+        experiment?.schedule?.length, Boolean(experiment?.provenance)]);
+    if (results.dataset.signature === signature || results.contains(document.activeElement)) return;
+    results.dataset.signature = signature;
+    const sections = Array.from(results.querySelectorAll("details[data-section]"));
+    const openSections = sections.length ? new Set(sections.filter(section => section.open).map(section => section.dataset.section)) : null;
+    if (openSections && !sections.some(section => section.dataset.section === "games")) openSections.add("games");
+    results.replaceChildren(...(showing ? [experimentResults(experiment, openSections)] : []));
+}
+
+function experimentStatusPanel() {
+    const panel = element("div", "panel");
+    panel.id = "experiment-status";
+    const heading = element("h2", "", "Current experiment");
+    const progress = element("p", "experiment-progress");
+    progress.tabIndex = -1;
+    const feedback = element("p", "inline-error");
+    progress.setAttribute("role", "status");
+    feedback.setAttribute("role", "status");
+    const controls = element("div", "row");
+    const live = element("section", "live-game-tracker");
+    const results = element("div");
+    results.addEventListener("focusout", () => setTimeout(updateExperimentStatus, 0));
+    const action = (label, endpoint, payload) => button(label, async event => {
+        const control = event.currentTarget;
+        const current = state.match.snapshot;
+        if (control.getAttribute("aria-disabled") === "true") return;
+        control.setAttribute("aria-disabled", "true");
+        feedback.textContent = "";
+        try {
+            const response = await api(endpoint, {...payload(current), id: current.id});
+            if (state.match.snapshot?.id === current.id) {
+                state.match.snapshot = response;
                 updateExperimentStatus();
-            } catch (error) { message(errorText(error), true); }
-            finally { control.disabled = false; }
-        });
-        if (experiment && snapshot.state === "running") {
-            if (snapshot.parallel_games > 0) {
-                controls.append(action(paused ? "Resume" : "Pause new games", "/api/experiment/pause", {paused: !paused}));
+                pollMatch(true);
             }
-        }
-        if (snapshot.state === "running") controls.append(action("Cancel experiment", "/api/match/cancel", {}));
-        target.append(controls);
-    }
-    if (experiment && (running || !inHistory)) {
-        target.append(live, experimentResults(experiment, gamesOpen));
-    }
+        } catch (error) { feedback.textContent = errorText(error); }
+        finally { control.removeAttribute("aria-disabled"); }
+    });
+    const pause = action("Pause new games", "/api/experiment/pause", snapshot => ({
+        paused: !(snapshot.experiment?.paused || snapshot.experiment?.pause_requested)
+    }));
+    const cancel = action("Cancel experiment", "/api/match/cancel", () => ({}));
+    controls.append(pause, cancel);
+    panel.append(heading, progress, feedback, controls, live, results);
+    panel.parts = {heading, progress, feedback, controls, live, results, pause, cancel};
+    return panel;
 }
 
 function renderExperimentHistory() {
@@ -495,39 +599,58 @@ function renderExperimentHistory() {
     const result = element("div");
     const draw = async () => {
         const entry = data.history.find(item => item.id === data.selected);
-        result.replaceChildren(experimentResults(entry));
-        if (!entry?.games?.some(game => !game.side_totals && game.run_id)) return;
+        const status = element("p", "muted", "Loading the saved experiment…");
+        status.setAttribute("role", "status");
+        result.replaceChildren(status);
         try {
             const {experiment} = await api("/api/experiment/history?" + new URLSearchParams({id: entry.id}));
-            if (data.selected !== entry.id || !result.isConnected) return;
-            const index = data.history.indexOf(entry);
-            if (index !== -1) data.history[index] = experiment;
-            const open = result.querySelector(".experiment-results-details")?.open ?? true;
-            result.replaceChildren(experimentResults(experiment, open));
+            if (data.selected !== entry.id || !status.isConnected) return;
+            result.replaceChildren(experimentResults(experiment));
         } catch (error) {
-            if (data.selected === entry.id && result.isConnected) {
-                result.append(notice("Could not load saved game totals. " + errorText(error), true));
+            if (data.selected === entry.id && status.isConnected) {
+                status.textContent = "Could not load the saved experiment. " + errorText(error);
             }
         }
     };
     if (!data.history.some(item => item.id === data.selected)) data.selected = data.history[0].id;
     box.append(dropdown("Saved experiment", data.history.map(item => [item.id,
         `${item.mode === "sweep" ? "Sweep" : "Tournament"} · ${item.started_at} · ${item.state}`
-    ]), data.selected, value => { data.selected = value; draw(); }), result);
+    ]), data.selected, value => { data.selected = value; draw(); }), result,
+    historyPagination("experiment-history-pagination", () => data.historyOffset, () => data.historyNext,
+        async offset => {
+            const direction = offset > data.historyOffset ? "forward" : "backward";
+            await loadExperimentHistory(false, offset);
+            const selector = direction === "forward" ? "button:last-child" : "button:first-child";
+            const buttons = $("experiment-history-pagination");
+            if (document.activeElement === document.body && buttons) {
+                const desired = buttons.querySelector(selector);
+                (desired.disabled ? buttons.querySelector("button:not([disabled])") : desired)?.focus();
+            }
+        }));
     draw();
 }
 
-async function loadExperimentHistory(checkStatus = false) {
+let experimentHistoryRequest = 0;
+async function loadExperimentHistory(checkStatus = false, offset = state.experiments.historyOffset) {
     const data = state.experiments;
+    const request = ++experimentHistoryRequest;
     try {
         if (checkStatus && !matchPoll) {
             state.match.snapshot = await api("/api/match/status");
             updateExperimentStatus();
             if (["running", "cancelling"].includes(state.match.snapshot.state)) pollMatch();
         }
-        data.history = (await api("/api/experiment/history")).experiments;
+        const result = await api("/api/experiment/history?" + new URLSearchParams({offset, limit: 25}));
+        if (request !== experimentHistoryRequest) return;
+        if (!result.experiments.length && offset > 0) return loadExperimentHistory(false, Math.max(0, offset - 25));
+        data.history = result.experiments;
+        data.historyOffset = offset;
+        data.historyNext = result.next_offset ?? null;
         data.error = "";
-    } catch (error) { data.error = errorText(error); }
+    } catch (error) {
+        if (request !== experimentHistoryRequest) return;
+        data.error = errorText(error);
+    }
     renderExperimentHistory();
     updateExperimentStatus();
 }
@@ -545,8 +668,7 @@ function experimentView(target) {
     } else {
         target.append(experimentForm(content));
     }
-    const live = element("div", "panel"), history = element("div", "panel");
-    live.id = "experiment-status";
+    const live = experimentStatusPanel(), history = element("div", "panel");
     history.id = "experiment-history";
     target.append(live, history);
     updateExperimentStatus();

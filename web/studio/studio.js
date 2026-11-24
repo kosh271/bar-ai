@@ -3,17 +3,21 @@
 const $ = id => document.getElementById(id);
 const C = window.StudioConfig;
 const S = window.StudioScripts;
+const QUICKSTART_DEFAULTS = Object.freeze({
+    starting_metal: 2000, starting_energy: 5000, starter_base: true, build_turret: true
+});
 const state = {
-    projects: [], project: "", profile: "", files: [], page: "overview",
+    projects: [], projectIssues: [], project: "", profile: "", files: [], page: "overview",
     layer: {}, factory: "", situation: "land", response: "", file: "",
     settings: null, defaultBarRoot: "", catalog: null, unitNames: new Map(), icons: {available: false, message: "", cache: new Map()}, saving: false, history: [], installStatus: null,
-    experiments: {history: [], selected: "", error: "", tournament: null},
+    experiments: {history: [], historyOffset: 0, historyNext: null, selected: "", error: "", tournament: null},
     match: {
         content: null, cached: false, cacheKey: "", cacheError: "", game: "", map: "",
         first: "", second: "", faction1: "Armada", faction2: "Cortex",
         side1: [], side2: [], seriesGames: 1, swapSides: false, seriesMaps: [], factionPairs: [],
-        minutes: 120, skip: false, snapshot: null, statusError: "", capacity: null,
-        history: [], historyFilters: {project: "", profile: "", map: "", checkpoint: ""}, historyError: ""
+        minutes: 120, skip: false, startOptions: QUICKSTART_DEFAULTS, snapshot: null, statusError: "", capacity: null,
+        history: [], historyOffset: 0, historyNext: null,
+        historyFilters: {project: "", profile: "", map: "", checkpoint: ""}, historyError: ""
     }
 };
 const pages = {
@@ -42,13 +46,15 @@ function element(tag, cls, text) {
     const node = document.createElement(tag);
     if (cls) node.className = cls;
     if (text !== undefined) node.textContent = text;
+    if (tag === "summary") StudioTips.set(node, StudioTips.summary(text));
     return node;
 }
-function button(text, fn, cls = "action") {
+function button(text, fn, cls = "action", help = StudioTips.action(text)) {
     const b = element("button", cls, text);
     b.type = "button"; b.addEventListener("click", fn);
-    return b;
+    return StudioTips.set(b, help);
 }
+function describeControl(control, text) { return StudioTips.set(control, text); }
 function notice(text, warning = false) { return element("div", "notice" + (warning ? " warning" : ""), text); }
 function errorText(error) { return error instanceof Error ? error.message : String(error); }
 function message(text, error = false) {
@@ -188,7 +194,7 @@ function rememberMatchPreferences() {
     const [first, second] = rosters.map(team => team[0]);
     rememberPreference({match: {
         game: m.game, map: m.map, first: first.ai, second: second.ai, faction1: first.faction,
-        faction2: second.faction, minutes: m.minutes, skip_smoke: m.skip, rosters
+        faction2: second.faction, minutes: m.minutes, skip_smoke: m.skip, start_options: m.startOptions, rosters
     }});
 }
 async function refreshState(project, profile) {
@@ -205,13 +211,16 @@ async function refreshState(project, profile) {
             })));
             Object.assign(state.match, {
                 game: match.game, map: match.map, minutes: match.minutes, skip: match.skip_smoke,
+                startOptions: match.start_options ?? QUICKSTART_DEFAULTS,
                 first: JSON.stringify(match.first), second: JSON.stringify(match.second),
                 faction1: match.faction1, faction2: match.faction2,
                 side1: teams?.[0] || [], side2: teams?.[1] || []
             });
         }
     }
-    state.projects = data.projects; setSettings(data.settings);
+    state.projects = data.projects;
+    state.projectIssues = data.project_issues || [];
+    setSettings(data.settings);
     await loadIconStatus();
     state.defaultBarRoot = data.default_bar_root || "";
     await loadCachedMatchContent();
@@ -300,13 +309,14 @@ function showDialog(title, content) {
 function textInput(label, value = "", placeholder = "") {
     const wrap = element("label", "field", label), input = element("input");
     input.value = value; input.placeholder = placeholder; wrap.append(input);
+    describeControl(input, StudioTips.field(label));
     return [wrap, input];
 }
-function dropdown(label, options, value, change) {
+function dropdown(label, options, value, change, help = StudioTips.field(label)) {
     const wrap = element("label", "field", label), select = element("select");
     selectOptions(select, options, value);
     select.addEventListener("change", () => change(select.value));
-    wrap.append(select); return wrap;
+    wrap.append(describeControl(select, help)); return wrap;
 }
 function chooseFile(page) {
     const names = groups[page] || [];
@@ -375,7 +385,7 @@ function layerPreview(initial, placement = false) {
         for (const preset of scopedPresets.values()) actions.append(button(preset.name, () => {
             order.splice(0, order.length, ...preset.order);
             draw();
-        }));
+        }, "action", "Preview the files the startup script lists for this condition, in their recorded order."));
         box.insertBefore(suggested, content);
     }
     if (warnings.length) {
@@ -395,6 +405,7 @@ function layerPreview(initial, placement = false) {
         const checkboxes = variants.map(([name, path]) => {
             const label = element("label", "option-check"), input = element("input");
             input.type = "checkbox"; input.checked = path === initial.path;
+            describeControl(input, "Include this layer when you apply the example order. The example is only used in this preview.");
             label.append(input, document.createTextNode(name)); options.append(label);
             return {input, path};
         });
@@ -417,11 +428,15 @@ function layerPreview(initial, placement = false) {
             up.setAttribute("aria-label", `Move ${path} at position ${index + 1} up`);
             down.setAttribute("aria-label", `Move ${path} at position ${index + 1} down`);
             remove.setAttribute("aria-label", `Remove ${path} at position ${index + 1}`);
+            describeControl(up, "Load this file earlier in the preview. A file after it can override its values.");
+            describeControl(down, "Load this file later in the preview so it can override earlier values.");
+            describeControl(remove, "Exclude this file from the preview. The AI's actual startup files stay the same.");
             row.append(up, down, remove);
             list.append(row);
         });
         const picker = element("select");
         picker.setAttribute("aria-label", placement ? "Settings file to add" : "Configuration file to add");
+        describeControl(picker, "Choose a file to append to the preview. Adding it can replace values from earlier files in the preview.");
         selectOptions(picker, files.map(file => [file.path, file.path]), files[0]?.path || "");
         const row = element("div", "row");
         row.append(picker, button(placement ? "Add settings file" : "Add file", () => {if (picker.value) {order.push(picker.value); draw();}}));
@@ -478,7 +493,7 @@ function previewNode(node, title, path) {
     const value = element("pre", "preview-value", JSON.stringify(node.value));
     row.append(label, value); return row;
 }
-function fieldInput(file, node, aria, callback, {preserveNumberText = false} = {}) {
+function fieldInput(file, node, aria, callback, {preserveNumberText = false, help = ""} = {}) {
     const input = element("input");
     input.setAttribute("aria-label", aria);
     const rawNumber = current => preserveNumberText ? file.text.slice(current.start, current.end) : current.value;
@@ -511,7 +526,42 @@ function fieldInput(file, node, aria, callback, {preserveNumberText = false} = {
             else input.value = current.kind === "number" ? rawNumber(current) : current.value;
         }
     });
-    return input;
+    return describeControl(input, help || configValueTip(file, node));
+}
+function configValueTip(file, node) {
+    const known = {
+        vs: "Enter the enemy unit role this response reacts to. The AI must recognize the role name.",
+        ratio: StudioTips.field("Investment ratio"),
+        importance: StudioTips.field("Importance")
+    };
+    if (node.path[0] === "response" && Object.hasOwn(known, node.path[2])) return known[node.path[2]];
+    if (node.path[0] === "building" || (node.path[0] === "terrain" && file.path.includes("block_map"))) {
+        const info = placementInfo(node.path, node.value);
+        if (info?.description) return [info.description, info.valueDescription].filter(Boolean).join(" ");
+    }
+    if (node.path[0] === "behaviour" && node.path.length >= 3) {
+        const key = node.path[2];
+        const unitSettings = {
+            limit: "Cap how many of this unit the AI can have. A cap of zero prevents normal production even if the unit has a positive factory weight.",
+            since: "Set the first time this unit can become available, in game seconds. Other requirements such as income and factory availability can still delay it.",
+            threat: "Change how dangerous the AI thinks an enemy unit of this type is. Raising the multiplier can make the AI engage it more cautiously.",
+            power: "Change how much strength the AI credits to its own units of this type. Higher values can make groups more willing to take on stronger enemies.",
+            retreat: "Adjust when this unit leaves a fight based on its remaining health. This works with the default retreat setting for its unit type.",
+            build_mod: "Adjust the building's target construction time and how many builders are assigned. A smaller value can bring more builders over from other work."
+        };
+        if (Object.hasOwn(unitSettings, key)) return unitSettings[key];
+    }
+    if (node.path[0] === "porcupine" && node.path[1] === "amount") {
+        const budget = {
+            factor: "Scale how much metal the AI can commit to a cluster's defenses based on its income. More budget can leave less metal for expansion or units.",
+            map: "Set the reference map size for the multiplier in the same position. The AI blends the paired multipliers for sizes between these references.",
+            offset: "Set a bound on the random adjustment to the income multiplier. A wider range can make defense spending vary more across clusters."
+        };
+        if (Object.hasOwn(budget, node.path[2])) return budget[node.path[2]];
+    }
+    const name = node.path.map(key => String(key).replace(/_/g, " ")).join(" › ");
+    const format = {boolean: "Turn this setting on or off", number: "Enter a number", string: "Enter text or a game ID"}[node.kind];
+    return `${format} for ${name || "the root value"} in this file. For custom settings, check the AI script that reads the value before changing it.`;
 }
 function treeNode(file, node, title, depth = 0, onChange = null, describe = null) {
     const info = describe ? describe(node.path, node.value, node.kind) : null;
@@ -519,6 +569,8 @@ function treeNode(file, node, title, depth = 0, onChange = null, describe = null
     if (node.children) {
         const detail = element("details"), summary = element("summary", "", `${title}  ·  ${node.children.length}`);
         const body = element("div", "tree-body");
+        describeControl(summary, info?.description ? `${info.description} Expand to see its settings.` :
+            `Expand to see the settings inside ${title}.`);
         detail.append(summary, body);
         detail.addEventListener("toggle", () => {
             if (detail.open && !body.childNodes.length) {
@@ -537,7 +589,8 @@ function treeNode(file, node, title, depth = 0, onChange = null, describe = null
     else label.append(element("div", "path", node.path.join(" / ")));
     if (node.kind === "null") row.append(label, element("span", "muted", info ? "Not set (game default)" : "null · source view only"));
     else {
-        const input = fieldInput(file, node, info && info.label ? info.label : node.path.join(" / "), onChange);
+        const input = fieldInput(file, node, info && info.label ? info.label : node.path.join(" / "), onChange,
+            {help: [info?.description, info?.valueDescription].filter(Boolean).join(" ")});
         const id = "field-" + Math.random().toString(36).slice(2);
         input.id = id; label.htmlFor = id; row.append(label, input);
         if (describe && info && info.valueDescription !== undefined) {
@@ -578,7 +631,7 @@ function overview(target) {
     const grid = element("div", "grid");
     for (const key of ["opening", "production", "economy", "defense", "combat", "units", "placement", "advanced"]) {
         const [title, description, icon] = pages[key];
-        const card = button("", () => navigate(key), "card");
+        const card = button("", () => navigate(key), "card", StudioTips.page(key));
         card.append(element("span", "card-arrow", "↗"), element("span", "card-icon", icon), element("h3", "", title), element("p", "", description));
         grid.append(card);
     }
@@ -655,11 +708,20 @@ function primaryUnitRoles(preferred) {
     return roles;
 }
 let unitPickerSequence = 0;
-function unitPicker(label, ids, selected, onSelect, preferredRoles) {
+function unitPicker(label, ids, selected, onSelect, preferredRoles, help) {
+    const pickerHelp = {
+        "Catalog build option": "Choose a buildable unit to add to this factory's production options.",
+        "Unit ID": "Choose the unit whose roles, attributes, and individual settings you want to see.",
+        "Completed building": "Choose which completed building contributes to the follow-up rule's count.",
+        "Requested building": "Choose which building the AI requests when enough qualifying buildings are complete.",
+        "Completed building ID": "Choose the completed building whose follow-up defense chains you want to edit.",
+        "Unit to recruit": "Choose the unit the rule should maintain. The selected factory must be able to build it."
+    };
     const control = element("div", "field unit-picker"), title = element("span", "", label);
     const id = `unit-picker-${++unitPickerSequence}`;
     title.id = id + "-title";
-    const trigger = button("", () => panel.hidden ? open() : close(), "action unit-picker-trigger");
+    const trigger = button("", () => panel.hidden ? open() : close(), "action unit-picker-trigger",
+        help || pickerHelp[label]);
     trigger.dataset.unitPickerLabel = label;
     trigger.setAttribute("aria-label", `${label}: ${unitLabel(selected)}`);
     trigger.setAttribute("aria-expanded", "false");
@@ -669,6 +731,7 @@ function unitPicker(label, ids, selected, onSelect, preferredRoles) {
     const panel = element("div", "unit-picker-panel"), filters = element("div", "unit-picker-filters");
     panel.id = id; panel.hidden = true;
     const search = window.StudioEditors.unitSearchInput(label);
+    describeControl(search, "Filter the list by unit name or game ID. Use the arrow keys to highlight a result and Enter to choose it.");
     const list = element("div", "unit-picker-results"), count = element("div", "unit-picker-count muted");
     list.id = id + "-list";
     search.setAttribute("role", "combobox");
@@ -680,7 +743,8 @@ function unitPicker(label, ids, selected, onSelect, preferredRoles) {
     const factions = [["", "All factions"], ["arm", "Armada"], ["cor", "Cortex"], ["leg", "Legion"], ["other", "Other"]];
     let role = "", faction = "", choices = [], matching = [], nodes = [], active = -1, iconObserver;
     let rolesLoaded = false;
-    filters.append(dropdown("Faction", factions, "", value => { faction = value; refresh(); }));
+    filters.append(dropdown("Faction", factions, "", value => { faction = value; refresh(); },
+        "Show units from one faction. This filters the picker and leaves the current selection in place."));
     panel.append(search, filters, count, list);
     control.append(title, trigger, panel);
     function open() {
@@ -694,7 +758,8 @@ function unitPicker(label, ids, selected, onSelect, preferredRoles) {
             const options = [...new Set(choices.map(entry => entry.role).filter(Boolean))].sort();
             if (options.length) {
                 filters.append(dropdown("Primary role", [["", "All roles"], ...options.map(name => [name, name])], "",
-                    value => { role = value; refresh(); }));
+                    value => { role = value; refresh(); },
+                    "Filter by the unit's main role, such as a builder or fighter. The current unit stays selected."));
             }
             rolesLoaded = true;
         }
@@ -749,6 +814,7 @@ function unitPicker(label, ids, selected, onSelect, preferredRoles) {
             option.dataset.unitId = entry.id;
             option.setAttribute("role", "option");
             option.setAttribute("aria-selected", String(entry.id === selected));
+            describeControl(option, `Choose ${unitLabel(entry.id)} for ${label.toLowerCase()}.`);
             if (entry.name) name.append(element("small", "muted", entry.id));
             option.append(name);
             if (entry.role) option.append(element("span", "muted", entry.role));
@@ -861,6 +927,7 @@ function catalogDialog() {
             const games = [...new Set(data.sources.map(source => source.game_name).filter(Boolean))];
             if (!games.length) throw Error("No packaged games were found. Unpacked sources cannot currently be selected for this catalog.");
             const label = element("label", "field", "Installed game"), select = element("select");
+            describeControl(select, "Choose the game version to read its units and build options. Other versions may supply different units.");
             selectOptions(select, [["", "Choose a game"], ...games.map(game => [game, game])], "");
             label.append(select);
             let job = null;
@@ -914,7 +981,8 @@ function production(target, selected) {
     }
     if (!factories.children.some(e => e.key === state.factory)) state.factory = factories.children[0].key;
     const row = element("div", "row");
-    row.append(unitPicker("Factory", factories.children.map(e => e.key), state.factory, value => { state.factory = value; render(); }),
+    row.append(unitPicker("Factory", factories.children.map(e => e.key), state.factory, value => { state.factory = value; render(); }, undefined,
+            "Choose which factory's build preferences and income tiers you want to edit."),
         dropdown("Situation", [["land", "Land"], ["water", "Water"], ["air", "Enemy air"]], state.situation, value => { state.situation = value; render(); }));
     row.append(unitIcon(state.factory));
     panel.append(row);
@@ -926,7 +994,9 @@ function production(target, selected) {
         for (const item of thresholds.children) {
             if (item.node.kind !== "number") continue;
             const label = element("label", "field", `Tier ${item.key + 1}`);
-            label.append(fieldInput(file, item.node, `${state.factory} tier ${item.key + 1} income`)); inputs.append(label);
+            label.append(fieldInput(file, item.node, `${state.factory} tier ${item.key + 1} income`, null, {
+                help: "Set the income cutoff for this production tier. A higher cutoff keeps the lower-tier weights in use longer. The AI's income calculation can depend on both metal and energy."
+            })); inputs.append(label);
         }
         panel.append(inputs);
     }
@@ -966,8 +1036,10 @@ function production(target, selected) {
             if (entry.kind === "number") {
                 const weight = element("div", "weight"), hint = element("span", "weight-share");
                 hint.id = `production-share-${index}-${i}`;
-                const input = fieldInput(file, entry, `${unit.node.value} ${tier.key} weight`, null, {preserveNumberText: true});
-                input.setAttribute("aria-describedby", hint.id);
+                const input = fieldInput(file, entry, `${unit.node.value} ${tier.key} weight`, null, {preserveNumberText: true,
+                    help: "Set this unit's weight relative to the other units in this column. Raising it reduces their shares. A weight of zero gives this unit no share here."
+                });
+                StudioTips.addDescription(input, hint.id, weight);
                 const column = weightColumns[index];
                 column.push({input, hint});
                 input.addEventListener("input", () => refreshShares(column));
@@ -981,7 +1053,7 @@ function production(target, selected) {
             if (!confirm(`Remove ${unit.node.value} from this factory and every tier in this file?`)) return;
             try { assign(file, C.changeFactoryUnit(file.text, state.factory, "", i)); render(); }
             catch (error) { message(errorText(error), true); }
-        }));
+        }, "action", "Remove this unit and its weights from every tier for this factory in the selected file. Other settings or layers can still request it."));
         tr.append(td); table.append(tr);
     });
     weightColumns.forEach(refreshShares);
@@ -1053,7 +1125,7 @@ function responseView(panel, file, root) {
                     ({path: ["response", state.response, key], remove: i}))));
                 render();
             } catch (error) { message(errorText(error), true); }
-        }));
+        }, "action", "Delete this enemy-role response and its ratio and importance together. The AI can still respond through other rules."));
         tr.append(remove);
         table.append(tr);
     });
@@ -1097,7 +1169,7 @@ function economyView(panel, file, root) {
     for (const item of found) {
         const row = element("div", "tree-field"), label = element("label");
         label.append(element("div", "", item.label), element("div", "muted", item.help));
-        row.append(label, fieldInput(file, item.node, item.label)); panel.append(row);
+        row.append(label, fieldInput(file, item.node, item.label, null, {help: StudioTips.field(item.label) || item.help})); panel.append(row);
     }
     panel.append(notice("Generator selection differs between BARb versions. A setting being present does not guarantee that the selected DLL uses it."));
 }
@@ -1120,12 +1192,18 @@ function unitsView(panel, file, root) {
         const rows = element("div");
         list.children.forEach((entry, index) => {
             const row = element("div", "row");
-            row.append(fieldInput(file, entry.node, `${selected} ${key} ${index + 1}`),
+            row.append(fieldInput(file, entry.node, `${selected} ${key} ${index + 1}`, null,
+                    {help: key === "role" ? (index === 0 ?
+                        "Set this unit's primary role. Rules that look for this type of unit may start or stop choosing it." :
+                        "Set an additional role. The inspected AI uses these extra roles when classifying enemy units.") :
+                        StudioTips.field("Add attribute")}),
                 button("Remove", () => {
                     if (key === "role" && list.children.length === 1) { message("A unit needs a primary role.", true); return; }
                     try { assign(file, C.editArrays(file.text, [{path: ["behaviour", selected, key], remove: index}])); render(); }
                     catch (error) { message(errorText(error), true); }
-                }));
+                }, "action", key === "role" ?
+                    "Remove this role. Removing the first role changes which role becomes primary. The unit must keep at least one role." :
+                    "Remove this attribute. Rules that depend on it may stop matching this unit."));
             rows.append(row);
         });
         const [label, input] = textInput(`Add ${key === "role" ? "role" : "attribute"}`, "");
@@ -1135,7 +1213,9 @@ function unitsView(panel, file, root) {
             if (!value || currentList.children.some(e => e.node.value === value)) { message("Enter a new, non-duplicate value.", true); return; }
             try { assign(file, C.editArrays(file.text, [{path: ["behaviour", selected, key], add: value}])); message("Added. Verify the name exists in the selected runtime."); render(); }
             catch (error) { message(errorText(error), true); }
-        }));
+        }, "action", key === "role"
+            ? "Add this role to the end of the list. Existing roles keep their order."
+            : "Add this attribute. Rules that check it may begin matching this unit."));
         panel.append(rows);
     }
     panel.append(element("h3", "", "Selected unit settings"));
@@ -1224,6 +1304,7 @@ function defenseSlotPicker(label, slots, selected, change, {id, placeholder, unk
     picker.append(trigger, popup);
     const search = window.StudioEditors.unitSearchInput(label);
     search.className = "defense-slot-search";
+    describeControl(search, "Filter slots by number or building name. Each slot can map to a different building for each faction.");
     search.autofocus = true;
     const count = element("div", "unit-picker-count muted");
     count.setAttribute("role", "status");
@@ -1256,7 +1337,9 @@ function defenseSlotPicker(label, slots, selected, change, {id, placeholder, unk
         const indicator = element("span", "defense-slot-indicator", "▾");
         indicator.setAttribute("aria-hidden", "true");
         trigger.setAttribute("aria-label", `${label}: ${description}`);
-        trigger.title = description;
+        describeControl(trigger, (id || label === "Defense to add")
+            ? "Choose a defense slot for this order. Each faction builds the unit listed in its column."
+            : "Choose the defense slot for this timed request. Each faction builds the unit listed in its column.");
         trigger.replaceChildren(summary, indicator);
     }
     showSelection(selected);
@@ -1310,6 +1393,7 @@ function defenseSlotPicker(label, slots, selected, change, {id, placeholder, unk
                 }, "defense-slot-option");
                 option.setAttribute("role", "option");
                 option.tabIndex = -1;
+                describeControl(option, "Select this slot. The AI uses the building listed for its own faction.");
                 if (units) {
                     option.classList.add("defense-slot-grid");
                     cells(option, slot, units, false);
@@ -1485,7 +1569,10 @@ function clusterDefenseView(panel, file, root) {
                 next < sequence.children.length - (action === null ? 1 : 0) ? `cluster-defense-slot-${next}` : "cluster-defense-add"),
                 "cluster-defense-row-button");
             control.setAttribute("aria-label", description);
-            control.title = label;
+            describeControl(control, {
+                up: "Move this defense earlier so the AI considers it sooner. This may move it into the preventive slots.",
+                down: "Move this defense later so the AI considers it later. This may move it out of the preventive slots."
+            }[action] || "Remove this entry from the build order. Other entries may move into the preventive slots.");
             control.disabled = next < 0 || (action === "down" && next >= sequence.children.length);
             buttons.append(control);
         }
@@ -1931,6 +2018,7 @@ function scriptSettings(panel, path, title, definitions) {
         input.min = String(min); if (max !== null) input.max = String(max);
         input.value = Number(current.literal.replace(/[fF]$/, ""));
         input.setAttribute("aria-label", label);
+        describeControl(input, StudioTips.field(label));
         input.addEventListener("change", () => {
             try {
                 current = locate();
@@ -2066,10 +2154,12 @@ function recruitRulesView(panel) {
         const yieldLabel = element("label", "option-check");
         const yieldInput = element("input");
         yieldInput.type = "checkbox"; yieldInput.checked = Boolean(rule?.yieldNormal);
+        describeControl(yieldInput, "Skip the next eligible special order after each one placed, giving the factory's normal rules a chance to run. The group replenishes more slowly.");
         yieldLabel.append(yieldInput, document.createTextNode("Yield alternate turns"));
         const metalLabel = element("label", "option-check");
         const metalInput = element("input");
         metalInput.type = "checkbox"; metalInput.checked = Boolean(rule?.requireMetal);
+        describeControl(metalInput, "Wait until the AI has enough stored metal to pay for a unit. This can delay recruitment when resources are tight.");
         metalLabel.append(metalInput, document.createTextNode("Require stored metal"));
         const [milestonesLabel, milestonesInput] = textInput("Milestone buildings (optional IDs)",
             rule?.milestones?.join(", ") || "", "e.g. armsilo, armamd");
@@ -2082,7 +2172,8 @@ function recruitRulesView(panel) {
 
         const top = element("div", "row");
         top.append(
-            unitPicker("Factory", unitChoices, factory, value => { factory = value; }),
+            unitPicker("Factory", unitChoices, factory, value => { factory = value; }, undefined,
+                "Choose the factory that receives the recruitment request. It must be able to build the selected unit."),
             unitPicker("Unit to recruit", unitChoices, unit, value => { unit = value; }),
             targetLabel, startLabel, cooldownLabel
         );
@@ -2150,6 +2241,9 @@ function initLayersView(panel) {
                 onUpdate(next);
             });
             const remove = button("Remove", () => onUpdate(items.filter((_, i) => i !== index)));
+            describeControl(up, "Load this file earlier at startup, giving files after it a chance to override its values.");
+            describeControl(down, "Load this file later at startup so it can override settings from earlier files.");
+            describeControl(remove, "Take this file out of this startup list. The file remains in the profile and other branches may still load it.");
             up.disabled = index === 0;
             down.disabled = index === items.length - 1;
             remove.disabled = !allowEmpty && items.length <= 1;
@@ -2162,6 +2256,7 @@ function initLayersView(panel) {
             const row = element("div", "row");
             const picker = element("select");
             picker.setAttribute("aria-label", `Layer to add to ${title}`);
+            describeControl(picker, "Choose a settings file to load at the end of this startup list.");
             selectOptions(picker, candidates.map(name => [name, `config/${name}.json`]), candidates[0]);
             row.append(picker, button("Add layer", () => onUpdate([...items, picker.value])));
             panel.append(row);
@@ -2252,6 +2347,8 @@ function advanced(target) {
                     input.id = id;
                     label.htmlFor = id;
                     input.setAttribute("aria-label", title);
+                    describeControl(input, item.meta?.description ||
+                        `Change the stored value of ${item.name}${item.unit ? ` in ${item.unit.toLowerCase()} units` : ""}. Other expressions that use this constant will use the new value.`);
                     if (item.type === "bool") {
                         input.type = "checkbox";
                         input.checked = item.value;
@@ -2305,7 +2402,8 @@ function advanced(target) {
                         chipList.append(button(inc.name, () => {
                             if (targetFile) { state.file = targetFile.path; render(); }
                             else if (sourceTextarea) focusSourceLine(sourceTextarea, inc.line);
-                        }));
+                        }, "action", targetFile ? "Open the script that this file includes. Edits to it can affect any script that includes it." :
+                            "Jump to the line that includes this script. The included file is unavailable in the current profile."));
                     }
                     body.append(chipList);
                 }
@@ -2316,7 +2414,7 @@ function advanced(target) {
                         const title = `${hook.namespace ? hook.namespace + "::" : ""}${hook.name} · line ${hook.line}`;
                         hookList.append(button(title, () => {
                             if (sourceTextarea) focusSourceLine(sourceTextarea, hook.line);
-                        }));
+                        }, "action", "Jump to this function in the source. The game can call it in response to an event."));
                     }
                     body.append(hookList);
                 }
@@ -2329,6 +2427,7 @@ function advanced(target) {
     }
     const label = element("label", "field", "Source"), textarea = element("textarea");
     sourceTextarea = textarea;
+    describeControl(textarea, "Edit this file directly. Check syntax before saving, especially for custom settings the visual editors cannot interpret.");
     textarea.value = file.text; textarea.spellcheck = false; textarea.dataset.source = "true";
     textarea.addEventListener("input", () => assign(file, textarea.value)); label.append(textarea);
     panel.append(label, element("div", "source-bar", "Changes are saved to this profile only. Unknown content is not rewritten."));
@@ -2724,6 +2823,7 @@ function renderMatchTracker(container, snapshot) {
                 toggle.setAttribute("aria-label", `${toggle.textContent} details for game ${index}`);
             };
             toggle.setAttribute("aria-controls", row.detailCell.id);
+            describeControl(toggle, "Show or hide this game's report, statistics, replay actions, and log links when available.");
             trackedGameDetails(row.detailCell, game);
             row.control.append(toggle);
             setExpanded(false);
@@ -2738,7 +2838,8 @@ function renderMatchTracker(container, snapshot) {
 
 function matchLogButton(runId, label = "View logs") {
     if (typeof runId === "string" && /^(?:match|smoke)-[A-Za-z0-9_-]+$/.test(runId)) {
-        return button(label, () => showMatchLogs(runId));
+        return button(label, () => showMatchLogs(runId), "action",
+            "Open the log for this run to search messages and inspect warnings, errors, or a crash.");
     }
     return element("span", "muted", "—");
 }
@@ -2826,6 +2927,7 @@ function renderMatchHistory(container) {
             logs.append(matchLogButton(entry.run_dir));
         }
         const matchup = element("td", "", `${side1} vs ${side2}`);
+        if (entry.start_options) matchup.append(element("div", "muted", startingConditionsText(entry.start_options)));
         if (entry.sweep_source?.project && entry.sweep_source?.profile) {
             matchup.append(element("div", "muted", `Sweep source ${entry.sweep_source.project} / ${entry.sweep_source.profile}`));
         }
@@ -2843,21 +2945,50 @@ function renderMatchHistory(container) {
     wrap.append(table);
     container.replaceChildren(wrap);
 }
-async function loadMatchHistory() {
+function historyPagination(id, offset, nextOffset, load) {
+    const row = element("div", "row");
+    row.id = id;
+    const move = async (to, control, fallback) => {
+        const hadFocus = document.activeElement === control;
+        await load(to);
+        if (hadFocus && row.isConnected && document.activeElement === document.body) {
+            (control.hidden || control.disabled ? fallback : control).focus();
+        }
+    };
+    const previous = button("Previous page", () => move(Math.max(0, offset() - 25), previous, next));
+    const next = button("Next page", () => move(nextOffset(), next, previous));
+    row.append(previous, next);
+    row.update = () => {
+        previous.disabled = offset() === 0;
+        next.disabled = nextOffset() == null;
+        row.hidden = previous.disabled && next.disabled;
+    };
+    row.update();
+    return row;
+}
+let matchHistoryRequest = 0;
+async function loadMatchHistory(offset = state.match.historyOffset) {
+    const request = ++matchHistoryRequest;
+    const limit = 25;
     const filters = state.match.historyFilters || {};
-    const params = new URLSearchParams();
+    const params = new URLSearchParams({offset, limit});
     for (const [key, value] of Object.entries(filters)) {
         if (value && value.trim()) params.set(key, value.trim());
     }
-    const query = params.toString();
     try {
-        const result = await api("/api/match/history" + (query ? "?" + query : ""));
+        const result = await api("/api/match/history?" + params);
+        if (request !== matchHistoryRequest) return;
+        if (!result.history.length && offset > 0) return loadMatchHistory(Math.max(0, offset - limit));
         state.match.history = result.history || [];
+        state.match.historyOffset = offset;
+        state.match.historyNext = result.next_offset ?? null;
         state.match.historyError = "";
     } catch (error) {
+        if (request !== matchHistoryRequest) return;
         state.match.historyError = errorText(error);
     }
     renderMatchHistory($("match-history-body"));
+    $("match-history-pagination")?.update?.();
 }
 const gameMemoryBytes = 5_000_000_000;
 
@@ -2876,6 +3007,7 @@ function gameParallelControl() {
     const label = element("label", "field", "Parallel game limit");
     const input = element("input");
     Object.assign(input, {type: "number", min: 0, max: capacity.processor_cores, step: 1, required: true, value: currentLimit()});
+    describeControl(input, "Set how many games can run at once. More games can finish a batch sooner and use more memory. Zero holds new starts while active games finish.");
     label.append(input);
     const row = element("div", "row");
     const current = element("p", "muted");
@@ -2917,6 +3049,72 @@ function gameParallelControl() {
     return control;
 }
 
+function startingConditions(options, changed) {
+    const fields = element("fieldset", "match-start-options");
+    const startFields = element("div", "row");
+    const resourceInputs = new Map();
+    const toggleInputs = new Map();
+    function updateStartOption(key, value) {
+        options = {...options, [key]: value};
+        changed(options);
+    }
+    for (const [key, title] of [["starting_metal", "Starting metal"], ["starting_energy", "Starting energy"]]) {
+        const label = element("label", "field", title), input = element("input");
+        input.type = "number"; input.min = "0"; input.max = "10000"; input.step = "1";
+        input.required = true; input.value = options[key];
+        describeControl(input, key === "starting_metal" ?
+            "Set each player's opening metal budget for buildings and units. Turning on the starter base takes 800 metal from this budget." :
+            "Set each player's opening energy budget. Turning on the starter base takes 400 energy from this budget.");
+        input.addEventListener("change", () => {
+            if (input.reportValidity()) updateStartOption(key, input.valueAsNumber);
+        });
+        label.append(input);
+        startFields.append(label);
+        resourceInputs.set(key, input);
+    }
+    for (const [key, title] of [["starter_base", "Starter base"], ["build_turret", "Base Builder Turret"]]) {
+        const label = element("label", "field", title), input = element("input");
+        input.type = "checkbox"; input.checked = options[key];
+        describeControl(input, key === "starter_base" ?
+            "Enable BAR's Quick Start buildings. BAR deducts 800 metal and 400 energy per player, leaving less to spend on later orders." :
+            "Give each player a construction turret near their start. The extra building power can speed up the opening and spend resources faster.");
+        input.addEventListener("change", () => updateStartOption(key, input.checked));
+        label.append(input);
+        startFields.append(label);
+        toggleInputs.set(key, input);
+    }
+    fields.append(element("legend", "", "Starting conditions"), startFields,
+        button("Apply Quickstart defaults", () => {
+            for (const [key, input] of resourceInputs) input.value = QUICKSTART_DEFAULTS[key];
+            for (const [key, input] of toggleInputs) input.checked = QUICKSTART_DEFAULTS[key];
+            options = QUICKSTART_DEFAULTS;
+            changed(options);
+        }),
+        element("p", "muted", "With Starter base on, BAR deducts up to 800 metal and 400 energy from these amounts."));
+    const inputs = [...resourceInputs, ...toggleInputs];
+    return {
+        fields,
+        reset(next) {
+            options = next;
+            for (const [key, input] of resourceInputs) input.value = options[key];
+            for (const [key, input] of toggleInputs) input.checked = options[key];
+        },
+        read() {
+            if (![...resourceInputs.values()].every(input => input.reportValidity())) return null;
+            return Object.fromEntries(inputs.map(([key, input]) => [
+                key, input.type === "checkbox" ? input.checked : input.valueAsNumber
+            ]));
+        }
+    };
+}
+
+function startingConditionsText(options) {
+    if (!options) return "";
+    const {starting_metal, starting_energy, starter_base, build_turret} = options;
+    return `${starting_metal.toLocaleString()} metal · ${starting_energy.toLocaleString()} energy · ` +
+        `Starter base ${starter_base ? "on" : "off"} · Base Builder Turret ${build_turret ? "on" : "off"}`;
+}
+
 function matchView(target) {
     const m = state.match, panel = element("div", "panel");
     const info = state.settings;
@@ -2930,14 +3128,16 @@ function matchView(target) {
             notice("Install saved changes before scanning. A successful smoke test verifies loading and script compilation, not playing strength."));
     }
     const controls = element("div", "row");
+    const operationFeedback = element("p", "inline-error");
+    operationFeedback.setAttribute("role", "status");
     const scanButton = button(m.content ? "Refresh installed content" : "Scan installed content", async () => {
+        operationFeedback.textContent = "";
         try {
             if (!state.settings) throw Error("Choose and save an installation first.");
             if (dirty().length) throw Error("Save or discard profile changes before testing.");
             const settings = state.settings;
             m.scanStarting = true;
             updateMatchControls();
-            message("");
             m.snapshot = await api("/api/match/scan", settings);
             m.scanSettingsKey = matchSettingsKey(settings);
             m.content = null;
@@ -2946,8 +3146,12 @@ function matchView(target) {
             m.cacheKey = "";
             m.statusError = "";
             pollMatch(true);
-        } catch (error) { message(errorText(error), true); }
-        finally { m.scanStarting = false; if (state.page === "match") render(); }
+        } catch (error) { operationFeedback.textContent = errorText(error); }
+        finally {
+            m.scanStarting = false;
+            if (state.page === "match" && m.snapshot?.operation === "scan" && isScanActive(m.snapshot)) render();
+            else updateMatchControls();
+        }
     });
     scanButton.id = "match-scan";
     scanButton.disabled = !info || m.scanStarting || isMatchActive(m.snapshot);
@@ -2956,11 +3160,11 @@ function matchView(target) {
         m.cancellingId = snapshot.id;
         updateMatchControls();
         try {
-            message("");
+            operationFeedback.textContent = "";
             const result = await api("/api/match/cancel", {id: snapshot.id});
             if (m.snapshot === snapshot) m.snapshot = result;
         }
-        catch (error) { message(errorText(error), true); }
+        catch (error) { operationFeedback.textContent = errorText(error); }
         finally {
             m.cancellingId = null;
             updateMatchStatus();
@@ -2973,9 +3177,10 @@ function matchView(target) {
     if (state.project && (dirty().length || (state.installStatus && state.installStatus.status !== "up_to_date"))) {
         controls.append(button("Save & install active AI", () => saveAndInstall({thenTest: false}), "button primary"));
     }
-    panel.append(controls);
+    panel.append(controls, operationFeedback);
     const statusBox = element("div", "notice");
     statusBox.id = "match-status";
+    statusBox.tabIndex = -1;
     statusBox.setAttribute("role", "status");
     statusBox.setAttribute("aria-live", "polite");
     statusBox.textContent = matchStatusText(m.snapshot, m.statusError, m.cacheError);
@@ -3021,21 +3226,28 @@ function matchView(target) {
             const factions = ["Armada", "Cortex", "Legion"].map(v => [v, v]);
             const aiChoices = choices.map(c => [c.value, c.label]);
             const rosterGrid = element("div", "roster-grid");
-            const renderRosterSide = (title, slots, defaultAi, defaultFaction) => {
+            const renderRosterSide = (title, side, slots, defaultAi, defaultFaction) => {
                 const sideBox = element("div", "roster-side");
                 const sideHead = element("div", "roster-side-head");
+                const redrawRoster = index => {
+                    render();
+                    $(`match-roster-${side}-${index + 1}`)?.focus();
+                };
                 const add = button("＋ Add AI", () => {
                     slots.push({ai: defaultAi, faction: defaultFaction});
                     rememberMatchPreferences();
-                    render();
+                    redrawRoster(slots.length - 1);
                 });
+                add.setAttribute("aria-label", `Add AI to ${title}`);
                 add.disabled = m.side1.length + m.side2.length >= 16;
                 sideHead.append(element("h3", "", `${title} (${slots.length})`), add);
                 sideBox.append(sideHead);
                 slots.forEach((slot, index) => {
                     const slotRow = element("div", "roster-slot");
                     const aiSelect = element("select");
+                    aiSelect.id = `match-roster-${side}-${index + 1}`;
                     aiSelect.setAttribute("aria-label", `${title} AI ${index + 1}`);
+                    describeControl(aiSelect, "Choose the installed AI and profile for this player. Install the latest edits before comparing runs.");
                     selectOptions(aiSelect, aiChoices, slot.ai);
                     aiSelect.addEventListener("change", () => {
                         slot.ai = aiSelect.value;
@@ -3043,6 +3255,7 @@ function matchView(target) {
                     });
                     const factionSelect = element("select");
                     factionSelect.setAttribute("aria-label", `${title} AI ${index + 1} faction`);
+                    describeControl(factionSelect, "Choose this player's faction. Different factions have different units and build options. A series can override this with faction rotation.");
                     selectOptions(factionSelect, factions, slot.faction);
                     factionSelect.addEventListener("change", () => {
                         slot.faction = factionSelect.value;
@@ -3052,17 +3265,19 @@ function matchView(target) {
                         if (slots.length <= 1) return;
                         slots.splice(index, 1);
                         rememberMatchPreferences();
-                        render();
+                        redrawRoster(Math.min(index, slots.length - 1));
                     });
+                    removeBtn.setAttribute("aria-label", `Remove ${title} AI ${index + 1}`);
                     removeBtn.disabled = slots.length <= 1;
+                    describeControl(removeBtn, "Take this AI player off the team. Each team must keep at least one player.");
                     slotRow.append(aiSelect, factionSelect, removeBtn);
                     sideBox.append(slotRow);
                 });
                 return sideBox;
             };
             rosterGrid.append(
-                renderRosterSide("Side 1 · Your team", m.side1, m.side1[0].ai, m.side1[0].faction),
-                renderRosterSide("Side 2 · Opponents", m.side2, m.side2[0].ai, m.side2[0].faction)
+                renderRosterSide("Side 1 · Your team", 1, m.side1, m.side1[0].ai, m.side1[0].faction),
+                renderRosterSide("Side 2 · Opponents", 2, m.side2, m.side2[0].ai, m.side2[0].faction)
             );
             panel.append(rosterGrid);
 
@@ -3071,6 +3286,7 @@ function matchView(target) {
             const gamesInput = element("input");
             gamesInput.type = "number"; gamesInput.min = "1"; gamesInput.max = "100"; gamesInput.step = "1";
             gamesInput.value = m.seriesGames || 1;
+            describeControl(gamesInput, "Run one match or repeat the setup across several games. More games take longer and let you compare results over sides, maps, or factions.");
             gamesInput.addEventListener("change", () => {
                 const value = Number(gamesInput.value);
                 m.seriesGames = Number.isInteger(value) && value >= 1 && value <= 100 ? value : 1;
@@ -3082,6 +3298,7 @@ function matchView(target) {
             if ((m.seriesGames || 1) > 1) {
                 const swapInput = element("input");
                 swapInput.type = "checkbox"; swapInput.checked = !!m.swapSides;
+                describeControl(swapInput, "Alternate which team gets each starting side. This helps reduce the influence of an easier starting position.");
                 swapInput.addEventListener("change", () => { m.swapSides = swapInput.checked; });
                 const swapLabel = element("label", "field", "Swap sides across games");
                 swapLabel.append(swapInput);
@@ -3098,6 +3315,7 @@ function matchView(target) {
                     const cb = element("input");
                     cb.type = "checkbox";
                     cb.checked = m.seriesMaps.includes(item.name);
+                    describeControl(cb, "Include this map in the series rotation. If the pool is empty, the series uses the primary map.");
                     cb.addEventListener("change", () => {
                         if (cb.checked) {
                             if (!m.seriesMaps.includes(item.name)) m.seriesMaps.push(item.name);
@@ -3122,6 +3340,7 @@ function matchView(target) {
                     const cb = element("input");
                     cb.type = "checkbox";
                     cb.checked = m.factionPairs.some(p => JSON.stringify(p) === key);
+                    describeControl(cb, "Include this faction pairing in the series rotation. Selecting pairings replaces the factions set on the roster for those games.");
                     cb.addEventListener("change", () => {
                         if (cb.checked) {
                             if (!m.factionPairs.some(p => JSON.stringify(p) === key)) m.factionPairs.push(pair);
@@ -3137,30 +3356,43 @@ function matchView(target) {
             }
             panel.append(seriesPanel);
 
+            const starting = startingConditions(m.startOptions, options => matchPreference("startOptions", options));
+            panel.append(starting.fields);
+
             const settings = element("div", "row"), minutes = element("input"), minuteLabel = element("label", "field", "Game-time limit (minutes)");
             minutes.type = "number"; minutes.min = "1"; minutes.max = String(Math.floor(2147483647 / 1800));
             minutes.required = true; minutes.step = "1"; minutes.value = m.minutes;
+            describeControl(minutes, "Stop at this many simulated minutes if the game has not finished. Shorter games can miss slower strategies.");
             minutes.addEventListener("change", () => {
                 if (minutes.reportValidity()) matchPreference("minutes", Number(minutes.value));
             });
             minuteLabel.append(minutes);
             const skipLabel = element("label", "field", "Skip smoke test"), skip = element("input");
             skip.type = "checkbox"; skip.checked = m.skip;
+            describeControl(skip, "Start without the short engine and AI startup check. Problems that it would catch may show up during the full match.");
             skip.addEventListener("change", () => matchPreference("skip", skip.checked)); skipLabel.append(skip);
             const replay = element("input"), replayLabel = element("label", "field", "Record replay");
             replay.type = "checkbox"; replay.checked = m.recordDemo === true;
+            describeControl(replay, "Save a replay file for watching the match later. Recording uses disk space and enables Copy to BAR demos when a replay is available.");
             replay.addEventListener("change", () => { m.recordDemo = replay.checked; });
             replayLabel.append(replay);
             const extra = element("input"), extraLabel = element("label", "field", "Extra Units Pack");
             extra.type = "checkbox"; extra.checked = m.extraUnits === true;
+            describeControl(extra, "Enable BAR's Extra Units Pack for this match. The extra build options can change an AI's choices, so keep this setting fixed for comparisons.");
             extra.addEventListener("change", () => { m.extraUnits = extra.checked; });
             extraLabel.append(extra);
             const startLabel = (m.seriesGames || 1) > 1 ? `Queue ${m.seriesGames}-game series` : "Queue match";
+            const queueFeedback = element("p", "inline-error");
+            queueFeedback.setAttribute("role", "status");
             const submit = button(startLabel, async () => {
                 if (m.submitting) return;
+                const hadFocus = document.activeElement === submit;
+                queueFeedback.textContent = "";
                 try {
                     if (dirty().length) throw Error("Save and install profile changes before testing.");
                     if (!minutes.reportValidity()) return;
+                    const startOptions = starting.read();
+                    if (!startOptions) return;
                     m.submitting = true;
                     updateMatchControls();
                     const player = (value, faction, ally) => {
@@ -3180,6 +3412,7 @@ function matchView(target) {
                         skip_smoke: m.skip,
                         record_demo: m.recordDemo === true,
                         extra_units: m.extraUnits === true,
+                        start_options: startOptions,
                     };
                     if ((m.seriesGames || 1) > 1) {
                         const selectedMaps = m.seriesMaps.length ? m.seriesMaps : [m.map];
@@ -3192,18 +3425,23 @@ function matchView(target) {
                     }
                     m.snapshot = await api("/api/match/start", body);
                     m.statusError = "";
-                    if (state.page === "match") render();
+                    if (state.page === "match") {
+                        render();
+                        if (hadFocus && document.activeElement === document.body) $("match-status")?.focus();
+                    }
                     pollMatch(true);
-                } catch (error) { message(errorText(error), true); }
+                } catch (error) { queueFeedback.textContent = errorText(error); }
                 finally {
                     m.submitting = false;
                     updateMatchControls();
+                    if (hadFocus && submit.isConnected && document.activeElement === document.body) submit.focus();
                 }
             }, "button primary");
             submit.id = "match-submit";
+            describeControl(submit, "Add this match or series to the queue with the chosen settings. Studio runs it as soon as an engine slot is available.");
             submit.disabled = !canQueueMatch(m);
             settings.append(minuteLabel, skipLabel, replayLabel, extraLabel, submit);
-            panel.append(settings);
+            panel.append(settings, queueFeedback);
             if (content.warnings.length) panel.append(notice("Scan warnings: " + content.warnings.join("; "), true));
         }
     }
@@ -3226,17 +3464,20 @@ function matchView(target) {
         };
     };
     filterRow.append(projFilterLbl, profFilterLbl, mapFilterLbl, ckptFilterLbl,
-        button("Apply filters", () => { syncFilters(); loadMatchHistory(); }),
+        button("Apply filters", () => { syncFilters(); loadMatchHistory(0); }),
         button("Clear", () => {
             m.historyFilters = {project: "", profile: "", map: "", checkpoint: ""};
             projFilterInput.value = profFilterInput.value = mapFilterInput.value = ckptFilterInput.value = "";
-            loadMatchHistory();
+            loadMatchHistory(0);
         }));
     const historyBody = element("div");
     historyBody.id = "match-history-body";
+    const pagination = historyPagination("match-history-pagination",
+        () => m.historyOffset, () => m.historyNext, loadMatchHistory);
     renderMatchHistory(historyBody);
-    historyPanel.append(filterRow, historyBody);
-    target.append(panel, historyPanel);
+    historyPanel.append(filterRow, historyBody, pagination);
+    m.artifactStorage ??= artifactStoragePanel();
+    target.append(panel, historyPanel, m.artifactStorage);
 }
 function isMatchActive(snapshot) {
     return ["running", "cancelling"].includes(snapshot?.state);
@@ -3365,7 +3606,7 @@ async function pollMatch(restart = false) {
                 } else if (snapshot.operation === "experiment") {
                     await loadExperimentHistory();
                 }
-                if (matchPoll === poll && ["match", "experiments"].includes(state.page)) render();
+                if (matchPoll === poll && snapshot.operation === "scan" && ["match", "experiments"].includes(state.page)) render();
                 break;
             }
             await new Promise(resolve => setTimeout(resolve, 1500));
@@ -3441,7 +3682,7 @@ function showValidation({errors, warnings}, title = "Validate profile", next = n
                     textarea.focus();
                     textarea.setSelectionRange(offset, offset);
                 }
-            }), element("p", "", item.location ? `${item.location} · ${item.message}` : item.message));
+            }, "action", "Open this file at the reported line so you can inspect or fix the issue."), element("p", "", item.location ? `${item.location} · ${item.message}` : item.message));
             list.append(row);
         }
         box.append(list);
@@ -3656,6 +3897,7 @@ function compareProfiles() {
     const projectInput = project.querySelector("select"), profileInput = profile.querySelector("select");
     const raw = element("input"), rawLabel = element("label", "option-check comparison-raw", "Show raw source differences");
     raw.type = "checkbox"; raw.hidden = false; rawLabel.hidden = true; rawLabel.prepend(raw);
+    describeControl(raw, "Show exact source changes, including comments and formatting that the settings comparison may omit.");
     let request = 0, comparison = null;
     function clear() { request++; comparison = null; feedback.textContent = ""; result.replaceChildren(); rawLabel.hidden = true; }
     function updateProfiles() {
@@ -3743,7 +3985,8 @@ async function projectHistory() {
         const compare = element("div", "row");
         compare.append(dropdown("From checkpoint", choices, base, value => { base = value; }),
             dropdown("To", [["", "Current saved files"], ...choices], commit, value => { commit = value; }),
-            button("Compare", () => showDiff({base, ...(commit ? {commit} : {})})));
+            button("Compare", () => showDiff({base, ...(commit ? {commit} : {})}), "action",
+                "Show the file changes between the selected snapshots. This leaves the current project as it is."));
         list.append(compare);
         for (const checkpoint of checkpoints) {
             const row = element("div", "chain-card"), details = element("div");
@@ -3818,19 +4061,35 @@ function createProject(project = "") {
     const box = element("div"), [nameLabel, name] = textInput(project ? "Profile name" : "AI name");
     const [rootLabel, root] = textInput("BAR installation folder", state.settings?.bar_root || state.defaultBarRoot, "C:\\Games\\Beyond-All-Reason");
     const sourceBox = element("div"), feedback = element("p", "muted");
+    feedback.setAttribute("role", "status");
     let source = null;
+    let searchRequest = 0;
+    root.addEventListener("input", () => {
+        searchRequest++;
+        source = null;
+        sourceBox.replaceChildren();
+        feedback.textContent = "";
+    });
     box.append(element("p", "muted", "Select an installed game version to copy its working hard profile. The source and your existing AIs are not changed."),
         nameLabel, rootLabel, button("Find installed game versions", async () => {
+            const request = ++searchRequest;
+            source = null;
+            sourceBox.replaceChildren();
+            feedback.textContent = "Finding installed game versions…";
             try {
                 const result = await api("/api/sources", {bar_root: root.value});
+                if (request !== searchRequest) return;
                 source = element("select");
+                describeControl(source, "Choose the installed game to copy the Hard profile from. Different releases can ship different settings and scripts.");
                 const choices = [["", "Choose a game version"], ...result.sources.map(item => [item.label, item.label])];
                 selectOptions(source, choices, result.suggested || "");
                 const label = element("label", "field", "Source game version"); label.append(source);
                 sourceBox.replaceChildren(label);
                 feedback.textContent = result.suggested ? "Suggested from the last game log; verify it is the version you want." :
                     result.sources.length ? "Choose the game version to copy." : "No installed game sources were found.";
-            } catch (error) { source = null; sourceBox.replaceChildren(); feedback.textContent = errorText(error); }
+            } catch (error) {
+                if (request === searchRequest) feedback.textContent = errorText(error);
+            }
         }), sourceBox, feedback, button(project ? "Create profile" : "Create AI", async event => {
             if (state.saving) return;
             const submit = event.currentTarget;
@@ -4063,7 +4322,9 @@ function mergeProfiles(project, profile) {
 function manageProject() {
     const project = selectedProject(), profile = project?.profiles.find(entry => entry.key === state.profile);
     const box = element("div"), projectImportFeedback = workspaceFeedback(), archive = element("input");
+    if (state.projectIssues.length) box.append(projectInventoryIssues());
     archive.type = "file"; archive.accept = ".zip,application/zip";
+    describeControl(archive, "Choose a Studio project ZIP to import. The archive can include several profiles.");
     const archiveLabel = element("label", "field", "Project ZIP");
     archiveLabel.append(archive);
 
@@ -4131,6 +4392,7 @@ function manageProject() {
         }
         const profileArchive = element("input");
         profileArchive.type = "file"; profileArchive.accept = ".zip,application/zip";
+        describeControl(profileArchive, "Choose a Studio profile ZIP to import into this project. The archive supplies the new profile's files.");
         const profileArchiveLabel = element("label", "field", "Profile ZIP");
         const [nameLabel, name] = textInput("New profile name");
         const profileImportFeedback = workspaceFeedback();
@@ -4171,7 +4433,9 @@ function manageAIs(target) {
         ? `${state.settings.engine} · ${state.settings.bar_root}`
         : "None"));
     const engine = element("select"), engineLabel = element("label", "field", "Engine");
+    describeControl(engine, "Choose which installed version of BAR's engine Studio will use. The engine determines where the AI is installed and which content Studio can test.");
     const feedback = element("p", "muted"), saveButton = button("Save installation selection", saveSelection);
+    feedback.setAttribute("role", "status");
     let inspectedRoot = null, inspectTimer = null, editing = !state.settings;
     engine.disabled = true;
     selectOptions(engine, [["", "Enter a BAR installation folder"]], "");
@@ -4256,6 +4520,7 @@ function manageAIs(target) {
     const actions = element("div", "panel");
     const project = selectedProject();
     const selectedEngine = state.settings;
+    const managed = selectedEngine ? managedInstallsPanel(selectedEngine.bar_root) : null;
     const ready = !!(project && selectedEngine && !state.saving);
     actions.append(element("h2", "", "2. Manage the selected AI"),
         element("p", "muted", project
@@ -4266,10 +4531,10 @@ function manageAIs(target) {
             : "Save an installation selection above to enable these actions."),
         notice("Install deploys the selected project's saved files. Remove only affects an installation previously managed by this editor. Close BAR before either action."));
     const installButton = button("Install / update selected AI", () => manageSelectedAI(
-        false, deploymentStatus, installButton, removeButton
+        false, deploymentStatus, installButton, removeButton, managed?.load
     ), "button primary");
     const removeButton = button("Remove selected AI from BAR", () => manageSelectedAI(
-        true, deploymentStatus, installButton, removeButton
+        true, deploymentStatus, installButton, removeButton, managed?.load
     ), "action");
     installButton.disabled = !ready;
     removeButton.disabled = !ready;
@@ -4280,9 +4545,108 @@ function manageAIs(target) {
     deploymentStatus.setAttribute("role", "status");
     deploymentStatus.setAttribute("aria-live", "polite");
     actions.append(controls, deploymentStatus);
+    if (state.projectIssues.length) target.append(projectInventoryIssues());
     target.append(setup, actions);
+    if (managed) target.append(managed);
 }
-async function manageSelectedAI(remove, feedback, installButton, removeButton) {
+
+function projectInventoryIssues() {
+    const panel = element("section", "panel");
+    const list = element("ul");
+    for (const {project, profile, message} of state.projectIssues) {
+        const label = profile ? `${project} / ${profile}` : project;
+        list.append(element("li", "", `${label}: ${message}`));
+    }
+    panel.append(element("h2", "", "Projects or profiles that could not be read"), list);
+    return panel;
+}
+
+async function submitDeployment(action, target, onConfirmation = () => {}) {
+    const confirmations = [];
+    for (;;) {
+        const result = await api(`/api/${action}`, {...target, confirmations});
+        if (!result.confirmation) return result;
+        if (confirmations.includes(result.confirmation)) throw Error("The requested confirmation was not accepted.");
+        onConfirmation();
+        if (!confirm(result.confirmation)) return null;
+        confirmations.push(result.confirmation);
+    }
+}
+
+async function refreshDeploymentStatus(result) {
+    if (result?.cache_updated) {
+        state.match.cacheKey = "";
+        await loadCachedMatchContent();
+    }
+    await loadInstallStatus();
+}
+
+function managedInstallsPanel(barRoot) {
+    const panel = element("section", "panel"), feedback = element("p", "deployment-status");
+    const issues = element("ul"), path = element("p", "path");
+    feedback.setAttribute("role", "status");
+    const field = dropdown("Managed installation", [], "", updateSelection);
+    const select = field.querySelector("select");
+    let rows = [];
+    function selection() { return select.value === "" ? null : rows[Number(select.value)]; }
+    function updateSelection() {
+        const item = selection();
+        remove.disabled = !item;
+        path.textContent = item?.path || "";
+    }
+    const remove = button("Remove managed installation", async () => {
+        const item = selection();
+        if (!item || state.saving) return;
+        if (!confirm(`Remove ${item.name} from ${item.engine}? Close BAR before removal.`)) return;
+        select.disabled = remove.disabled = reload.disabled = true;
+        feedback.textContent = `Removing ${item.name} from ${item.engine}…`;
+        try {
+            const result = await submitDeployment("remove", {project: item.project, bar_root: barRoot, engine: item.engine});
+            if (!result) { feedback.textContent = "Removal cancelled."; return; }
+            await refreshDeploymentStatus(result);
+            await load(`${item.name} removed from ${item.engine}. Restart BAR to refresh its AI list.`);
+        } catch (error) {
+            feedback.textContent = "Removal failed. " + errorText(error);
+        } finally {
+            select.disabled = !rows.length;
+            reload.disabled = false;
+            updateSelection();
+            (remove.disabled ? reload : remove).focus();
+        }
+    });
+    async function load(success = "") {
+        reload.disabled = select.disabled = remove.disabled = true;
+        if (!success) feedback.textContent = "Reading managed installations…";
+        try {
+            const result = await api("/api/installations/managed", {bar_root: barRoot});
+            rows = result.installations;
+            selectOptions(select, [["", "Choose an installation"], ...rows.map((item, index) =>
+                [String(index), `${item.name} (${item.project}) · ${item.engine}`])], "");
+            issues.replaceChildren(...result.issues.map(issue => element("li", "", issue)));
+            feedback.textContent = success || (rows.length ? "" : "No managed installations were found.");
+        } catch (error) {
+            rows = [];
+            selectOptions(select, [], "");
+            issues.replaceChildren();
+            feedback.textContent = (success ? success + " " : "") +
+                "Could not load managed installations. " + errorText(error);
+        } finally {
+            reload.disabled = false;
+            select.disabled = !rows.length;
+            updateSelection();
+        }
+    }
+    const reload = button("Refresh managed installations", () => load());
+    panel.append(element("h2", "", "3. Managed installations"),
+        element("p", "muted", "Remove managed copies across engines, including copies of deleted projects."),
+        field, path, remove, reload, feedback, issues);
+    load();
+    panel.load = load;
+    return panel;
+}
+
+async function manageSelectedAI(remove, feedback, installButton, removeButton, refreshManaged) {
+    const focused = document.activeElement;
     const wasInstallDisabled = installButton.disabled, wasRemoveDisabled = removeButton.disabled;
     const setFeedback = (text, error = false) => {
         feedback.textContent = text;
@@ -4303,29 +4667,14 @@ async function manageSelectedAI(remove, feedback, installButton, removeButton) {
             setFeedback("Removal cancelled. No changes were made.");
             return;
         }
-        const confirmations = [];
-        let result;
-        for (;;) {
-            result = await api(`/api/${action}`, {
-                project: state.project,
-                bar_root: state.settings.bar_root,
-                engine: state.settings.engine,
-                confirmations
-            });
-            if (!result.confirmation) break;
-            if (confirmations.includes(result.confirmation)) throw Error("The requested confirmation was not accepted.");
-            setFeedback("Waiting for confirmation...");
-            if (!confirm(result.confirmation)) {
-                setFeedback(`${remove ? "Removal" : "Installation"} cancelled. No changes were made.`);
-                return;
-            }
-            confirmations.push(result.confirmation);
+        const result = await submitDeployment(action, {project: state.project, ...state.settings},
+            () => setFeedback("Waiting for confirmation..."));
+        if (!result) {
+            setFeedback(`${remove ? "Removal" : "Installation"} cancelled. No changes were made.`);
+            return;
         }
-        if (result?.cache_updated) {
-            state.match.cacheKey = "";
-            await loadCachedMatchContent();
-        }
-        await loadInstallStatus();
+        await refreshDeploymentStatus(result);
+        await refreshManaged?.();
         const success = remove
             ? `${title} removed successfully. Restart BAR to refresh the AI list.`
             : result.changed
@@ -4337,6 +4686,7 @@ async function manageSelectedAI(remove, feedback, installButton, removeButton) {
     } finally {
         installButton.disabled = wasInstallDisabled;
         removeButton.disabled = wasRemoveDisabled;
+        if (document.activeElement === document.body && [installButton, removeButton].includes(focused)) focused.focus();
     }
 }
 $("dialog-close").addEventListener("click", () => $("dialog").close());

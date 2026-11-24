@@ -13,10 +13,12 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Callable
 
+from .control_help import control_help
 from .discovery import Installation
 from .game_sources import GameSourceError, list_game_sources
 from .headless import MatchError, MatchProgress, Player, archive_cache_path, run_match, scan_content
-from .settings import SettingsError, load_content_cache, load_match_map, save_content_cache, save_match_map
+from .settings import (QUICKSTART_DEFAULTS, SettingsError, load_content_cache, load_match_map,
+                       save_content_cache, save_match_map, validate_start_options)
 
 
 @dataclass(frozen=True)
@@ -45,14 +47,26 @@ class PlayerRow(ttk.Frame):
         self.profile = tk.StringVar()
         self.profile_choices: dict[str, str] = {}
         self.faction = tk.StringVar(value="Armada")
-        self.ai_box = ttk.Combobox(self, textvariable=self.ai, values=tuple(ais), state="readonly", width=28)
+        self.ai_box = control_help(
+            ttk.Combobox(self, textvariable=self.ai, values=tuple(ais), state="readonly", width=28),
+            "Choose the installed AI for this player. Changing it loads that AI's available profiles.",
+        )
         self.ai_box.pack(side="left", fill="x", expand=True)
         self.ai_box.bind("<<ComboboxSelected>>", self._changed)
-        self.profile_box = ttk.Combobox(self, textvariable=self.profile, state="readonly", width=24)
+        self.profile_box = control_help(
+            ttk.Combobox(self, textvariable=self.profile, state="readonly", width=24),
+            "Choose the strategy profile this player uses. Install your latest changes before testing.",
+        )
         self.profile_box.pack(side="left", padx=5)
-        ttk.Combobox(self, textvariable=self.faction, values=("Armada", "Cortex", "Legion"),
-                     state="readonly", width=9).pack(side="left")
-        ttk.Button(self, text="Remove", command=remove).pack(side="left", padx=(5, 0))
+        control_help(
+            ttk.Combobox(self, textvariable=self.faction, values=("Armada", "Cortex", "Legion"),
+                         state="readonly", width=9),
+            "Choose the player's faction. Its units and factory build options depend on this choice.",
+        ).pack(side="left")
+        control_help(
+            ttk.Button(self, text="Remove", command=remove),
+            "Remove this player from the team. A match needs at least one AI on each side.",
+        ).pack(side="left", padx=(5, 0))
         if ais:
             self.ai.set(next(iter(ais)))
             self._changed()
@@ -104,6 +118,12 @@ class MatchEditor(ttk.Frame):
         self.game = tk.StringVar()
         self.minutes = tk.StringVar(value="120")
         self.skip_smoke = tk.BooleanVar(value=False)
+        self.start_options = {
+            "starting_metal": tk.StringVar(value=str(QUICKSTART_DEFAULTS["starting_metal"])),
+            "starting_energy": tk.StringVar(value=str(QUICKSTART_DEFAULTS["starting_energy"])),
+            "starter_base": tk.BooleanVar(value=QUICKSTART_DEFAULTS["starter_base"]),
+            "build_turret": tk.BooleanVar(value=QUICKSTART_DEFAULTS["build_turret"]),
+        }
         self.status = tk.StringVar(value="Refresh installed content to configure a match.")
         self.status_summary = tk.StringVar()
         self.smoke_status = tk.StringVar(value="Smoke test: Not run")
@@ -123,18 +143,27 @@ class MatchEditor(ttk.Frame):
         header = ttk.Frame(self)
         header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         header.columnconfigure(1, weight=1)
-        self.refresh_button = ttk.Button(header, text="Refresh installed content", command=self.refresh)
+        self.refresh_button = control_help(
+            ttk.Button(header, text="Refresh installed content", command=self.refresh),
+            "Read the selected engine's games, maps, and AIs. Refresh after changing your installation or adding content.",
+        )
         self.refresh_button.grid(row=0, column=0, sticky="w")
         ttk.Label(header, textvariable=self.scan_notice, wraplength=400).grid(row=0, column=1, sticky="w", padx=8)
         self.scan_progress = ttk.Progressbar(header, mode="indeterminate", length=100)
         self.scan_progress.grid(row=0, column=2, padx=(0, 8))
         self.scan_progress.grid_remove()
-        self.scan_cancel = ttk.Button(header, text="Cancel scan", command=self.stop)
+        self.scan_cancel = control_help(
+            ttk.Button(header, text="Cancel scan", command=self.stop),
+            "Stop looking for installed content. Refresh again when you want to reload the lists.",
+        )
         self.scan_cancel.grid(row=0, column=3)
         self.scan_cancel.grid_remove()
         canvas = tk.Canvas(self, highlightthickness=0)
         canvas.grid(row=1, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        scrollbar = control_help(
+            ttk.Scrollbar(self, orient="vertical", command=canvas.yview),
+            "Scroll through the match setup and status.",
+        )
         scrollbar.grid(row=1, column=1, sticky="ns")
         canvas.configure(yscrollcommand=scrollbar.set)
         content = ttk.Frame(canvas)
@@ -149,21 +178,61 @@ class MatchEditor(ttk.Frame):
         content.bind("<Configure>", resize_content)
         canvas.bind("<Configure>", resize_content)
         content.columnconfigure(1, weight=1)
-        content.rowconfigure(7, weight=1)
+        content.rowconfigure(8, weight=1)
         ttk.Label(content, text="Install saved AI changes before testing.").grid(
             row=0, column=0, columnspan=2, sticky="w"
         )
         ttk.Label(content, text="Game:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.game_box = ttk.Combobox(content, textvariable=self.game, state="readonly")
+        self.game_box = control_help(
+            ttk.Combobox(content, textvariable=self.game, state="readonly"),
+            "Choose the installed BAR game version. Keep it the same across comparisons because it determines the rules and units.",
+        )
         self.game_box.grid(row=1, column=1, sticky="ew", pady=(8, 0))
         ttk.Label(content, text="Map:").grid(row=2, column=0, sticky="w", pady=6)
-        self.map_box = ttk.Combobox(content, textvariable=self.map, state="readonly")
+        self.map_box = control_help(
+            ttk.Combobox(content, textvariable=self.map, state="readonly"),
+            "Choose the map for this match. Terrain and starting positions can affect which AI performs better.",
+        )
         self.map_box.grid(row=2, column=1, sticky="ew", pady=6)
         self.map_box.bind("<<ComboboxSelected>>", self._remember_map)
         ttk.Label(content, text="Game-time limit (minutes):").grid(row=3, column=0, sticky="w")
-        ttk.Entry(content, textvariable=self.minutes, width=8).grid(row=3, column=1, sticky="w")
+        control_help(
+            ttk.Entry(content, textvariable=self.minutes, width=8),
+            "Stop the match at this many in-game minutes if it has yet to finish. A shorter limit can cut off slow strategies.",
+        ).grid(row=3, column=1, sticky="w")
+        start_options = ttk.LabelFrame(content, text="Starting conditions", padding=5)
+        start_options.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for column, (key, title) in enumerate((("starting_metal", "Starting metal"),
+                                               ("starting_energy", "Starting energy"))):
+            ttk.Label(start_options, text=title).grid(row=0, column=column * 2, sticky="w")
+            control_help(
+                ttk.Entry(start_options, textvariable=self.start_options[key], width=8),
+                "Set each player's opening metal. BAR uses 800 of it if the starter base is enabled."
+                if key == "starting_metal" else
+                "Set each player's opening energy. BAR uses 400 of it if the starter base is enabled.",
+            ).grid(
+                row=0, column=column * 2 + 1, padx=(4, 12), sticky="w",
+            )
+        control_help(
+            ttk.Checkbutton(start_options, text="Starter base", variable=self.start_options["starter_base"]),
+            "Enable Quick Start buildings. BAR deducts 800 metal and 400 energy per player, leaving less for later orders.",
+        ).grid(
+            row=1, column=0, columnspan=2, sticky="w",
+        )
+        control_help(
+            ttk.Checkbutton(start_options, text="Base Builder Turret", variable=self.start_options["build_turret"]),
+            "Give each player a construction turret near their start. Extra building power can speed up the opening and spend resources faster.",
+        ).grid(
+            row=1, column=2, columnspan=2, sticky="w",
+        )
+        control_help(
+            ttk.Button(start_options, text="Apply Quickstart defaults", command=self._apply_quickstart),
+            "Restore 2,000 starting metal and 5,000 starting energy and turn on the starter base and Base Builder Turret.",
+        ).grid(
+            row=0, column=4, rowspan=2, sticky="w",
+        )
         teams = ttk.Frame(content)
-        teams.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=10)
+        teams.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=10)
         teams.columnconfigure(0, weight=1)
         teams.bind("<Configure>", resize_content)
         self.team_frames = []
@@ -171,34 +240,58 @@ class MatchEditor(ttk.Frame):
             frame = ttk.LabelFrame(teams, text=f"Side {side + 1}", padding=5)
             frame.grid(row=side, column=0, sticky="nsew", padx=4, pady=4)
             self.team_frames.append(frame)
-            ttk.Button(frame, text="Add AI", command=lambda s=side: self.add_row(s)).pack(anchor="w")
+            control_help(
+                ttk.Button(frame, text="Add AI", command=lambda s=side: self.add_row(s)),
+                "Add another AI player to this side. Team size can change the matchup and its resource needs.",
+            ).pack(anchor="w")
         buttons = ttk.Frame(content)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="w")
-        ttk.Button(buttons, text="Start match", command=self.start).pack(side="left")
-        ttk.Button(buttons, text="Stop / cancel", command=self.stop).pack(side="left", padx=6)
-        self.skip_smoke_button = ttk.Checkbutton(buttons, text="Skip smoke test", variable=self.skip_smoke)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="w")
+        control_help(
+            ttk.Button(buttons, text="Start match", command=self.start),
+            "Run the selected AIs with these settings. A short startup check runs first unless you skip it.",
+        ).pack(side="left")
+        control_help(
+            ttk.Button(buttons, text="Stop / cancel", command=self.stop),
+            "Stop the active scan or match. A stopped match may have only partial results.",
+        ).pack(side="left", padx=6)
+        self.skip_smoke_button = control_help(
+            ttk.Checkbutton(buttons, text="Skip smoke test", variable=self.skip_smoke),
+            "Skip the short startup check. Errors that it would catch may appear during the full match instead.",
+        )
         self.skip_smoke_button.pack(side="left", padx=6)
-        ttk.Label(content, textvariable=self.elapsed).grid(row=6, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        ttk.Label(content, textvariable=self.elapsed).grid(row=7, column=0, columnspan=2, sticky="w", pady=(5, 0))
         status_frame = ttk.Frame(content)
-        status_frame.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=8)
+        status_frame.grid(row=8, column=0, columnspan=2, sticky="nsew", pady=8)
         status_frame.columnconfigure(0, weight=1)
         status_frame.rowconfigure(4, weight=1)
         ttk.Label(status_frame, textvariable=self.status_summary, wraplength=700).grid(row=0, column=0, sticky="w")
         ttk.Label(status_frame, textvariable=self.smoke_status).grid(row=1, column=0, sticky="w")
         ttk.Label(status_frame, textvariable=self.match_status, wraplength=700).grid(row=2, column=0, sticky="w")
-        self.log_toggle = ttk.Button(status_frame, text="Show log", command=self._toggle_log)
+        self.log_toggle = control_help(
+            ttk.Button(status_frame, text="Show log", command=self._toggle_log),
+            "Show or hide the match progress and diagnostic text.",
+        )
         self.log_toggle.grid(row=3, column=0, sticky="w", pady=(4, 0))
         self.log_frame = ttk.Frame(status_frame)
         self.log_frame.grid(row=4, column=0, sticky="nsew", pady=(4, 0))
         self.log_frame.grid_remove()
         self.log_frame.columnconfigure(0, weight=1)
         self.log_frame.rowconfigure(0, weight=1)
-        self.status_text = tk.Text(self.log_frame, height=3, wrap="word", font="TkDefaultFont", state="disabled")
+        self.status_text = control_help(
+            tk.Text(self.log_frame, height=3, wrap="word", font="TkDefaultFont", state="disabled"),
+            "Read the progress and diagnostic messages collected by the editor.",
+        )
         self.status_text.grid(row=0, column=0, sticky="nsew")
-        status_scrollbar = ttk.Scrollbar(self.log_frame, orient="vertical", command=self.status_text.yview)
+        status_scrollbar = control_help(
+            ttk.Scrollbar(self.log_frame, orient="vertical", command=self.status_text.yview),
+            "Scroll through the diagnostic messages.",
+        )
         status_scrollbar.grid(row=0, column=1, sticky="ns")
         self.status_text.configure(yscrollcommand=status_scrollbar.set)
-        self.copy_status_button = ttk.Button(self.log_frame, text="Copy status", command=self.copy_status)
+        self.copy_status_button = control_help(
+            ttk.Button(self.log_frame, text="Copy status", command=self.copy_status),
+            "Copy the status and diagnostic text to the clipboard.",
+        )
         self.copy_status_button.grid(row=1, column=0, sticky="e", pady=(4, 0))
         self.status.trace_add("write", self._update_status_text)
         self._update_status_text()
@@ -386,6 +479,10 @@ class MatchEditor(ttk.Frame):
         self.rows[side].remove(row)
         row.destroy()
 
+    def _apply_quickstart(self) -> None:
+        for key, value in QUICKSTART_DEFAULTS.items():
+            self.start_options[key].set(value)
+
     def start(self) -> None:
         if self.busy:
             return
@@ -399,7 +496,14 @@ class MatchEditor(ttk.Frame):
             players = [row.player(side) for side in range(2) for row in self.rows[side]]
             if not 0 < minutes <= 2147483647 // 1800 or any(not rows for rows in self.rows):
                 raise MatchError("Enter a valid positive time limit and add at least one AI to each side.")
-        except (MatchError, ValueError) as error:
+            start_options = {key: setting.get() for key, setting in self.start_options.items()}
+            for key in ("starting_metal", "starting_energy"):
+                try:
+                    start_options[key] = int(start_options[key])
+                except ValueError:
+                    raise MatchError("Enter whole numbers for starting metal and energy.") from None
+            validate_start_options(start_options)
+        except (MatchError, SettingsError, ValueError) as error:
             self._error(str(error) or "Enter a whole number of game minutes.")
             return
         self._remember_map()
@@ -418,7 +522,7 @@ class MatchEditor(ttk.Frame):
         def run() -> MatchResult:
             summary, path = run_match(
                 engine_dir, installation.data, self.local_data, map_name, game, players, minutes, self.stop_event,
-                self.events.put, skip_smoke=skip_smoke,
+                self.events.put, skip_smoke=skip_smoke, start_options=start_options,
             )
             return MatchResult(summary, path)
 

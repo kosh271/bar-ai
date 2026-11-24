@@ -75,6 +75,69 @@ class StudioServerTests(unittest.TestCase):
             response.headers.get_content_type() == "application/json"
         ) else response.read().decode("utf-8"), response.headers
 
+    def test_invalid_workspace_entries_leave_healthy_profiles_accessible(self):
+        (self.projects / "Scratch").mkdir()
+        project = self.projects / "ExampleAI"
+        (project / "profiles" / "broken").mkdir()
+        status, state, _ = self._request("/api/state")
+        self.assertEqual(status, 200)
+        self.assertEqual([entry["key"] for entry in state["projects"]], ["ExampleAI"])
+        self.assertEqual([entry["key"] for entry in state["projects"][0]["profiles"]], ["hard"])
+        self.assertEqual(
+            {(entry["project"], entry.get("profile")) for entry in state["project_issues"]},
+            {("Scratch", None), ("ExampleAI", "broken")},
+        )
+        self.assertEqual(self._request("/api/profile?project=ExampleAI&profile=hard")[0], 200)
+        self.assertEqual(self._request("/api/profile?project=ExampleAI&profile=broken")[0], 400)
+
+    def test_storage_and_paged_history_use_the_same_run_artifacts(self):
+        root = self.server.match_service.local_data / "matches"
+        for name in ("match-first", "match-second"):
+            run = root / name
+            run.mkdir(parents=True)
+            (run / "result.json").write_text('{"result":"Draw."}', encoding="utf-8")
+        self.assertEqual(self._request("/api/storage", token=False)[0], 401)
+        status, page, _ = self._request("/api/storage?offset=0&limit=1")
+        self.assertEqual((status, page["total_runs"], page["next_offset"]), (200, 2, 1))
+        self.assertEqual(self._request("/api/match/history?offset=0&limit=1")[1]["next_offset"], 1)
+        pin = {"action": "pin", "id": "match-first", "pinned": True}
+        self.assertEqual(self._request("/api/storage", method="POST", body=pin)[0], 200)
+        cleanup = {"action": "cleanup", "ids": ["match-first"]}
+        self.assertEqual(self._request("/api/storage", method="POST", body=cleanup)[0], 400)
+        cleanup["ids"] = ["match-second"]
+        self.assertEqual(self._request("/api/storage", method="POST", body=cleanup)[1]["removed"], ["match-second"])
+        status, history, _ = self._request("/api/match/history?offset=0&limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual([entry["run_dir"] for entry in history["history"]], ["match-first"])
+
+    def test_save_accepts_multiple_files_with_large_json_encoding_overhead(self):
+        project = self.projects / "ExampleAI" / "profiles" / "hard"
+        edits = {"script/init.as": "é" * (1200 * 1024), "script/main.as": "\\" * (410 * 1024)}
+        entries = [
+            {"path": name, "text": content, "sha256": hashlib.sha256((project / name).read_bytes()).hexdigest()}
+            for name, content in edits.items()
+        ]
+        status, response, _ = self._request("/api/save", method="POST", body={
+            "project": "ExampleAI", "profile": "hard", "files": entries,
+        })
+        self.assertEqual(status, 200)
+        for name, content in edits.items():
+            self.assertEqual((project / name).read_bytes(), content.encode("utf-8"))
+            self.assertIn(name, [entry["path"] for entry in response["files"]])
+
+    def test_save_cannot_grow_an_entire_profile_past_the_archive_limit(self):
+        project = self.projects / "ExampleAI" / "profiles" / "hard"
+        (project / "script" / "main.as").write_bytes(b"x" * 950)
+        initial = (project / "script" / "init.as").read_bytes()
+        with patch("app.projects.MAX_WORKSPACE_BYTES", 1000):
+            body = {"project": "ExampleAI", "profile": "hard", "files": [{
+                "path": "script/init.as", "text": "x" * 50, "sha256": hashlib.sha256(initial).hexdigest(),
+            }]}
+            status, response, _ = self._request("/api/save", method="POST", body=body)
+        self.assertEqual(status, 400)
+        self.assertIn("size limit", response["error"])
+        self.assertEqual((project / "script" / "init.as").read_bytes(), initial)
+
     def test_api_requires_token_and_rejects_cross_origin(self):
         status, _, _ = self._request("/api/state", token=False)
         self.assertEqual(status, 401)
@@ -259,8 +322,10 @@ class StudioServerTests(unittest.TestCase):
 
     def test_experiment_endpoints_require_a_token_and_pass_validated_requests(self):
         start_path = "/api/experiment/start"
+        start_options = {"starting_metal": 2000, "starting_energy": 5000, "starter_base": True, "build_turret": True}
         spec = {"bar_root": "bar", "engine": "engine", "game": "Game", "maps": ["Map"], "minutes": 1,
-                "game_limit": 2, "seconds_limit": 60, "mode": "tournament", "players": []}
+                "game_limit": 2, "seconds_limit": 60, "mode": "tournament", "players": [],
+                "start_options": start_options}
         for path, method, body in (
             (start_path, "POST", spec),
             ("/api/experiment/history", "GET", None),
@@ -274,7 +339,7 @@ class StudioServerTests(unittest.TestCase):
             self.assertEqual(self._request(start_path, method="POST", body={})[0], 400)
             self.assertEqual(self._request(start_path, method="POST", body=spec)[1]["operation"], "experiment")
             start.assert_called_once_with("bar", "engine", "Game", ["Map"], 1, 2, 60, "tournament", [],
-                                          sweep=None, parallel_games=None)
+                                          sweep=None, parallel_games=None, start_options=start_options)
         self.assertEqual(self._request("/api/experiment/history")[1], {"experiments": []})
         self.assertEqual(self._request("/api/experiment/pause", method="POST", body={"id": "e", "paused": 1})[0], 400)
         self.assertEqual(self._request("/api/experiment/pause", method="POST", body={"paused": True})[0], 400)
@@ -327,13 +392,21 @@ class StudioServerTests(unittest.TestCase):
             self.assertEqual(state["game_capacity"]["parallel_games"], 0)
             self.assertEqual(self._request(path, method="POST", body={"parallel_games": 5})[0], 400)
 
-    def test_server_close_signals_active_experiment(self):
-        with patch.object(self.server.match_service, "is_busy", return_value=True) as busy, \
-                patch.object(self.server.match_service, "cancel") as cancel, \
-                patch("app.studio_server.ThreadingHTTPServer.server_close"):
+    def test_server_close_waits_for_active_engine_operation_to_cancel(self):
+        started = threading.Event()
+        service = self.server.match_service
+
+        def experiment():
+            started.set()
+            if not service._stop.wait(2):
+                raise RuntimeError("Studio did not signal cancellation")
+            return {}, {}, "cancelled"
+
+        service._launch("experiment", experiment)
+        self.assertTrue(started.wait(1))
+        with patch("app.studio_server.ThreadingHTTPServer.server_close"):
             self.server.server_close()
-        busy.assert_called_once_with("experiment")
-        cancel.assert_called_once_with()
+        self.assertEqual(service.status()["state"], "cancelled")
 
     def test_match_log_endpoint_pages_bounded_raw_artifacts(self):
         url = "/api/match/logs?run_id=match-logs&file="
@@ -818,8 +891,8 @@ class StudioServerTests(unittest.TestCase):
         prompt = "Installed AI files have been modified. Remove them anyway?\n\n" + str(target)
         found = SimpleNamespace(data=data, engines=("engine1",))
 
-        def remove_with_confirmation(project, selected_data, engine, confirm):
-            self.assertEqual(project, self.projects / "ExampleAI")
+        def remove_with_confirmation(short_name, selected_data, engine, confirm):
+            self.assertEqual(short_name, "ExampleAI")
             self.assertEqual(selected_data, data)
             self.assertEqual(engine, "engine1")
             confirm(prompt)
@@ -831,7 +904,7 @@ class StudioServerTests(unittest.TestCase):
         }
         with (
             patch("app.studio_server.discovery.discover", return_value=found),
-            patch("app.studio_server.installation.remove", side_effect=remove_with_confirmation) as remove,
+            patch("app.studio_server.installation.remove_installed", side_effect=remove_with_confirmation) as remove,
         ):
             status, response, _ = self._request("/api/remove", method="POST", body=body)
             self.assertEqual(status, 200)
@@ -842,7 +915,7 @@ class StudioServerTests(unittest.TestCase):
             status, response, _ = self._request("/api/remove", method="POST", body=body)
             self.assertEqual(status, 200)
             self.assertEqual(response, {
-                "path": str(target), "project": "ExampleAI", "engine": "engine1",
+                "path": str(target), "project": "ExampleAI", "engine": "engine1", "cache_updated": False,
             })
             self.assertEqual(remove.call_count, 2)
 
@@ -963,6 +1036,84 @@ class StudioInstallSeriesHistoryTests(unittest.TestCase):
             "setups": [{"package": {"id": "setup1"}, "launch": {"engine": engine}}],
         }), encoding="utf-8")
         return bar_root, data, engine
+
+    def test_first_install_and_orphan_removal_reconcile_live_and_saved_inventory(self):
+        bar_root, data, engine = self._setup_bar()
+        content = {
+            "maps": [{"name": "Map", "width": 512, "height": 512}],
+            "games": ["Game"],
+            "ais": [{"short_name": "BARb", "version": "stable", "name": "BARbarIAn", "profiles": []}],
+            "warnings": [],
+        }
+        with patch("app.studio_matches.headless.scan_content", return_value=content):
+            self.assertEqual(self._request("/api/match/scan", method="POST", body={
+                "bar_root": str(bar_root), "engine": engine,
+            })[0], 200)
+            deadline = time.monotonic() + 4
+            while self.server.match_service.is_busy("scan") and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(self.server.match_service.status()["state"], "completed")
+        body = {"project": "ExampleAI", "bar_root": str(bar_root), "engine": engine, "confirmations": []}
+        status, response = self._request("/api/install", method="POST", body=body)
+        self.assertEqual(status, 200)
+        self.assertTrue(response["cache_updated"])
+        target = Path(response["path"])
+        cached = self.server.match_service.cached_content(bar_root, engine)
+        self.assertEqual({entry["short_name"] for entry in cached["ais"]}, {"BARb", "ExampleAI"})
+        self.assertEqual(self.server.match_service.status()["result"]["content"], cached)
+        second_engine = "engine2"
+        shutil.copytree(data / "engine" / engine / "AI" / "Skirmish" / "BARb",
+                        data / "engine" / second_engine / "AI" / "Skirmish" / "BARb")
+        status, second = self._request("/api/install", method="POST", body={**body, "engine": second_engine})
+        self.assertEqual(status, 200)
+        second_target = Path(second["path"])
+        invalid_target = second_target.parent.parent / "DamagedAI" / "1"
+        invalid_target.mkdir(parents=True)
+        (invalid_target / ".bar-ai-editor.json").write_text("{broken", encoding="utf-8")
+
+        status, _ = self._request("/api/project/manage", method="POST", body={
+            "action": "delete_project", "project": "ExampleAI", "confirm": True,
+        })
+        self.assertEqual(status, 200)
+        status, response = self._request("/api/installations/managed", method="POST", body={
+            "bar_root": str(bar_root),
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual([(entry["project"], entry["engine"]) for entry in response["installations"]],
+                         [("ExampleAI", engine), ("ExampleAI", second_engine)])
+        self.assertEqual(len(response["issues"]), 1)
+        self.assertIn("DamagedAI", response["issues"][0])
+        status, response = self._request("/api/remove", method="POST", body=body)
+        self.assertEqual(status, 200)
+        self.assertTrue(response["cache_updated"])
+        self.assertFalse(target.exists())
+        self.assertTrue(second_target.exists())
+        cached = MatchService(self.projects.parent).cached_content(bar_root, engine)
+        self.assertEqual([entry["short_name"] for entry in cached["ais"]], ["BARb"])
+        self.assertEqual(self.server.match_service.status()["result"]["content"], cached)
+
+    def test_install_is_rejected_while_scan_can_publish_stale_content(self):
+        bar_root, _data, engine = self._setup_bar()
+        scan_started = threading.Event()
+        scan_continue = threading.Event()
+
+        def scan(*_args, **_kwargs):
+            scan_started.set()
+            scan_continue.wait(timeout=5)
+            return {"maps": [], "games": [], "ais": [], "warnings": []}
+
+        with patch("app.studio_matches.headless.scan_content", side_effect=scan):
+            try:
+                body = {"bar_root": str(bar_root), "engine": engine}
+                self.assertEqual(self._request("/api/match/scan", method="POST", body=body)[0], 200)
+                self.assertTrue(scan_started.wait(timeout=3))
+                status, response = self._request("/api/install", method="POST", body={
+                    **body, "project": "ExampleAI", "confirmations": [],
+                })
+                self.assertEqual(status, 400)
+                self.assertIn("scan", response["error"].lower())
+            finally:
+                scan_continue.set()
 
     def test_install_status_endpoint_and_cache_sync_on_install(self):
         self.assertEqual(self._request("/api/install-status?project=ExampleAI", token=False)[0], 401)

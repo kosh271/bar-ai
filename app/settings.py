@@ -17,6 +17,22 @@ class SettingsError(Exception):
     """Settings could not be read or saved."""
 
 
+QUICKSTART_DEFAULTS = {
+    "starting_metal": 2000, "starting_energy": 5000,
+    "starter_base": True, "build_turret": True,
+}
+
+
+def validate_start_options(options: object) -> None:
+    if not isinstance(options, dict) or options.keys() != QUICKSTART_DEFAULTS.keys():
+        raise SettingsError("Supply starting metal, starting energy, starter base, and build turret settings.")
+    for key, label in (("starting_metal", "Starting metal"), ("starting_energy", "Starting energy")):
+        if type(options[key]) is not int or not 0 <= options[key] <= 10000:
+            raise SettingsError(f"{label} must be a whole number from 0 to 10,000.")
+    if any(type(options[key]) is not bool for key in ("starter_base", "build_turret")):
+        raise SettingsError("Starter base and build turret must be on or off.")
+
+
 @dataclass(frozen=True)
 class Settings:
     bar_root: str
@@ -148,12 +164,14 @@ def _studio_preferences(value: object) -> dict:
     if "match" in value:
         match = value["match"]
         fields = {"game", "map", "first", "second", "faction1", "faction2", "minutes", "skip_smoke"}
-        if (not isinstance(match, dict) or not fields <= match.keys() <= fields | {"rosters"}
+        if (not isinstance(match, dict) or not fields <= match.keys() <= fields | {"rosters", "start_options"}
                 or not all(_preference_text(match[key]) for key in ("game", "map"))
                 or type(match["minutes"]) is not int or not 1 <= match["minutes"] <= 2147483647 // 1800
                 or type(match["skip_smoke"]) is not bool
                 or any(match[key] not in FACTIONS for key in ("faction1", "faction2"))):
             raise SettingsError("Invalid Studio match preferences.")
+        if "start_options" in match:
+            validate_start_options(match["start_options"])
         if not all(_preference_ai(match[key]) for key in ("first", "second")):
             raise SettingsError("Invalid Studio AI selection.")
         if "rosters" in match:
@@ -168,10 +186,13 @@ def _studio_preferences(value: object) -> dict:
     if "tournament" in value:
         draft = value["tournament"]
         fields = {"game", "maps", "players", "minutes", "game_limit", "seconds_limit"}
-        if (not isinstance(draft, dict) or draft.keys() != fields or not _preference_text(draft["game"])
+        if (not isinstance(draft, dict) or not fields <= draft.keys() <= fields | {"start_options"}
+                or not _preference_text(draft["game"])
                 or not all(type(draft[key]) is int and 1 <= draft[key] <= limit for key, limit in
                            (("minutes", 2147483647 // 1800), ("game_limit", 100), ("seconds_limit", 21600)))):
             raise SettingsError("Invalid Studio tournament preferences.")
+        if "start_options" in draft:
+            validate_start_options(draft["start_options"])
         maps, players = draft["maps"], draft["players"]
         if (not isinstance(maps, list) or len(maps) > 32 or not all(map(_preference_text, maps))
                 or len(set(maps)) != len(maps)

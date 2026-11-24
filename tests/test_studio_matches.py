@@ -137,7 +137,7 @@ class MatchServiceTests(unittest.TestCase):
         self.assertEqual(self.scan()["result"]["content"], CONTENT)
 
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
-                skip_smoke, process_started, record_demo, extra_units, capture_stats):
+                skip_smoke, process_started, record_demo, extra_units, capture_stats, start_options):
             self.assertTrue(skip_smoke)
             self.assertTrue(extra_units)
             self.assertEqual(players[0].name, "Display")
@@ -258,7 +258,7 @@ class MatchServiceTests(unittest.TestCase):
         match.poll.return_value = None
 
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
-                skip_smoke, process_started, record_demo, extra_units, capture_stats):
+                skip_smoke, process_started, record_demo, extra_units, capture_stats, start_options):
             process_started(smoke)
             smoke_ready.set()
             advance.wait(2)
@@ -341,7 +341,7 @@ class MatchServiceTests(unittest.TestCase):
         self.assertIn("Profile", status["error"])
 
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
-                skip_smoke, process_started, record_demo, extra_units, capture_stats):
+                skip_smoke, process_started, record_demo, extra_units, capture_stats, start_options):
             progress(MatchProgress("smoke", "Failed", 1, "Smoke logs: smoke"))
             return "Smoke test failed", self.root / "smoke"
 
@@ -370,7 +370,7 @@ class MatchServiceTests(unittest.TestCase):
         self.assertEqual(status["result"]["catalog"], catalog)
         self.assertEqual(self.service.latest_catalog(), catalog)
         def fail_smoke(engine, data, local, map_name, game, players, minutes, stop, progress, *,
-                       skip_smoke, process_started, record_demo, extra_units, capture_stats):
+                       skip_smoke, process_started, record_demo, extra_units, capture_stats, start_options):
             progress(MatchProgress("smoke", "Failed"))
             return "Smoke test failed", self.root
         with patch("app.studio_matches.headless.run_match", side_effect=fail_smoke):
@@ -482,7 +482,7 @@ class MatchServiceTests(unittest.TestCase):
                 pass
 
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, *,
-                skip_smoke, process_started, record_demo, extra_units, capture_stats):
+                skip_smoke, process_started, record_demo, extra_units, capture_stats, start_options):
             self.assertTrue(stop.is_set())
             raise MatchError("Stopped")
 
@@ -631,6 +631,9 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
     def test_sequential_benchmark_series_maps_factions_swapping_and_tallies(self):
         self.scan()
         calls = []
+        options = {"starting_metal": 0, "starting_energy": 3500,
+                   "starter_base": False, "build_turret": True}
+        seen_options = []
         outcomes = [
             "Smoke test passed.\nWinner: side 1.",
             "Smoke test passed.\nWinner: side 2.",
@@ -641,6 +644,7 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
             idx = len(calls)
             calls.append((map_name, [(p.short_name, p.faction, p.ally) for p in players]))
+            seen_options.append(kwargs["start_options"])
             item = outcomes[idx]
             if isinstance(item, Exception):
                 raise item
@@ -663,7 +667,8 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
             "faction_pairs": [["Armada", "Cortex"], ["Legion", "Armada"]],
         }
         with patch("app.studio_matches.headless.run_match", side_effect=run):
-            self.service.start(self.bar_root, self.engine, "Game", "Map", players, 30, True, series=series)
+            self.service.start(self.bar_root, self.engine, "Game", "Map", players, 30, True,
+                               series=series, start_options=options)
             status = self.wait()
 
         self.assertEqual(status["state"], "completed")
@@ -674,6 +679,9 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertEqual(calls[1], ("Map2", [("AI", "Legion", 1), ("BARb", "Armada", 0)]))
         self.assertEqual(calls[2][0], "Map")
         self.assertEqual(calls[3][0], "Map2")
+        self.assertEqual(seen_options, [options] * 4)
+        self.assertIsNot(seen_options[0], options)
+        self.assertEqual(self.service.history()[0]["start_options"], options)
         rows = status["games"]
         self.assertEqual([row["state"] for row in rows], ["completed", "completed", "draw", "failed"])
         self.assertEqual([row["winner_side"] for row in rows], [1, 2, None, None])
@@ -926,7 +934,11 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertEqual(entry["stop_reason"], "game_limit")
         self.assertEqual(entry["completed_games"], 4)
         self.assertEqual(len(calls), 4)
-        self.assertEqual(len({frozenset(call[1:]) for call in calls[:3]}), 3)
+        self.assertEqual(len({frozenset(call[1:]) for call in calls}), 2)
+        self.assertEqual(calls[1], (calls[0][0], calls[0][2], calls[0][1]))
+        self.assertEqual(calls[3], (calls[2][0], calls[2][2], calls[2][1]))
+        self.assertEqual(entry["coverage"], {"full_pairs": 6, "scheduled_pairs": 2, "completed_pairs": 2,
+                                             "scheduled_games": 4, "completed_games": 4})
         self.assertEqual({call[0] for call in calls}, {"Map", "Map2"})
         self.assertEqual(entry["games"][1]["outcome"], "failed")
         totals = [{"resources": 900, "damage": 321}, {"resources": None, "damage": None}]
@@ -943,34 +955,41 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         restarted._save_experiment(workspace, saved["experiment"], saved["promotion"])
         self.assertEqual(restarted.experiment_details(entry["id"])["games"][0]["side_totals"], totals)
 
-    def test_experiment_tournament_resolves_factions_for_each_game(self):
+    def test_experiment_tournament_freezes_factions_for_each_mirrored_pair(self):
         self.scan()
+        start_options = {"starting_metal": 0, "starting_energy": 5000, "starter_base": False, "build_turret": True}
         players = [
             {"short_name": "AI", "version": "1", "profile": "hard", "faction": "Rotate", "ally": 0},
             {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Random", "ally": 1},
             {"short_name": "BARb", "version": "stable", "profile": "hard", "faction": "Cortex", "ally": 1},
         ]
         calls = []
+        game_options = []
 
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
             calls.append(tuple(player.faction for player in players))
+            game_options.append(kwargs["start_options"])
             raise MatchError("Engine test stub")
 
-        rolls = ["Legion", "Legion", "Armada", "Cortex", "Legion", "Armada", "Armada", "Cortex"]
-        with (patch("app.studio_matches.headless.run_match", side_effect=run),
-              patch("app.studio_experiments.choice", side_effect=rolls) as roll):
+        with patch("app.studio_matches.headless.run_match", side_effect=run):
             self.service.start_experiment(
                 self.bar_root, self.engine, "Game", ["Map", "Map2"], 30, 12, 60, "tournament", players,
+                start_options=start_options, seed=42,
             )
             entry = self.wait()["experiment"]
-        self.assertEqual(roll.call_count, 8)
+        self.assertEqual(entry["seed"], 42)
         self.assertEqual(entry["completed_games"], 12)
+        self.assertEqual(game_options, [start_options] * 12)
+        self.assertIsNot(game_options[0], start_options)
+        self.assertEqual(self.service.experiment_details(entry["id"])["start_options"], start_options)
         self.assertCountEqual(calls, [tuple(game["factions"]) for game in entry["games"]])
-        for candidate, expected in (
-            ("v1", ["Armada", "Cortex", "Legion", "Armada", "Cortex", "Legion", "Armada", "Cortex"]),
-            ("v2", rolls),
-            ("v3", ["Cortex"] * 8),
-        ):
+        for first, second in zip(entry["schedule"][::2], entry["schedule"][1::2]):
+            self.assertEqual((first["map"], first["side1"], first["side2"]),
+                             (second["map"], second["side2"], second["side1"]))
+            self.assertEqual([p["faction"] for p in first["players"]],
+                             list(reversed([p["faction"] for p in second["players"]])))
+        for candidate, expected in (("v1", ["Armada", "Armada", "Cortex", "Cortex", "Legion", "Legion", "Armada", "Armada"]),
+                                    ("v3", ["Cortex"] * 8)):
             actual = [game["factions"][side] for game in entry["games"]
                       for side, key in enumerate(("side1", "side2")) if game[key] == candidate]
             self.assertEqual(actual, expected)
@@ -1081,7 +1100,8 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         ]
         run = self.service.local_data / "matches" / "match-capped"
         run.mkdir(parents=True)
-        (run / "result.json").write_text('{"engine_exit":0,"telemetry":{"end_frame":1800}}', encoding="utf-8")
+        (run / "result.json").write_text('{"engine_exit":0,"telemetry":{"end_frame":1800,"ai_script_errors":0}}',
+                                         encoding="utf-8")
         with patch("app.studio_matches.headless.run_match", return_value=("Time limit reached (1 game minutes).", run)):
             self.service.start_experiment(
                 self.bar_root, self.engine, "Game", ["Map"], 1, 1, 60, "tournament", players,
@@ -1140,7 +1160,7 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         def run(engine, data, local, map_name, game, players, minutes, stop, progress, **kwargs):
             self.assertNotEqual(engine, live_engine)
             self.assertEqual(data, self.data)
-            self.assertEqual(map_name, "Map")
+            self.assertIn(map_name, ("Map", "Map2"))
             candidate = next(player for player in players if player.short_name.startswith("StudioSweep"))
             path = (engine / "AI" / "Skirmish" / candidate.short_name / candidate.version
                     / "config" / candidate.profile / "settings.json")
@@ -1153,21 +1173,21 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
             run_dir = local / "matches" / f"match-sweep-{len(choices)}"
             run_dir.mkdir(parents=True)
             (run_dir / "result.json").write_text(json.dumps({
-                "winning_sides": [winner], "result": summary, "engine_exit": 0,
+                "winning_sides": [winner], "result": summary, "engine_exit": 0, "telemetry": {"ai_script_errors": 0},
             }), encoding="utf-8")
             return summary, run_dir
 
         with patch("app.studio_matches.headless.run_match", side_effect=run):
             job = self.service.start_experiment(
-                self.bar_root, self.engine, "Game", ["Map", "Map2"], 30, 4, 60, "sweep", players, sweep,
+                self.bar_root, self.engine, "Game", ["Map", "Map2"], 30, 8, 60, "sweep", players, sweep,
             )
             status = self.wait()
         self.assertEqual(status["state"], "completed", status)
-        self.assertEqual(choices, [2, 2, 3, 3])
+        self.assertEqual(choices, [2, 2, 3, 3] * 2)
         self.assertEqual(status["experiment"]["best_candidate_id"], "v2")
         config.write_text('{"weight": 99}', encoding="utf-8")
         restarted = MatchService(self.root, projects_root=self.projects)
-        self.assertEqual(len(restarted.history(project="UninstalledAI", profile="custom")), 4)
+        self.assertEqual(len(restarted.history(project="UninstalledAI", profile="custom")), 8)
         won = restarted.promote_experiment(job["id"], "v2", "Winner")
         self.assertEqual(won, {"project": "UninstalledAI", "profile": "winner"})
         promoted = profile.parent / won["profile"] / "config" / "settings.json"
@@ -1178,14 +1198,15 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         with self.assertRaises(MatchError):
             restarted.promote_experiment(job["id"], "v1", "Losing variant")
 
-    def test_sweep_promotion_requires_a_win_on_a_fully_paired_map(self):
+    def test_even_sweep_record_stays_below_promotion_threshold(self):
         player = Player("AI", "1", "hard", "Armada", 0, "AI")
         candidates = [Candidate("variant", "Variant", player, True), Candidate("base", "Base", player)]
 
         def game(map_name, first, second, outcome):
             return {"map": map_name, "side1": first, "side2": second, "outcome": outcome,
                     "simulated_seconds": 60, "script_errors_by_side": {"side1": 0, "side2": 0},
-                    "unassigned_script_errors": 0, "engine_error": False, "simulated_limit": False}
+                    "unassigned_script_errors": 0, "engine_error": False, "simulated_limit": False,
+                    "telemetry_verified": True}
 
         played = [
             game("Map", "variant", "base", "side2"),
@@ -1197,7 +1218,7 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         self.assertFalse(before["promotable"])
         played.append(game("Map2", "base", "variant", "side2"))
         after = next(row for row in rankings(candidates, played) if row["id"] == "variant")
-        self.assertTrue(after["promotable"])
+        self.assertFalse(after["promotable"])
         self.assertEqual(after["paired_win_rate"], 0.5)
 
     def test_sync_installed_ai_updates_cached_profiles_without_rescan(self):
@@ -1210,9 +1231,11 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         cached = MatchService(self.root).cached_content(self.bar_root, self.engine)
         ai_entry = next(item for item in cached["ais"] if item["short_name"] == "AI")
         self.assertEqual([p["key"] for p in ai_entry["profiles"]], ["hard", "rush"])
-        self.assertFalse(self.service.sync_installed_ai(
+        self.assertTrue(self.service.sync_installed_ai(
             self.bar_root, self.engine, "MissingAI", "1", "Missing", [{"key": "hard", "name": "Hard"}],
         ))
+        self.assertIn("MissingAI", [entry["short_name"]
+                                   for entry in MatchService(self.root).cached_content(self.bar_root, self.engine)["ais"]])
         with patch("app.studio_matches.headless.run_match", return_value=("Winner: side 1.", self.root / "match")):
             self.service.start(
                 self.bar_root, self.engine, "Game", "Map",

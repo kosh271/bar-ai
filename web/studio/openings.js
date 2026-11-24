@@ -236,7 +236,7 @@
     const canChange = typeof options.onChange === "function";
     let disposed = false;
 
-    function patch(changes) {
+    function patch(changes, focusSelector) {
       if (!canChange || disposed) return;
       changes.sort(function (a, b) { return b.start - a.start; });
       let next = text;
@@ -257,7 +257,7 @@
       }
       text = next;
       options.onChange(text);
-      render();
+      render(focusSelector);
     }
 
     function notice(message) {
@@ -266,11 +266,29 @@
       container.appendChild(node);
     }
 
+    const openingTips = {
+      "Factory": "Choose which factory's opening plans to view and edit. This affects the first queue for new factories of that type.",
+      "Relative weight": "Set how likely this opening queue is compared with the other queues. Increasing it lowers their chances. Zero gives this queue no share.",
+      "Role": "Choose the job the next unit should fill, such as builder or scout. The actual unit depends on what the factory can build.",
+      "Count": "Set how many units with this role the AI should request in this step. A larger count can delay later steps and regular production.",
+      "New factory": "Enter the game's internal factory ID or a supported factory constant to give it its own opening plans.",
+      "Move queue up": "Move this alternative earlier in the stored list. The weights still determine each queue's share.",
+      "Move queue down": "Move this alternative later in the stored list. The weights still determine each queue's share.",
+      "Remove queue": "Delete this alternative opening. The remaining queues share the weight between them.",
+      "Move step up": "Request this step earlier in the opening queue so its units can be built sooner.",
+      "Move step down": "Request this step later in the opening queue so earlier steps can use the factory first.",
+      "Remove step": "Delete this request from the queue. Following orders move up in the sequence.",
+      "Add step": "Append another unit request to this opening queue.",
+      "Add queue": "Create another possible opening plan for this factory. Its weight determines how often the AI chooses it.",
+      "Add factory": "Give this factory a named opener entry. The game must recognize the factory ID or constant."
+    };
+
     function button(parent, label, action, disabled) {
       const b = element("button", "", label);
       b.type = "button";
       b.disabled = !canChange || !!disabled;
       b.addEventListener("click", action);
+      window.StudioTips?.set(b, openingTips[label]);
       parent.appendChild(b);
       return b;
     }
@@ -278,6 +296,11 @@
     function field(parent, label, input) {
       const wrap = element("label", "opening-field");
       wrap.appendChild(element("span", "", label));
+      if (window.StudioTips) {
+        window.StudioTips.set(input, openingTips[label]);
+        const description = input.getAttribute("aria-describedby");
+        if (description) window.StudioTips.addDescription(input, description, wrap);
+      }
       wrap.appendChild(input);
       parent.appendChild(wrap);
     }
@@ -315,25 +338,28 @@
       return hasComments(start, t[items[index].first].start);
     }
 
-    function add(t, open, items, value, separator) {
+    function add(t, open, items, value, separator, focusSelector) {
       if (items.length) {
         const last = items[items.length - 1];
         const pos = t[last.last].end;
         // A trailing comma already separates the new entry.
         if (last.after !== null) {
           const commaEnd = t[last.after].end;
-          patch([{ start: commaEnd, end: commaEnd, text: separator + value }]);
+          patch([{ start: commaEnd, end: commaEnd, text: separator + value }], focusSelector);
         } else {
-          patch([{ start: pos, end: pos, text: "," + separator + value }]);
+          patch([{ start: pos, end: pos, text: "," + separator + value }], focusSelector);
         }
       } else {
         const pos = t[open].end;
-        patch([{ start: pos, end: pos, text: value }]);
+        patch([{ start: pos, end: pos, text: value }], focusSelector);
       }
     }
 
-    function render() {
+    function render(focusSelector) {
       if (disposed) return;
+      const controls = "button, input, select";
+      const oldControls = Array.from(container.querySelectorAll(controls));
+      const focusIndex = oldControls.indexOf(container.ownerDocument.activeElement);
       while (container.firstChild) container.removeChild(container.firstChild);
       container.appendChild(element("h2", "", "Factory openers"));
       if (text === null) {
@@ -481,7 +507,8 @@
           });
           panel.appendChild(steps);
           button(panel, "Add step", function () {
-            add(t, queue.open, queue.steps.map(function (s) { return s.item; }), "SO(RT::BUILDER)", " ");
+          const addedCount = `.opening-queue:nth-of-type(${qi + 1}) .opening-step:last-child input`;
+          add(t, queue.open, queue.steps.map(function (s) { return s.item; }), "SO(RT::BUILDER)", " ", addedCount);
           });
           container.appendChild(panel);
         });
@@ -513,6 +540,9 @@
       } else {
         container.appendChild(element("p", "muted", "Adding factories is unavailable: Factory:: keys may alias names not declared in this file. Use the source view."));
       }
+      const focused = (focusSelector && container.querySelector(focusSelector)) ||
+        container.querySelectorAll(controls)[focusIndex];
+      if (focusIndex >= 0) (focused && !focused.disabled ? focused : select).focus({preventScroll: true});
     }
     render();
     return { destroy: function () { disposed = true; while (container.firstChild) container.removeChild(container.firstChild); } };

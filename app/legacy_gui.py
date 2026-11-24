@@ -6,6 +6,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from .control_help import control_help
 from .discovery import DiscoveryError, Installation, default_root, discover, engine_readiness
 from .match_editor import MatchEditor
 from .project_editor import ProjectEditor
@@ -47,8 +48,11 @@ class Editor(tk.Tk):
         container.pack(fill="both", expand=True)
         installation_section = ttk.Frame(container)
         installation_section.pack(fill="x")
-        self.installation_toggle = ttk.Button(
-            installation_section, text="[-] BAR installation", command=self._toggle_installation
+        self.installation_toggle = control_help(
+            ttk.Button(
+                installation_section, text="[-] BAR installation", command=self._toggle_installation
+            ),
+            "Show or hide the BAR installation and engine settings.",
         )
         self.installation_toggle.pack(anchor="w")
         frame = ttk.Frame(installation_section, padding=8)
@@ -56,14 +60,29 @@ class Editor(tk.Tk):
         self.installation_frame = frame
         frame.columnconfigure(1, weight=1)
         ttk.Label(frame, text="BAR installation:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.root_path).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(frame, text="Browse...", command=self.browse).grid(row=0, column=2)
-        ttk.Button(frame, text="Inspect", command=self.inspect).grid(row=1, column=1, sticky="w", padx=8, pady=10)
+        control_help(
+            ttk.Entry(frame, textvariable=self.root_path),
+            "Enter the main Beyond All Reason folder. Inspect it to find installed engines and game files.",
+        ).grid(row=0, column=1, sticky="ew", padx=8)
+        control_help(
+            ttk.Button(frame, text="Browse...", command=self.browse),
+            "Pick the BAR installation folder. Studio inspects it as soon as you choose it.",
+        ).grid(row=0, column=2)
+        control_help(
+            ttk.Button(frame, text="Inspect", command=self.inspect),
+            "Check the folder for installed engines and game files. Pick an engine before saving.",
+        ).grid(row=1, column=1, sticky="w", padx=8, pady=10)
         ttk.Label(frame, text="Engine to use:").grid(row=2, column=0, sticky="w")
-        self.engine_box = ttk.Combobox(frame, textvariable=self.engine, state="readonly")
+        self.engine_box = control_help(
+            ttk.Combobox(frame, textvariable=self.engine, state="readonly"),
+            "Choose the engine used to install AIs and run tests. Different engines can see different installed AIs.",
+        )
         self.engine_box.grid(row=2, column=1, sticky="ew", padx=8)
         self.engine_box.bind("<<ComboboxSelected>>", self._engine_changed)
-        ttk.Button(frame, text="Save selection", command=self.save).grid(row=2, column=2)
+        control_help(
+            ttk.Button(frame, text="Save selection", command=self.save),
+            "Remember this BAR folder and engine for future sessions. The engine must pass the readiness check.",
+        ).grid(row=2, column=2)
         ttk.Label(frame, textvariable=self.status, wraplength=600).grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(16, 6)
         )
@@ -81,9 +100,13 @@ class Editor(tk.Tk):
         self.pages = {"AI projects": project_frame, "Headless match": self.match_editor}
         self.tab_buttons: dict[str, tk.Button] = {}
         for name in self.pages:
-            button = tk.Button(
-                tab_bar, text=name, command=lambda selected=name: self._select_tab(selected),
-                padx=12, pady=5, borderwidth=2, foreground="#202020", activeforeground="#202020",
+            button = control_help(
+                tk.Button(
+                    tab_bar, text=name, command=lambda selected=name: self._select_tab(selected),
+                    padx=12, pady=5, borderwidth=2, foreground="#202020", activeforeground="#202020",
+                ),
+                "Edit projects and their profile files." if name == "AI projects" else
+                "Set up a test match that runs without opening the game window.",
             )
             button.pack(side="left", padx=(0, 4))
             self.tab_buttons[name] = button
