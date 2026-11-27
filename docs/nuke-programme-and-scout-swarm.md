@@ -1,6 +1,6 @@
 # Late-game nuke battery, air force and fortification (DefWk2-N)
 
-The DefWk2-N profile (a copy of Defensive Wk2) starts a nuclear programme at **12 minutes**: up to 23 launchers, a new one about every two minutes, behind the base, with a growing ring of anti-nukes, plus a swarm of scout aircraft that finds targets for them. Everything is AngelScript and configuration; nothing native was changed.
+The DefWk2-N profile starts its nuclear programme at **12 minutes**. It can request up to 23 launchers, using rear land sites, a growing anti-nuke ring and scout aircraft to find targets. The profile works with plain BAR. A match can load an optional synced gadget for live stockpile counts.
 
 Code: `script/manager/nuke.as`, `nuke_subs.as`, `anti_nuke.as`, `naval.as`, `outrigger.as`, `air_nanos.as`, `scout_swarm.as`, `air_defence.as`, `air_reserve.as`, `factory.as`, `big_gun_support.as`, `census.as`. Limits: `config/behaviour.json` and `config/behaviour_leg.json`.
 
@@ -10,42 +10,46 @@ Code: `script/manager/nuke.as`, `nuke_subs.as`, `anti_nuke.as`, `naval.as`, `out
 | --- | --- | --- |
 | Start | 12:00 (`Nuke::startFrame`). Silos are unavailable to the AI before 10:00 (`"since": 600`). | `behaviour*.json`, `nuke.as` |
 | Cap | 23 launchers, silos and nuclear submarines together (`Nuke::siloTarget`, `"limit": 23`) | `behaviour*.json`, `nuke.as` |
-| First launch | due by 22:00 (`Nuke::firstLaunchBy`): from then even one estimated missile opens a volley | `Nuke::VolleyNeeded` |
-| Volley size | all standing silos loaded once: at least 2 (until the 22:00 deadline) and at most 8 estimated missiles | `Nuke::VolleyNeeded` |
-| Silo requests | one every 2 minutes, up to 3 builds at once, 20-minute task timeout, once metal income is at least 15 and energy income at least 500, energy is not stalling, the AI has a Tech 2 constructor and an air plant (or it is 17:00). The first silo is top priority, the second high, later ones normal | `Nuke::RequestSilo` |
+| Volley gate | eight ready missiles across at least four launchers. If four launchers are still unavailable after five minutes above the eight-missile threshold, the available launchers can release. The profile estimates ammo when the optional stockpile gadget is absent | `Nuke::ReadyAmmo`, `Nuke::Update` |
+| Silo requests | one every 2 minutes, up to 3 builds at once, 20-minute task timeout, once metal income is at least 15 and energy income at least 500, energy is not stalling, the AI has a finished Tech 2 constructor and an air plant (or it is 17:00). The first land silo is top priority, the second high, and later ones normal. Submarines do not take those priority slots | `Nuke::RequestSilo` |
 | Tech 2 nudge | from 8:00, when the AI has no Tech 2 factory, factory selection is nudged toward the advanced lab, every 2 minutes at most | `Nuke::ChooseTechFactory` |
 | Park nanos | 3 nano turrets are queued at the park with the first silo (a silo is 178500 build points; a nano turret adds 200 a second). Eight were tried and starved the air plant of builders | `Nuke::RequestSilo` |
-| Silo park and pads | a park spot 1000 elmos behind the commander's start position, away from the front (the map centre stands in until there are 4 land units), clamped to the map. Requests cycle through 10 pads along the back edge: 0, +250, -250, +500 ... elmos sideways from the park. A failed request retries the same pad | `Nuke::ChoosePark`, `Nuke::Pad` |
+| Silo park and pads | a park spot 1000 elmos behind the commander's start position, away from the front (the map centre stands in until there are 4 land units), clamped to the map. Requests cycle through 10 pads along the back edge: 0, +250, -250, +500 ... elmos sideways from the park. The park and every request must be buildable ground (see below) | `Nuke::ChoosePark`, `Nuke::NextSpot` |
+| Failed or stalled requests | after a failed or three-minute unstarted task, nearby sites cool down for 3 minutes per recent failure, up to 15 minutes. Failures stay on record for 30 minutes after the last one. Another site can be requested after 30 s | `Nuke::AbortStalled`, `Nuke::TaskRemoved` |
 | Silo escort | the park is an escort site of the heaviest tier (3 shields, 5 heavy statics, 5 anti-nukes, 4 T2 SAMs); the two outer pads each get a tier-3 site. Escort tasks run at normal priority | `BigGunSupport::RegisterEscort` |
 | Base escort | a tier-3 escort site at the base (2 shields, 3 heavy, 4 anti-nuke, 3 T2 SAMs); a new one every 4 minutes after the last finishes, up to 6 | `Nuke::FortifyHome` |
 | T3 labs | none: `limit: 0` on the Armada, Cortex and Legion gantries (land and underwater) | `behaviour*.json` |
 
-The silo is requested as an ordinary defence build, not a big-gun build, so the big-gun placement module does not move it toward the front. Each silo logs where it finished, its distance from the base anchor and from the park, and how far toward the front it stands (negative is behind the base).
+Silos use the ordinary defence build task. The native builder can search up to 1600 elmos from a requested spot, including across the base-to-front line. Each completed silo logs its actual position and signed distance along that line. Negative means behind the base. The ring can then assign coverage to the actual silo position.
 
 The first live game (with the old 45-minute start and 8 silos) showed silos finishing at 52, 74, 79, 84, 90 and 97 minutes. Three of the build tasks timed out at 4 minutes without finishing, and builds ran one at a time. The longer timeout and three builds at once address that; no T3 lab also frees the metal. In the headless games below, escort structures at low priority starved while silo builds held every builder (tasks timing out after about 4.5 minutes), which is why escorts run at normal priority and only the first two silos are high priority.
 
 ### How the volley gate works
 
-The AI's superweapon task fires as soon as any silo holds one missile, and scripts cannot read a silo's stockpile. The gate therefore uses an estimate and AI control:
+The military manager keeps the stockpile queue filled while completed launchers are held. For live counts, package `projects/Willtest/tools/defwk2_n_stockpile.lua` under `luarules/gadgets/` in the BAR add-on used for the match. It answers read-only stockpile queries for the requesting team's own strategic launchers. Plain BAR provides no reply, so the profile falls back to its estimates. The script still receives no acknowledgement when a launcher fires.
 
-1. A finished silo is taken out of AI control. It keeps stockpiling, because the military manager keeps the stockpile queue topped up whatever the unit's task is.
-2. Each silo banks one second of progress per game second, none while energy is stalling. A missile counts every 150 s of progress (the weapon takes 120 s; the extra 25% is a margin for shortfalls). A silo holds at most 10.
-3. When the estimate reaches the needed number, every silo is handed back to the AI, which picks targets and fires. The window is long enough for each silo to fire its estimated stock at one missile per 10 s, at least 30 s.
-4. When the window is over, every enemy unit type is marked "ignored" for 20 s. The superweapon task then finds no target and orders its silo to stop, which clears the silo's order queue. After that the silos are held again, the ignore flags are restored and the estimate restarts from zero. Log lines: `volley window ending, targets masked`, then `volley window closed, silos held`.
+1. The profile estimates progress separately for every launcher and pauses the estimate during energy stalls or when the metal stores are nearly empty and demand exceeds income. It uses 150 s for an Armada silo, 225 s for a Cortex or Legion silo, 175 s for a Seadragon, and 262.5 s for a Desolator. These are the weapon timings plus a 25 percent margin.
+2. On each half-minute boundary, the profile reads the stockpile for each held launcher and uses its estimate when a valid reply is unavailable. A window can open once four held launchers share at least eight ready missiles. If fewer are ready, five minutes above the eight-missile threshold allow a smaller group to release. Allied copies that independently meet the gate at the same boundary open together. Only held launchers with ready ammo are released. The profile subtracts their committed rounds from the estimate and carries forward partial progress.
+3. An ordinary volley uses the smallest per-launcher round limit that commits at least eight missiles across the group. Eight or more loaded launchers need a single round each and use a 20-second window. Each additional round allowed on a launcher adds 45 seconds for reload and targeting. A volley with fewer than four ready launchers uses their accumulated rounds after the fallback wait. The native tasks decide what to target and which launchers actually shoot.
+4. At the end of the window, static launchers enter the native stop behavior. The script takes them back after a 20-second grace period and restores their previous fire state. An attack the native task already ordered can still launch during that grace period. Submarines return to script control at the start of the interval.
 
-Why step 4 exists: the first version only held the silos when the window ended, and a launch happened while the window was closed. The superweapon task gives a silo an attack order that stays live for 60 s, and handing the silo to script control does not cancel it, so a missile that completed in that tail fired alone. The script interface has no stop order, so the stop is induced by removing every valid target.
+The stop behavior works through the native static superweapon task. The script cannot cancel an individual command directly. Real stockpile progress can still differ from the estimate, and the profile cannot read scouted anti-nuke locations or interceptor inventories through the installed script API.
 
-The estimate can still be wrong. A silo that was part-way through a missile when it was re-held keeps that progress. A window with no valid target leaves missiles unspent that the estimate has forgotten, which only delays the next volley. Check the engine log for `Nuke:` lines to compare the estimate with what you see in a replay.
+### Buildable ground
+
+`Terrain::FindBuildable` (`map_terrain.as`) returns the nearest dry, flat sample. The spot must be above sea level with a slope of at most 0.30, and at least 14 of 25 samples in the surrounding 320-elmo square must be dry with a slope of at most 0.35. Silo requests prefer positions at least 160 elmos behind the base. The search checks within 480 elmos of the pads and 2400 elmos of the park, then falls back to positions up to the base line. After two failures are on cooldown, the rear search starts within 640 elmos of eligible finished T2 constructors near the base and prefers a short distance from builder to site. The native task still assigns the builder and chooses the final position. Sites within 200 elmos of a standing silo, a pending silo task or a failure on cooldown are skipped. Outrigger centres and tactical launchers use the same terrain test. On maps without a height snapshot, distance and retry rules still apply and native placement checks the terrain.
+
+Why: in a game on Mediterraneum the silo area was partly under water. The old placement kept a water spot when it found nothing dry nearby, and asked for the same spot again after each failure (one AI asked for one underwater spot 23 times).
 
 ## Scout swarm
 
 From 12:00 the AI's aircraft plants also build radar aircraft until 30 are alive in total: Peepers (`armpeep`) and Finks (`corfink`) from the Tech 1 plants, advanced radar planes (`armawac`, `corawac`, `legwhisper`) from advanced plants. Legion has no Tech 1 scout aircraft. If the AI has no Tech 1 aircraft plant, the swarm also nudges factory selection toward one (every 2 minutes at most).
 
-Scouts that finish after 12:00 wait at the base in a defend task that never promotes. When 20 are waiting (10 after 6 minutes of waiting), the hold tasks are aborted and the scouts take scout tasks together within 20 seconds. After that each scout flies the stock scout task, which explores and reports what it sees. The superweapon task chooses its targets from that picture by cost, so finding the enemy base is what lets the silos hit something valuable.
+Scouts that finish after 12:00 wait at the base in a defend task that never promotes. Only live scouts still assigned to a hold task count toward a launch. At 20 waiting scouts, or 10 after 6 minutes, the hold tasks are aborted and the scouts take scout tasks together within 20 seconds. Each scout then explores using the stock task. The superweapon task chooses targets from the sightings by cost.
 
 ## Air force and fortification
 
-- **Fighters.** From 10 minutes a standing fighter force is kept whether or not enemy air has been seen: 6 + minutes/4 Tech 1 fighters (3 + minutes/6 advanced fighters), plus one per three fighter-costs of enemy air observed; capped at 45 and 30.
+- **Fighters.** From 10:00 the profile requests 6 + minutes/4 Tech 1 fighters and 3 + minutes/6 advanced fighters, plus one per three fighter-costs of observed enemy air. The caps are 45 and 30. From 55:00 an air plant can take its fighter turn before scouts or bombers when the relevant fighter type drops below eight. Each air plant tracks its own pending fighter request.
 - **Plant rotation.** Fighters, scouts and bombers all want the same air plants, and the fighter screen always wants more. The factory hook now rotates who is asked first (scout swarm, bomber reserve, fighter screen), so scouts and bombers are no longer starved.
 - **Bombers.** The bomber reserve (cap 50, one order every 5 s once a silo and an anti-nuke exist) only builds from the advanced air plant. If the AI has none, factory selection is nudged toward one every 2 minutes (`ChooseBomberPlant`). Advanced air plants may now be built twice (`"limit": 2`).
 - **T2 SAMs, shields, heavy defences, anti-nukes.** These come from escort sites: the silo park, its outer pads and the base itself (a tier-3 site around the commander's start position, renewed every 4 minutes after the last one finishes, up to 6). Quotas per site are in `big_gun_support.as`.
@@ -55,7 +59,7 @@ Scouts that finish after 12:00 wait at the base in a defend task that never prom
 ## Anti-nukes
 
 - **Base cover.** One anti-nuke at the base (`AntiNuke::Coverage`, the original rule: only while there are none).
-- **Ring.** From 18:00 (and once a silo stands, or from 26:00) a second rule keeps adding batteries: wanted = 2 + one per two silos (standing or being built) + one every 4 minutes after 18:00, at most 24. They go in turn to the base, the silo pads and the outrigger clusters, two tasks at a time, one every 15 s (`AntiNuke::RequestRing`).
+- **Ring.** From 18:00 (and once a launcher stands, or from 26:00) a second rule keeps adding batteries. It wants 2 plus one per two launchers standing or being built plus one every 4 minutes after 18:00, up to 24. The existing turns for the base and outriggers stay in place. A silo-pad turn can instead cover the actual finished silo furthest from any completed battery or active ring request. The ring submits at most two tasks at a time and one every 15 seconds.
 - **Escort sites** add more at the park, the outer pads, the base and the outriggers (see below).
 - **Navy.** The shipyard hook (`Naval::TryAntiNuke`) wanted anti-nuke ships only in proportion to flagships, and flagships are limited to one on open water and none on mixed maps, so it never wanted more than one. It now also wants 2 from 14:00 plus one every 4 minutes, at most 8 (`Naval::TimedTarget`): Armada `armantiship`, Cortex `corantiship`, Legion `leganavyantinukecarrier`. This is the "one or two launchers" cap: the base rule and the fleet rule each topped out at one.
 
@@ -65,7 +69,7 @@ Scouts that finish after 12:00 wait at the base in a defend task that never prom
 
 **How they fire.** Like the Thor's EMP missile, the ICBM is a manual-fire stockpile weapon, and the native code fires those itself. A unit with a manual-fire weapon gets a `CDGunAction` whenever it is assigned to a fighter task (`FighterTask.cpp`); every few updates it takes the most powerful visible enemy within the weapon's range and orders the shot (`DGunAction.cpp`), if a missile is stockpiled and the weapon's energy cost per second of stockpile time is affordable. The ICBM is a `StarburstLauncher`, which `CircuitWDef.cpp` counts as high trajectory, so the action's line-of-fire check over the terrain is skipped, and its 72000 range covers the map. The military manager keeps the stockpile going. The role in `behaviour_extra_units.json` is `super`, as for `armthor`.
 
-**How the volley gate treats them.** A submarine is registered in `Nuke::silos` like a silo and counts toward the volley estimate (140 s per missile, the same 150 s margin). Outside a window it is taken out of AI control, which clears its fighter task and with it the manual-fire action. When a window opens it is handed back and the native action picks targets. When the window ends it is held again at once, before the 20 s target masking, because the manual-fire action does not look at the ignore flags the mask uses. Differences from a silo: the target is the most powerful visible enemy unit, not the largest group, and a submarine that has to surface or move to see targets may fire later than a silo does.
+**How the volley gate treats them.** A submarine uses the same estimated-ammo threshold as a silo, with its own weapon timing. While held it has no native fighter task to run its manual-fire action. At volley close it returns to script control immediately. The native action targets the most powerful visible enemy unit, and a submarine may need extra time to surface or move into range.
 
 **Not verified.** The test map has no water, so none of this ran. Set `maxSubs` to 0 in `nuke_subs.as` if 8000 metal and 85000 energy each is not worth it.
 
@@ -95,13 +99,14 @@ Up to two energy clusters well away from the base, at right angles to the base-t
 ## Air plants
 
 - **Nano turrets.** `air_nanos.as` gives every air plant 2 nano turrets and every advanced air plant 4, counting nano turrets of any origin within 450 elmos. The native logic hands nanos out per factory starting with the newest, and a land lab with a large weight took all of them.
-- **Plant fallback.** The factory-selection nudge ("selected corap for the defensive response") was seen repeating for half an hour without a plant ever being built, in roughly one game in four. `AirDefence::EnsurePlant` queues the plant directly at the base from 14:00 when there is none (every 3 minutes, 5 tries). The plant also sits ahead of the Tech 2 lab nudge in factory selection.
+- **Plant fallback.** From 14:00, if no air plant stands, `AirDefence::EnsurePlant` queues a basic plant directly. It starts at the base, tries alternate rear ground on later attempts when available, and backs off from three to six minutes between attempts. The retry count resets once a plant stands, so rebuilding remains available after a loss.
 
 ## What needs native support
 
-Neither of these is reachable from AngelScript. The profile approximates them as above.
+The profile approximates these behaviors through the current AngelScript interface.
 
-- **A minimum stockpile in the superweapon task.** `SuperTask::Update` fires whenever `GetStockpile() > 0`. A native minimum (sum of stockpiles across launchers, read with `GetStockpile()`) would replace the estimate and the control hand-off.
+- **Volley coordination in the superweapon task.** The optional gadget supplies actual stockpiles. Coordinating targets, accounting for missiles that actually launched and holding fire through native commands still need support.
+- **Bounded silo placement.** The native builder would need a position constraint or a bounded search radius to enforce rear placement after it receives a request.
 - **A coordinated swarm task.** The script interface has no move or attack order for a single unit, so these cannot be scripted:
   - a shared approach axis from a staging point toward the enemy base;
   - lateral spacing wide enough that one flak burst does not hit several scouts, tight enough to saturate the defences' fire;
@@ -111,6 +116,14 @@ Neither of these is reachable from AngelScript. The profile approximates them as
   The native tree already has deterministic planners for formation slots and synchronized multi-group arrival (`FormationSlots.h`, `MultiGroupManeuver.h`) that a swarm task could build on.
 
 ## What has been verified
+
+In a controlled Mediterraneum shoreline start, the updated profile completed three Cortex silos. The first completed behind the base after the initial two rear pads failed. The builder moved one later request to a position 601 elmos toward the front.
+
+In a plain-BAR volley fixture, eight silos were estimated ready and the witness recorded a launch inside the window. A second fixture primed one silo with eight actual missiles. The profile waited for three more launchers, read all four stockpiles through the gadget and opened a window with twelve ready rounds. The witness recorded three launches inside that window. Target selection and combat saturation remain open.
+
+Two follow-up stockpile fixtures exercised the shorter release. Four unevenly armed silos committed eight rounds in 200 seconds and fired three missiles together. Eight silos with at least three rounds each committed one round apiece in 20 seconds and fired two missiles together. Both counts came from observed projectiles.
+
+A paired Mediterraneum coverage fixture seeded two quiet bases and sent one simultaneous wave from 12 scripted enemy silos at 24:00. All 12 nuclear detonations in each variant happened in the air, at least 1800 elmos above ground. Both variants retained their seeded reactors before the wave. This tests a prepared anti-nuke defense with ordinary nuclear releases disabled for both profiles.
 
 Headless games on Koom Valley (engine 2026.09.03, one profile under test per game, Armada and Cortex alternating). Script compile errors: none. The scripts for repeating this are in the session scratch folder, not in the repository.
 
@@ -147,7 +160,7 @@ Why the first launch is late: a silo is 8100 metal and 90000 energy, and each mi
 ## Not verified
 
 - **Tactical and EMP missiles in a fight.** In the test games (opponent with factories disabled) 1 or 2 launchers were standing by 33 to 37 minutes in 4 of 7 games, 1500 to 1700 elmos toward the front and behind the nearest defences; in the others the first task timed out and a second was queued. Nothing shows whether they stockpile and fire: the opponent had nothing in range.
-- **Missiles actually held back.** Each window close shows the silos under script control and the target mask running, but the log cannot show a launch. The leak seen in the live game (a launch while the window was closed) has a mechanism that the mask addresses, but the headless games cannot confirm that no missile fired outside a window.
+- **Combat release discipline.** The controlled fixture observed two launches inside the window. Sustained fighting, submarines and matches with varying target availability still need projectile evidence to check for launches outside the intended window.
 - **Volleys that hit something.** The opponent in the long games had no army and, quickly, nothing worth a missile.
 - **Fighters, bombers and scouts under real attack.** Counts depend on what survives. The plant rotation and the advanced plant nudge raise production; they cannot make aircraft survive enemy air defence.
 - **Cortex escorts.** Roughly 40% of escort tasks in the Cortex games timed out waiting for a builder; the structures still arrive, later. I did not find why Cortex has fewer builders available.
