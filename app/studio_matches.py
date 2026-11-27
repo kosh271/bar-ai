@@ -1931,6 +1931,10 @@ class MatchService:
                     if parallel_games is not None:
                         self._parallel_games = parallel_games
                     self._batches.append(batch)
+                    submission = {
+                        "queue_id": self._state["id"], "batch_id": batch.id,
+                        "first_game_index": len(self._state["games"]) + 1, "game_count": len(batch.games),
+                    }
                     for task in batch.games:
                         task.row["game_index"] = len(self._state["games"]) + 1
                         self._state["games"].append(task.row)
@@ -1939,7 +1943,7 @@ class MatchService:
                 with self._queue_changed:
                     self._admitting_to_queue = None
                     self._queue_changed.notify_all()
-        return self.status()
+        return {**self.status(), "submission": submission}
 
     def _run_queue(self) -> tuple[dict, dict, str]:
         while True:

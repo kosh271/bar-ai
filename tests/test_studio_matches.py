@@ -752,13 +752,19 @@ class BenchmarkSeriesAndHistoryTests(unittest.TestCase):
         ]
         with patch("app.studio_matches.headless.run_match", side_effect=run):
             try:
+                receipts = []
                 for minutes in (10, 20, 30):
-                    self.service.start(self.bar_root, self.engine, "Game", "Map", players, minutes, True,
-                                       parallel_games=2)
+                    accepted = self.service.start(self.bar_root, self.engine, "Game", "Map", players, minutes, True,
+                                                  parallel_games=2)
+                    receipts.append(accepted["submission"])
                 self.assertTrue(first.wait(2))
                 self.assertTrue(second.wait(2))
                 self.assertFalse(third.is_set())
                 status = self.service.status()
+                self.assertEqual([receipt["queue_id"] for receipt in receipts], [status["id"]] * 3)
+                self.assertEqual([receipt["batch_id"] for receipt in receipts], [row["batch_id"] for row in status["games"]])
+                self.assertEqual([receipt["first_game_index"] for receipt in receipts], [1, 2, 3])
+                self.assertEqual([receipt["game_count"] for receipt in receipts], [1, 1, 1])
                 self.assertEqual([(row["state"], row["pid"]) for row in status["games"]],
                                  [("running", 110), ("running", 120), ("queued", None)])
                 self.service.cancel_game(status["id"], status["games"][0]["game_index"])

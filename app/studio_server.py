@@ -20,7 +20,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 from . import (
     discovery, game_sources, installation, profile_exchange, profile_text, project_archive, project_history,
@@ -72,6 +72,8 @@ class StudioServer(ThreadingHTTPServer):
         self._client_lock = threading.Lock()
         self._clients: dict[str, float] = {}
         self._has_connected_client = False
+        self._active_requests = 0
+        self._shutdown_started = False
         self._client_expiry_timer: threading.Timer | None = None
         self._shutdown_timer: threading.Timer | None = None
         super().__init__(address, StudioRequestHandler)
@@ -96,6 +98,17 @@ class StudioServer(ThreadingHTTPServer):
                 if self._has_connected_client:
                     self._schedule_shutdown_locked()
 
+    def begin_request(self) -> bool:
+        with self._client_lock:
+            if self._shutdown_started:
+                return False
+            self._active_requests += 1
+            return True
+
+    def end_request(self) -> None:
+        with self._client_lock:
+            self._active_requests -= 1
+
     def _expire_clients(self) -> None:
         with self._client_lock:
             self._client_expiry_timer = None
@@ -107,14 +120,17 @@ class StudioServer(ThreadingHTTPServer):
 
     def _shutdown_if_idle(self) -> None:
         with self._client_lock:
+            if self._shutdown_started:
+                return
             self._shutdown_timer = None
             self._expire_stale_clients_locked(time.monotonic())
             if self._clients:
                 self._schedule_client_expiry_locked()
                 return
-            if self.match_service.is_busy():
+            if self._active_requests or self.match_service.is_busy():
                 self._schedule_shutdown_locked()
                 return
+            self._shutdown_started = True
         self.shutdown()
 
     def _expire_stale_clients_locked(self, now: float) -> None:
@@ -173,12 +189,39 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
+        self._handle_live_request(self._get)
+
+    def do_POST(self) -> None:
+        self._handle_live_request(self._post)
+
+    def _handle_live_request(self, handle: Callable[[], None]) -> None:
+        if not self.server.begin_request():
+            self.close_connection = True
+            return self._error(503, "Studio is shutting down.")
+        try:
+            handle()
+        finally:
+            self.server.end_request()
+
+    def _get(self) -> None:
         if not self._valid_host_origin():
             return self._error(403, "Invalid request origin.")
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path.startswith("/api/"):
             if not self._authorized():
                 return self._error(401, "A valid workshop token is required.")
+            if parsed.path == "/api/projects" and not parsed.query:
+                try:
+                    issues: list[dict[str, str]] = []
+                    entries = self._state_projects(issues, initialize_history=False)
+                    return self._json(200, {"projects": entries, "project_issues": issues})
+                except Exception as error:
+                    return self._handle_error(error)
+            if parsed.path == "/api/settings" and not parsed.query:
+                try:
+                    return self._json(200, {"settings": self._settings()})
+                except Exception as error:
+                    return self._handle_error(error)
             if parsed.path == "/api/state" and not parsed.query:
                 try:
                     default_bar_root = discovery.default_root()
@@ -292,13 +335,15 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/profile":
                 try:
                     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
-                    if set(query) != {"project", "profile"} or any(len(values) != 1 for values in query.values()):
-                        raise ValueError("project and profile query values are required exactly once.")
+                    if (not {"project", "profile"} <= query.keys() <= {"project", "profile", "path", "metadata"}
+                            or any(len(values) != 1 for values in query.values())
+                            or ("metadata" in query and query["metadata"] != ["1"])):
+                        raise ValueError("Provide one project and profile, an optional file path, and optional metadata=1.")
                     with self.server.write_lock:
                         files = self._profile({
                             "project": query["project"][0],
                             "profile": query["profile"][0],
-                        })
+                        }, file_path=query.get("path", [None])[0], metadata_only="metadata" in query)
                     return self._json(200, {"files": files})
                 except Exception as error:
                     return self._handle_error(error)
@@ -330,6 +375,10 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 return self._error(404, "Unknown API endpoint.")
         if parsed.query:
             return self._error(404, "Not found.")
+        if parsed.path == "/mcp/session":
+            if self.headers.get("Sec-Fetch-Site", "").casefold() not in ("", "same-origin"):
+                return self._error(403, "Session bootstrap is same-origin only.")
+            return self._json(200, {"version": 1, "token": self.server.session_token})
         if parsed.path == "/session.js":
             if self.headers.get("Sec-Fetch-Site", "").casefold() == "cross-site":
                 return self._error(403, "Session bootstrap is same-origin only.")
@@ -367,7 +416,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             content_type += "; charset=utf-8"
         self._send(200, body, content_type)
 
-    def do_POST(self) -> None:
+    def _post(self) -> None:
         if not self._valid_host_origin():
             return self._error(403, "Invalid request origin.")
         if not self._authorized():
@@ -733,7 +782,8 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             return str(error)
         return None
 
-    def _state_projects(self, issues: list[dict[str, str]] | None = None) -> list[dict[str, Any]]:
+    def _state_projects(self, issues: list[dict[str, str]] | None = None, *,
+                        initialize_history: bool = True) -> list[dict[str, Any]]:
         result = []
         if issues is None:
             issues = []
@@ -749,14 +799,16 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 except (projects.ProjectError, OSError) as error:
                     issues.append({"project": key, "message": str(error)})
                     continue
-                result.append({
+                entry = {
                     "key": key,
                     "name": name,
                     "default_profile": default,
-                    "history_error": self._initialize_history(project),
                     "profiles": [{"key": profile_key, "name": profile_name}
                                  for profile_key, profile_name in profiles],
-                })
+                }
+                if initialize_history:
+                    entry["history_error"] = self._initialize_history(project)
+                result.append(entry)
         return result
 
     def _settings(self) -> dict[str, str] | None:
@@ -979,7 +1031,8 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("Projects directory cannot be a link.")
         return projects.project_path(self.server.projects_root.resolve(), key)
 
-    def _profile(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+    def _profile(self, payload: dict[str, Any], *, file_path: str | None = None,
+                 metadata_only: bool = False) -> list[dict[str, str]]:
         self._require_fields(payload, ("project", "profile"))
         project_dir = self._project(self._string(payload["project"], "project"))
         profile_key = self._string(payload["profile"], "profile")
@@ -989,6 +1042,10 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         total = (profile / "profile.json").stat().st_size
         count = len(files) + 1
         projects.check_workspace_size(total, total, count)
+        if file_path is not None:
+            files = [relative for relative in files if relative.as_posix() == file_path]
+            if not files:
+                raise ValueError("The path is not an editable file in the selected project profile.")
         for relative in files:
             path = profile / relative
             if self._path_has_link(profile, path):
@@ -998,12 +1055,13 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             raw = profile_text.read(path)
             total += len(raw)
             projects.check_workspace_size(len(raw), total, count)
-            text = raw.decode("utf-8")
-            result.append({
+            entry = {
                 "path": relative.as_posix(),
-                "text": text,
                 "sha256": hashlib.sha256(raw).hexdigest(),
-            })
+            }
+            if not metadata_only:
+                entry["text"] = raw.decode("utf-8")
+            result.append(entry)
         return result
 
     def _save(self, payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -1012,6 +1070,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         profile_key = self._string(payload["profile"], "profile")
         profile = projects._profile_path(project_dir, profile_key)
         submitted = payload["files"]
+        changed_only = payload.get("changed_only", False)
+        if type(changed_only) is not bool:
+            raise ValueError("changed_only must be a boolean.")
         if not isinstance(submitted, list) or not submitted or len(submitted) > projects.MAX_WORKSPACE_ENTRIES:
             raise ValueError(f"files must be a non-empty list of at most {projects.MAX_WORKSPACE_ENTRIES} files.")
 
@@ -1050,6 +1111,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 edited_size += size
                 projects.check_workspace_size(size, edited_size, count)
         profile_text.replace(profile, edits)
+        if changed_only:
+            return [{"path": path.relative_to(profile).as_posix(), "sha256": hashlib.sha256(raw).hexdigest()}
+                    for path, _revision, raw in edits]
         return self._profile({"project": payload["project"], "profile": profile_key})
 
     def _inspect(self, payload: dict[str, Any]) -> dict[str, Any]:

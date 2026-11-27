@@ -1,16 +1,23 @@
 """Expose a running local BAR AI Studio instance to MCP clients over stdio."""
 
 import argparse
+import asyncio
 import json
 import re
 import threading
+from collections import Counter
+from functools import wraps
 from http.client import HTTPConnection, HTTPException
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
 from uuid import uuid4
 
 
 DEFAULT_PORT = 8765
+_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+_UNKNOWN_OUTCOME = (
+    "Studio did not confirm the request. Check the operation or workspace state before retrying."
+)
 
 
 class StudioError(Exception):
@@ -23,7 +30,7 @@ class StudioClient:
         self.client_id = f"mcp-{uuid4().hex}"
         self._stop = threading.Event()
         self._heartbeat = threading.Thread(target=self._keep_alive, daemon=True)
-        self._connected = False
+        self._registered = False
 
     def __enter__(self) -> "StudioClient":
         self._heartbeat.start()
@@ -32,7 +39,7 @@ class StudioClient:
     def __exit__(self, *_exc: object) -> None:
         self._stop.set()
         self._heartbeat.join()
-        if self._connected:
+        if self._registered:
             try:
                 self.request("/api/client/close", {"client_id": self.client_id})
             except StudioError:
@@ -43,29 +50,39 @@ class StudioClient:
             try:
                 self.request("/api/client/heartbeat", {"client_id": self.client_id})
             except StudioError:
-                self._connected = False
+                interval = 2
             else:
-                self._connected = True
-            self._stop.wait(20 if self._connected else 2)
+                self._registered = True
+                interval = 20
+            self._stop.wait(interval)
 
-    def request(self, path: str, payload: dict | None = None, **query: str | int) -> dict:
-        # The browser uses this same local bootstrap. Never evaluate its JavaScript
-        # or follow redirects, and keep the token out of MCP results and logs.
+    @staticmethod
+    def _session_token(connection: HTTPConnection, host: str) -> str:
+        connection.request("GET", "/mcp/session")
+        session = None
+        with connection.getresponse() as response:
+            if response.status == 200 and response.headers.get_content_type() == "application/json":
+                body = response.read(513)
+                if len(body) <= 512:
+                    try:
+                        session = json.loads(body.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        pass
+        if isinstance(session, dict) and type(session.get("version")) is int and session["version"] == 1:
+            token = session.get("token")
+            if isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+                return token
+        raise StudioError(
+            f"No compatible BAR AI Studio MCP session was found at http://{host}/. "
+            "Restart Studio from the same checkout as the MCP adapter."
+        )
+
+    def request(self, path: str, /, payload: dict | None = None, **query: str | int) -> dict:
         host = f"127.0.0.1:{self.port}"
         connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
-        sending_request = False
+        mutation_sent = False
         try:
-            connection.request("GET", "/session.js")
-            with connection.getresponse() as response:
-                body = response.read(512)
-                expected = (
-                    rb'if \(location.origin === "http://' + re.escape(host.encode("ascii"))
-                    + rb'"\) window.WORKSHOP_TOKEN = "([A-Za-z0-9_-]{43})";\n'
-                )
-                token = re.fullmatch(expected, body) if response.status == 200 else None
-            if token is None:
-                raise StudioError(f"No BAR AI Studio session was found at http://{host}/.")
-            headers = {"X-Workshop-Token": token[1].decode("ascii")}
+            headers = {"X-Workshop-Token": self._session_token(connection, host)}
             if query:
                 path += "?" + urlencode(query)
             if payload is None:
@@ -76,23 +93,31 @@ class StudioClient:
                 if connection.sock is not None:
                     connection.sock.settimeout(connection.timeout)
                 headers["Content-Type"] = "application/json"
-                sending_request = True
-                connection.request("POST", path, body=json.dumps(payload, ensure_ascii=True), headers=headers)
+                try:
+                    body = json.dumps(payload, ensure_ascii=True, allow_nan=False)
+                except ValueError as error:
+                    raise StudioError("Studio tool arguments must contain valid JSON values.") from error
+                mutation_sent = path != "/api/match/cache"
+                connection.request("POST", path, body=body, headers=headers)
             with connection.getresponse() as response:
                 try:
-                    result = json.loads(response.read())
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    raise StudioError(f"Studio returned an invalid response (HTTP {response.status}).") from None
+                    body = response.read(_MAX_RESPONSE_BYTES + 1)
+                    result = json.loads(body) if len(body) <= _MAX_RESPONSE_BYTES else None
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+                    result = None
                 if not isinstance(result, dict):
-                    raise StudioError("Studio returned an invalid response.")
+                    if mutation_sent:
+                        raise StudioError(_UNKNOWN_OUTCOME)
+                    raise StudioError(f"Studio returned an invalid response (HTTP {response.status}).")
                 if response.status != 200:
-                    raise StudioError(result.get("error") or f"Studio returned HTTP {response.status}.")
+                    if mutation_sent and not 400 <= response.status < 500:
+                        raise StudioError(_UNKNOWN_OUTCOME)
+                    error = result.get("error")
+                    raise StudioError(error if isinstance(error, str) and error else f"Studio returned HTTP {response.status}.")
                 return result
         except (OSError, HTTPException):
-            if sending_request:
-                raise StudioError(
-                    "Studio did not confirm the request. Check the operation or workspace state before retrying."
-                ) from None
+            if mutation_sent:
+                raise StudioError(_UNKNOWN_OUTCOME) from None
             raise StudioError(
                 f"Could not reach BAR AI Studio at http://{host}/. Start it with python -m app --port {self.port}."
             ) from None
@@ -100,19 +125,18 @@ class StudioClient:
             connection.close()
 
     def installation(self) -> dict:
-        settings = self.request("/api/state").get("settings")
+        settings = self.request("/api/settings").get("settings")
         if settings is None:
             raise StudioError("Choose and save a BAR installation in Studio before using this tool.")
         return {"bar_root": settings["bar_root"], "engine": settings["engine"]}
-
-    def profile_files(self, project: str, profile: str) -> list[dict]:
-        return self.request("/api/profile", project=project, profile=profile)["files"]
 
 
 def create_server(studio: StudioClient):
     from mcp.server.fastmcp import FastMCP
     from mcp.types import ToolAnnotations
-    from pydantic import BaseModel, ConfigDict
+    from pydantic import BaseModel, ConfigDict, Field
+
+    FixedFaction = Literal["Armada", "Cortex", "Legion"]
 
     class Player(BaseModel):
         model_config = ConfigDict(extra="forbid", strict=True)
@@ -122,6 +146,17 @@ def create_server(studio: StudioClient):
         profile: str = ""
         faction: Literal["Armada", "Cortex", "Legion", "Rotate", "Random"]
         ally: Literal[0, 1]
+
+    class MatchPlayer(Player):
+        faction: FixedFaction
+
+    class BenchmarkSeries(BaseModel):
+        model_config = ConfigDict(extra="forbid", strict=True)
+
+        games: int = Field(default=1, ge=1, le=100)
+        maps: list[str] | None = Field(default=None, min_length=1)
+        swap_sides: bool = False
+        faction_pairs: list[Annotated[list[FixedFaction], Field(min_length=2, max_length=2)]] | None = None
 
     class Sweep(BaseModel):
         model_config = ConfigDict(extra="forbid", strict=True)
@@ -133,6 +168,14 @@ def create_server(studio: StudioClient):
         column: int
         values: list[int | float]
         sha256: str | None = None
+
+    class StartOptions(BaseModel):
+        model_config = ConfigDict(extra="forbid", strict=True)
+
+        starting_metal: int = Field(ge=0, le=10_000)
+        starting_energy: int = Field(ge=0, le=10_000)
+        starter_base: bool
+        build_turret: bool
 
     mcp = FastMCP(
         "BAR AI Studio",
@@ -148,55 +191,97 @@ def create_server(studio: StudioClient):
     starts_work = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
     changes_state = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 
-    @mcp.tool(annotations=read_only)
+    def register_tool(*, annotations: ToolAnnotations):
+        def decorate(function):
+            @wraps(function)
+            async def run(**arguments):
+                return await asyncio.to_thread(function, **arguments)
+
+            return mcp.tool(annotations=annotations)(run)
+
+        return decorate
+
+    @register_tool(annotations=read_only)
     def list_projects() -> dict[str, Any]:
         """List Studio projects, profile keys and names, and workspace issues."""
-        state = studio.request("/api/state")
-        return {key: state[key] for key in ("projects", "project_issues")}
+        return studio.request("/api/projects")
 
-    @mcp.tool(annotations=read_only)
-    def list_profile_files(project: str, profile: str) -> dict[str, Any]:
-        """List the editable file paths and revision hashes in a workspace profile."""
-        files = studio.profile_files(project, profile)
-        return {"files": [{"path": file["path"], "sha256": file["sha256"]} for file in files]}
+    @register_tool(annotations=read_only)
+    def list_profile_files(project: str, profile: str, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        """Page through editable file paths and revision hashes in a workspace profile."""
+        if offset < 0 or not 1 <= limit <= 200:
+            raise StudioError("Use a nonnegative offset and a limit from 1 to 200.")
+        files = studio.request("/api/profile", project=project, profile=profile, metadata=1)["files"]
+        end = offset + limit
+        return {"files": files[offset:end], "total_files": len(files), "next_offset": end if end < len(files) else None}
 
-    @mcp.tool(annotations=read_only)
+    @register_tool(annotations=read_only)
     def read_profile_file(project: str, profile: str, path: str,
-                          start_line: int = 1, line_count: int = 100) -> dict[str, Any]:
-        """Read a profile file by path, with one-based line paging and its full-file revision hash."""
-        if start_line < 1 or not 1 <= line_count <= 500:
-            raise StudioError("Use a positive start_line and a line_count from 1 to 500.")
-        file = next((file for file in studio.profile_files(project, profile) if file["path"] == path), None)
-        if file is None:
-            raise StudioError("The path is not an editable file in the selected project profile.")
+                          start_line: int = 1, line_count: int = 100,
+                          max_chars: int = 12000, start_column: int = 1) -> dict[str, Any]:
+        """Read bounded text with a full-file revision hash. Continue at one-based next_line and next_column."""
+        if start_line < 1 or start_column < 1 or not 1 <= line_count <= 500 or not 1 <= max_chars <= 32000:
+            raise StudioError("Use positive line and column numbers, 1 to 500 lines, and 1 to 32000 characters.")
+        file = studio.request("/api/profile", project=project, profile=profile, path=path)["files"][0]
         lines = re.findall(r"[^\r\n]*(?:\r\n?|\n)|[^\r\n]+", file["text"])
-        next_line = start_line + line_count
+        if start_line <= len(lines) and start_column > len(lines[start_line - 1]) + 1:
+            raise StudioError("start_column is beyond the requested line.")
+        parts = []
+        next_index = min(start_line - 1, len(lines))
+        column = start_column - 1
+        end = min(next_index + line_count, len(lines))
+        while next_index < end and max_chars:
+            part = lines[next_index][column:column + max_chars]
+            parts.append(part)
+            max_chars -= len(part)
+            column += len(part)
+            if column == len(lines[next_index]):
+                next_index += 1
+                column = 0
         return {
-            "path": path, "sha256": file["sha256"], "text": "".join(lines[start_line - 1:next_line - 1]),
-            "total_lines": len(lines), "next_line": next_line if next_line <= len(lines) else None,
+            "path": path, "sha256": file["sha256"], "text": "".join(parts), "total_lines": len(lines),
+            "next_line": next_index + 1 if next_index < len(lines) else None,
+            "next_column": column + 1 if next_index < len(lines) else None,
         }
 
-    @mcp.tool(annotations=changes_state)
+    @register_tool(annotations=changes_state)
     def save_profile_file(project: str, profile: str, path: str, sha256: str, text: str) -> dict[str, Any]:
         """Replace an existing workspace profile file with complete text, given its last-read SHA-256 revision."""
         edited = {"path": path, "sha256": sha256, "text": text}
-        result = studio.request("/api/save", {"project": project, "profile": profile, "files": [edited]})
+        result = studio.request("/api/save", {"project": project, "profile": profile, "files": [edited], "changed_only": True})
         file = next(file for file in result["files"] if file["path"] == path)
         return {"path": path, "sha256": file["sha256"]}
 
-    @mcp.tool(annotations=read_only)
+    @register_tool(annotations=read_only)
+    def get_project_install_status(project: str) -> dict[str, Any]:
+        """Check whether a workspace project is installed and up to date for Studio's selected engine."""
+        return studio.request("/api/install-status", project=project)
+
+    @register_tool(annotations=changes_state)
+    def install_project(project: str, confirmations: list[str] | None = None) -> dict[str, Any]:
+        """Install the saved workspace project and all its profiles into Studio's selected engine.
+
+        Start without confirmations. If Studio returns a confirmation prompt, show its exact text to
+        the user. Retry with that text only after the user accepts it. Retain previously accepted
+        prompts for the same installation attempt while handling any further prompts.
+        """
+        return studio.request("/api/install", {
+            **studio.installation(), "project": project, "confirmations": confirmations or [],
+        })
+
+    @register_tool(annotations=read_only)
     def get_installed_content() -> dict[str, Any]:
         """Get games, maps, and installed AI variants from Studio's saved scan for the current engine."""
         installation = studio.installation()
         result = studio.request("/api/match/cache", installation)
         return {"engine": installation["engine"], "scan_required": result["content"] is None, **result}
 
-    @mcp.tool(annotations=starts_work)
+    @register_tool(annotations=starts_work)
     def scan_installed_content() -> dict[str, Any]:
         """Start a BAR content scan using Studio's saved installation. Poll get_run_status for completion."""
         return _status(studio.request("/api/match/scan", studio.installation()))
 
-    @mcp.tool(annotations=read_only)
+    @register_tool(annotations=read_only)
     def find_units(query: str, limit: int = 20) -> dict[str, Any]:
         """Search unit IDs and names in Studio's most recently built unit catalog."""
         if not 1 <= limit <= 100:
@@ -214,67 +299,160 @@ def create_server(studio: StudioClient):
             "total_matches": len(matches), "catalog_available": True,
         }
 
-    @mcp.tool(annotations=starts_work)
+    @register_tool(annotations=starts_work)
     def build_unit_catalog(game: str) -> dict[str, Any]:
         """Build Studio's searchable unit catalog for an installed game."""
         return _status(studio.request("/api/catalog/start", {**studio.installation(), "game": game}))
 
-    @mcp.tool(annotations=read_only)
-    def get_run_status() -> dict[str, Any]:
-        """Check current or last Studio operation, including run ID, progress, and errors."""
-        return _status(studio.request("/api/match/status"))
+    @register_tool(annotations=read_only)
+    def get_run_status(run_id: str | None = None) -> dict[str, Any]:
+        """Check the current or most recent Studio operation. Pass its ID to avoid reading a different run."""
+        status = studio.request("/api/match/status")
+        if run_id is not None and status.get("id") != run_id:
+            raise StudioError("That run is no longer the current Studio operation. Check saved match or experiment history.")
+        return _status(status)
 
-    @mcp.tool(annotations=read_only)
-    def list_matches(offset: int = 0, limit: int = 20) -> dict[str, Any]:
-        """List saved test match results and their run directory IDs."""
-        return studio.request("/api/match/history", offset=offset, limit=limit)
+    @register_tool(annotations=read_only)
+    def list_queue_games(run_id: str, offset: int = 0, limit: int = 20) -> dict[str, Any]:
+        """List games in the current or most recent test queue by its exact operation ID.
 
-    @mcp.tool(annotations=read_only)
+        Use the one-based game_index to cancel a game. For logs, pass the game's logs.run_id or
+        logs.smoke_run_id to read_match_log. Follow next_offset for additional games.
+        """
+        if not 0 <= offset <= 2**31 - 1 or not 1 <= limit <= 100:
+            raise StudioError("Use a nonnegative offset up to 2147483647 and a limit from 1 to 100.")
+        snapshot = studio.request("/api/match/status")
+        if snapshot.get("operation") != "match" or snapshot.get("id") != run_id:
+            raise StudioError("The requested queue is no longer current. Use list_matches for saved results.")
+        games = snapshot["games"]
+        end = offset + limit
+        fields = (
+            "game_index", "batch_id", "batch_game", "batch_size", "game", "map", "players",
+            "state", "elapsed_seconds", "winner_side", "summary", "logs",
+        )
+        return {
+            "id": run_id,
+            "games": [{key: game[key] for key in fields if key in game} for game in games[offset:end]],
+            "total_games": len(games),
+            "next_offset": end if end < len(games) else None,
+        }
+
+    @register_tool(annotations=read_only)
+    def read_match_log(
+        run_id: str, file: Literal["infolog.txt", "stdout.txt", "result.json"], offset: int = 0,
+    ) -> dict[str, Any]:
+        """Read a bounded page of a match artifact by its run directory ID and byte offset.
+
+        Use a run directory ID from a game or saved result. Follow next_offset for additional lines.
+        """
+        return studio.request("/api/match/logs", run_id=run_id, file=file, offset=offset)
+
+    @register_tool(annotations=read_only)
+    def list_matches(
+        offset: int = 0, limit: int = 20, project: str | None = None,
+        profile: str | None = None, map_name: str | None = None, checkpoint: str | None = None,
+    ) -> dict[str, Any]:
+        """List saved matches and their run directory IDs, optionally filtered by workspace or map."""
+        filters = {"project": project, "profile": profile, "map": map_name, "checkpoint": checkpoint}
+        return studio.request(
+            "/api/match/history", offset=offset, limit=limit,
+            **{key: value for key, value in filters.items() if value is not None},
+        )
+
+    @register_tool(annotations=read_only)
     def list_experiments(offset: int = 0, limit: int = 20) -> dict[str, Any]:
         """List saved tournament and parameter sweep summaries, most recent first."""
         return studio.request("/api/experiment/history", offset=offset, limit=limit)
 
-    @mcp.tool(annotations=read_only)
-    def get_experiment(experiment_id: str) -> dict[str, Any]:
-        """Read the standings, per-game results, and provenance for a saved experiment ID."""
-        return studio.request("/api/experiment/history", id=experiment_id)
+    @register_tool(annotations=read_only)
+    def get_experiment(experiment_id: str, game_offset: int = 0, game_limit: int = 20) -> dict[str, Any]:
+        """Read standings, provenance, and a page of an experiment's schedule and game results."""
+        if game_offset < 0 or not 1 <= game_limit <= 100:
+            raise StudioError("Use a nonnegative game offset and a game limit from 1 to 100.")
+        saved = studio.request("/api/experiment/history", id=experiment_id)["experiment"]
+        experiment = dict(saved)
+        end = game_offset + game_limit
+        total = 0
+        for field in ("games", "schedule"):
+            if isinstance(rows := saved.get(field), list):
+                total = max(total, len(rows))
+                experiment[field] = rows[game_offset:end]
+        return {"experiment": experiment, "total_games": total, "next_game_offset": end if end < total else None}
 
-    @mcp.tool(annotations=starts_work)
-    def start_test_match(game: str, map_name: str, players: list[Player], game_minutes: int,
-                         record_demo: bool = False) -> dict[str, Any]:
-        """Start a headless test match with installed players. Each player needs short_name, version, profile,
-        faction (Armada, Cortex, or Legion), and ally (0 or 1). game_minutes is simulated game time."""
+    @register_tool(annotations=read_only)
+    def preview_sweep_literal(
+        project: str, profile: str, path: str, line: int, column: int, sha256: str,
+    ) -> dict[str, Any]:
+        """Validate a numeric sweep selection against a file revision and return the literal's column and length.
+
+        Pass the SHA-256 from read_profile_file and a one-based line and Unicode column.
+        """
+        return studio.request("/api/experiment/literal", {
+            "project": project, "profile": profile, "path": path, "line": line, "column": column, "sha256": sha256,
+        })
+
+    @register_tool(annotations=starts_work)
+    def promote_sweep_candidate(experiment_id: str, candidate_id: str, name: str) -> dict[str, Any]:
+        """Create a new workspace profile from an eligible candidate in a completed sweep."""
+        return studio.request("/api/experiment/promote", {"id": experiment_id, "candidate_id": candidate_id, "name": name})
+
+    @register_tool(annotations=starts_work)
+    def start_test_match(game: str, map_name: str, players: list[MatchPlayer], game_minutes: int,
+                         record_demo: bool = False, parallel_games: int | None = None,
+                         start_options: StartOptions | None = None,
+                         series: BenchmarkSeries | None = None) -> dict[str, Any]:
+        """Queue a headless test match with installed players. Each player needs short_name, version, profile,
+        faction (Armada, Cortex, or Legion), and ally (0 or 1). game_minutes is simulated game time.
+        Supply series for repeated benchmark games, optional map and faction rotations, and swapped sides.
+        If supplied, parallel_games changes the shared limit for concurrent games."""
         return _status(studio.request("/api/match/start", {
             **studio.installation(), "game": game, "map_name": map_name,
             "players": [player.model_dump() for player in players],
             "minutes": game_minutes, "skip_smoke": False, "record_demo": record_demo,
+            "parallel_games": parallel_games, "start_options": start_options.model_dump() if start_options else None,
+            "series": series.model_dump(exclude_none=True) if series else None,
         }))
 
-    @mcp.tool(annotations=starts_work)
+    @register_tool(annotations=starts_work)
     def start_experiment(
         game: str, maps: list[str], players: list[Player], game_minutes: int,
         game_limit: int, real_time_seconds: int, mode: Literal["tournament", "sweep"],
         sweep: Sweep | None = None, seed: int | None = None,
+        parallel_games: int | None = None, start_options: StartOptions | None = None,
     ) -> dict[str, Any]:
         """Start a round-robin tournament or numeric parameter sweep. Players use short_name, version, profile,
         faction, and ally (0 or 1). Tournaments also support Rotate and Random factions. A sweep uses a first
         player, an installed opponent, and a sweep object with workspace project, profile, path, one-based
         line and column, and numeric values. Supply the last-read file sha256 to guard the literal
         selection against concurrent edits. game_minutes is simulated per game, real_time_seconds is a budget
-        for the whole run. Poll get_run_status for preparation errors, progress, and the experiment ID."""
+        for the whole run. If supplied, parallel_games changes the shared limit for concurrent games.
+        Poll get_run_status for preparation errors, progress, and the experiment ID."""
         return _status(studio.request("/api/experiment/start", {
             **studio.installation(), "game": game, "maps": maps,
             "players": [player.model_dump() for player in players],
             "minutes": game_minutes, "game_limit": game_limit, "seconds_limit": real_time_seconds,
             "mode": mode, "sweep": sweep.model_dump(exclude_none=True) if sweep else None, "seed": seed,
+            "parallel_games": parallel_games, "start_options": start_options.model_dump() if start_options else None,
         }))
 
-    @mcp.tool(annotations=changes_state)
+    @register_tool(annotations=changes_state)
     def cancel_run(run_id: str) -> dict[str, Any]:
-        """Ask Studio to cancel the active operation with this exact run ID."""
+        """Cancel the operation with this exact ID. A test queue ID cancels the entire shared queue."""
         return _status(studio.request("/api/match/cancel", {"id": run_id}))
 
-    @mcp.tool(annotations=changes_state)
+    @register_tool(annotations=changes_state)
+    def cancel_match_game(run_id: str, game_index: int) -> dict[str, Any]:
+        """Cancel one pending or running game by queue operation ID and one-based game_index."""
+        return _status(studio.request("/api/match/cancel-game", {"id": run_id, "game_index": game_index}))
+
+    @register_tool(annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+    ))
+    def set_parallel_games(parallel_games: int) -> dict[str, Any]:
+        """Set Studio's shared concurrent game limit. Zero pauses new games without stopping in-flight games."""
+        return _status(studio.request("/api/match/parallel", {"parallel_games": parallel_games}))
+
+    @register_tool(annotations=changes_state)
     def set_experiment_paused(experiment_id: str, paused: bool) -> dict[str, Any]:
         """Request that the specified active experiment pause after in-flight games or resume."""
         return _status(studio.request("/api/experiment/pause", {"id": experiment_id, "paused": paused}))
@@ -286,11 +464,20 @@ def _status(state: dict) -> dict:
     """Keep status focused on progress. Saved detail is available separately."""
     fields = (
         "id", "operation", "state", "phase", "message", "scan_progress", "active_games",
-        "active_matchups", "elapsed_seconds", "error",
+        "parallel_games", "elapsed_seconds", "error", "submission",
     )
     result = {field: state[field] for field in fields if field in state}
+    if state.get("operation") == "match":
+        result["game_counts"] = dict(Counter(row["state"] for row in state.get("games", [])))
+    for field in ("progress", "history_errors", "active_matchups"):
+        if state.get(field):
+            result[field] = state[field][-10:]
+    if (completed := state.get("result")) and completed.get("summary"):
+        result["summary"] = completed["summary"]
     if experiment := state.get("experiment"):
-        result["experiment"] = {key: value for key, value in experiment.items() if key not in ("games", "projects", "provenance")}
+        fields = ("id", "mode", "state", "game", "maps", "scheduled_games", "completed_games",
+                  "stop_reason", "paused", "pause_requested", "elapsed_seconds", "coverage", "best_candidate_id")
+        result["experiment"] = {field: experiment[field] for field in fields if field in experiment}
     return result
 
 
