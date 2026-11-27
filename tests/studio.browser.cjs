@@ -67,7 +67,24 @@ async function workshop(t, options = {}) {
             fixture.preferences = {...fixture.preferences, ...data};
             return json({ok: true});
         }
-        if (pathname === "/api/profile") return json({files: fixture.files});
+        if (pathname === "/api/profile") {
+            const profile = new URL(req.url, "http://localhost").searchParams.get("profile");
+            await fixture.profileLoadGate;
+            if (fixture.unavailableProfile === profile) return json({error: "Fixture profile could not be loaded."}, 404);
+            return json({files: fixture.files});
+        }
+        if (pathname === "/api/project/manage") {
+            const project = fixture.project.find(item => item.key === data.project);
+            if (data.action === "rename_project") {
+                project.name = data.name.trim();
+                return json({project: project.key});
+            }
+            const profile = project.profiles.find(item => item.key === data.profile);
+            if (data.action === "rename_profile") profile.name = data.name.trim();
+            if (data.action === "set_default") project.default_profile = profile.key;
+            if (data.action === "delete_profile") project.profiles = project.profiles.filter(item => item !== profile);
+            return json({project: project.key, profile: data.action === "delete_profile" ? "" : profile.key});
+        }
         if (pathname === "/api/match/cache") return json({content: options.content ?? content});
         if (pathname === "/api/match/status") return json(fixture.snapshot);
         if (pathname === "/api/match/history") return json({history: records});
@@ -127,7 +144,7 @@ async function workshop(t, options = {}) {
             return json(fixture.snapshot);
         }
         if (pathname.startsWith("/api/")) return json({});
-        if (pathname === "/data/units.json") return json({units: {names: {}}});
+        if (pathname === "/data/units.json") return json({units: {names: options.unitNames ?? {}}});
         if (pathname === "/session.js") {
             res.writeHead(200, {"Content-Type": "text/javascript"});
             return res.end('window.WORKSHOP_TOKEN = "fixture";');
@@ -158,14 +175,122 @@ async function workshop(t, options = {}) {
 const isFocused = locator => locator.evaluate(node => node === document.activeElement);
 const nav = (page, name) => page.getByRole("navigation").getByRole("button", {name});
 
-test("production explains the income score beside the tier cutoffs", async t => {
+test("profile manager targets another profile and preserves unsaved editor work", async t => {
+    const {fixture, page, requests} = await workshop(t, {profiles: [
+        {key: "hard", name: "Hard"}, {key: "easy", name: "Easy"}, {key: "test", name: "Test"}
+    ]});
+    await nav(page, "All files").click();
+    const editor = page.locator("#content textarea");
+    const draft = commander + "\n// unsaved change";
+    await editor.fill(draft);
+    await page.getByRole("button", {name: "Manage projects & profiles"}).click();
+    const manager = page.getByRole("dialog");
+    await manager.getByRole("button", {name: /^Easy/}).click();
+    await manager.getByRole("textbox", {name: "Profile display name"}).fill("Experiment");
+    await manager.getByRole("button", {name: "Rename profile", exact: true}).click();
+    await manager.getByRole("status").filter({hasText: "Profile renamed."}).waitFor();
+    await manager.getByRole("button", {name: "Make default", exact: true}).click();
+    await manager.getByRole("status").filter({hasText: "Default profile updated."}).waitFor();
+    assert.equal(await manager.getByRole("button", {name: "Delete profile", exact: true}).isDisabled(), true);
+
+    await page.setViewportSize({width: 375, height: 440});
+    assert.equal(await manager.locator(".dialog-inner").evaluate(node => node.scrollWidth <= node.clientWidth), true);
+    await manager.getByRole("button", {name: /^Test/}).click();
+    page.once("dialog", dialog => dialog.accept());
+    await manager.getByRole("button", {name: "Delete profile", exact: true}).click();
+    await manager.getByRole("status").filter({hasText: "Profile deleted."}).waitFor();
+    assert.equal(await manager.getByRole("button", {name: /^Test/}).count(), 0);
+    await manager.getByText("Project settings", {exact: true}).click();
+    await manager.getByRole("textbox", {name: "Project display name"}).fill("Renamed Project");
+    await manager.getByRole("button", {name: "Rename project", exact: true}).click();
+    await manager.getByRole("heading", {name: "Renamed Project", exact: true}).waitFor();
+    await manager.getByRole("button", {name: "Close", exact: true}).click();
+    assert.equal(await page.locator("#profile").inputValue(), "hard");
+    assert.equal(await editor.inputValue(), draft);
+    assert.deepEqual(requests.filter(item => item.pathname === "/api/project/manage").map(({data}) =>
+        [data.action, data.profile]), [
+        ["rename_profile", "easy"], ["set_default", "easy"], ["delete_profile", "test"], ["rename_project", undefined]
+    ]);
+
+    await page.getByRole("button", {name: "Manage projects & profiles"}).click();
+    await manager.getByRole("button", {name: /^Experiment/}).click();
+    page.once("dialog", dialog => dialog.dismiss());
+    await manager.getByRole("button", {name: "Open in editor", exact: true}).click();
+    assert.equal(await manager.isVisible(), true);
+
+    fixture.unavailableProfile = "easy";
+    page.once("dialog", dialog => dialog.accept());
+    await manager.getByRole("button", {name: "Open in editor", exact: true}).click();
+    await manager.getByRole("status").filter({hasText: "Fixture profile could not be loaded."}).waitFor();
+    assert.equal(await page.locator("#profile").inputValue(), "hard");
+    assert.equal(await editor.inputValue(), draft);
+
+    fixture.unavailableProfile = null;
+    let enableProfileLoad;
+    fixture.profileLoadGate = new Promise(resolve => { enableProfileLoad = resolve; });
+    page.once("dialog", dialog => dialog.accept());
+    try {
+        await manager.getByRole("button", {name: "Open in editor", exact: true}).click();
+        assert.equal(await manager.getByRole("button", {name: "Close", exact: true}).isDisabled(), true);
+        await page.keyboard.press("Escape");
+        assert.equal(await manager.isVisible(), true);
+    } finally {
+        enableProfileLoad();
+    }
+    await manager.waitFor({state: "hidden"});
+    assert.equal(await page.locator("#profile").inputValue(), "easy");
+    assert.equal(await editor.inputValue(), commander);
+
+    await page.getByRole("button", {name: "Manage projects & profiles"}).click();
+    await manager.getByRole("button", {name: /^Hard/}).click();
+    await manager.getByRole("button", {name: "Make default", exact: true}).click();
+    await manager.getByRole("status").filter({hasText: "Default profile updated."}).waitFor();
+    await manager.getByRole("button", {name: /^Experiment/}).click();
+    page.once("dialog", dialog => dialog.accept());
+    await manager.getByRole("button", {name: "Delete profile", exact: true}).click();
+    await manager.waitFor({state: "hidden"});
+    assert.equal(await page.locator("#profile").inputValue(), "hard");
+});
+
+async function dragBelow(page, grip, row) {
+    await row.scrollIntoViewIfNeeded();
+    await grip.hover();
+    const target = await row.boundingBox();
+    const x = target.x + 20, y = target.y + target.height * 0.8;
+    await page.mouse.down();
+    await page.mouse.move(x, y, {steps: 12});
+    await page.mouse.move(x + 1, y);
+    await page.mouse.up();
+}
+
+test("production explains the income score and aligns each cutoff with its tier", async t => {
     const files = [{path: "config/factory.json", text: JSON.stringify({factory: {armlab: {
-        income_tier: [10], unit: ["armflea"], land: {tier0: [1], tier1: [2]}
+        income_tier: [10, 20, 30, 40, 50, 60], unit: ["armflea"],
+        land: {tier0: [1], tier1: [2], tier3: [3], tier4: [4], tier5: [5], tier6: [6]}
     }}}), sha256: "fixture-factory"}];
     const {page} = await workshop(t, {files});
     await nav(page, "Production").click();
     await page.getByText("Income score = min(average metal income, average energy income) × economy factor", {exact: true}).waitFor();
-    await page.getByText("Minimum score for Tier 1", {exact: true}).waitFor();
+    const table = page.getByRole("table").filter({has: page.getByRole("columnheader", {name: "Tier 3", exact: true})});
+    const row = table.getByRole("row").filter({has: page.getByRole("rowheader", {name: "Minimum score", exact: true})});
+    async function checkAlignment() {
+        for (const [tier, score] of [[1, "10"], [3, "30"]]) {
+            const cutoff = row.getByRole("spinbutton", {name: `Minimum score for Tier ${tier}`, exact: true});
+            const weight = table.getByRole("spinbutton", {name: `armflea tier${tier} weight`, exact: true});
+            assert.equal(await cutoff.inputValue(), score);
+            assert.equal((await cutoff.boundingBox()).x, (await weight.boundingBox()).x);
+        }
+    }
+    await checkAlignment();
+    await page.setViewportSize({width: 390, height: 900});
+    const scroll = await table.evaluate(node => {
+        const wrap = node.parentElement;
+        wrap.scrollLeft = wrap.scrollWidth;
+        return {left: wrap.scrollLeft, available: wrap.clientWidth, content: wrap.scrollWidth};
+    });
+    assert.ok(scroll.left > 0, JSON.stringify(scroll));
+    await checkAlignment();
+    assert.equal(await page.getByRole("spinbutton", {name: "Minimum score for Tier 2", exact: true}).inputValue(), "20");
 });
 
 test("placement redraws the building area, clearance and offset and preserves a custom shape", async t => {
@@ -205,9 +330,9 @@ test("placement redraws the building area, clearance and offset and preserves a 
     assert.deepEqual(rule, {type: ["custom", "factory"], size: [10, 8], yard: [12, 10], offset: [3, 0], radius: 6});
 });
 
-test("distance tooltips follow live edits and compare converted distances using friendly names", async t => {
+test("distance inputs show live comparisons and displayed distances retain tooltips", async t => {
     const files = [
-        {path: "config/economy.json", text: '{"economy":{"cluster_range":20}}', sha256: "fixture-economy"},
+        {path: "config/economy.json", text: '{"economy":{"cluster_range":20,"goal_exec":30}}', sha256: "fixture-economy"},
         {path: "config/block_map.json", text: JSON.stringify({building: {class_land: {
             fac_land_t1: {type: ["rectangle", "factory"], size: [6, 8], yard: [2, 2], offset: [0, 0]}
         }}}), sha256: "fixture-placement"},
@@ -218,12 +343,16 @@ test("distance tooltips follow live edits and compare converted distances using 
     const tip = page.locator(".control-tooltip:visible");
     await nav(page, "Economy").click();
     const range = page.getByRole("spinbutton", {name: "Metal cluster range", exact: true});
-    await range.hover();
-    await tip.filter({hasText: /About the width of a Grunt .*20 elmos/}).waitFor();
+    const readout = range.locator("xpath=following-sibling::*[1]").filter({hasText: /width of a Grunt .*20 elmos/});
+    await readout.waitFor();
+    assert.ok((await readout.boundingBox()).y >= (await range.boundingBox()).y + (await range.boundingBox()).height);
+    await range.fill("");
+    await range.locator("xpath=following-sibling::*[1]").waitFor({state: "hidden"});
     await range.fill("4650");
-    await tip.filter({hasText: /Basilica long-range plasma cannon .*4,650 elmos/}).waitFor();
-    await range.press("Escape");
-    await tip.waitFor({state: "hidden"});
+    await range.locator("xpath=following-sibling::*[1]").filter({hasText: /Basilica long-range plasma cannon .*4,650 elmos/}).waitFor();
+    assert.match(await range.getAttribute("aria-description"), /Basilica/);
+    const time = page.getByRole("spinbutton", {name: "Target construction time", exact: true});
+    assert.equal(await time.locator("xpath=following-sibling::*[1]").count(), 0);
     await nav(page, "Building placement").click();
     const width = page.locator(".placement-footprint-label .distance-value").first();
     await width.focus();
@@ -249,6 +378,46 @@ test("distance tooltips follow live edits and compare converted distances using 
     await literal.scrollIntoViewIfNeeded();
     await literal.hover();
     await tip.filter({hasText: /About the width of a Grunt .*20 elmos/}).waitFor();
+    await page.setViewportSize({width: 390, height: 900});
+    await nav(page, "Building placement").click();
+    await page.locator("summary").filter({hasText: /^Position adjustment\s+·/}).click();
+    const shift = page.getByRole("spinbutton", {name: "Front/back shift", exact: true});
+    const shiftReadout = shift.locator("xpath=following-sibling::*[1]");
+    await shiftReadout.filter({hasText: "No distance (0 elmos)."}).waitFor();
+    await shift.fill("-5.5");
+    const converted = shiftReadout.filter({hasText: /Juggernaut .*−80 elmos/});
+    await converted.waitFor();
+    const mobileReadout = await converted.boundingBox();
+    assert.ok(mobileReadout.x >= 0 && mobileReadout.x + mobileReadout.width <= 390);
+});
+
+test("defense and script distance fields use the same inline readout", async t => {
+    const files = [
+        {path: "config/build_chain.json", text: "{}", sha256: "fixture-defense"},
+        {path: "script/main.as", text: [
+            '// @studio label="Guard radius" unit=elmos',
+            "const float guardRadius = 145.0f;",
+            "const uint waitSeconds = 60;",
+        ].join("\n"), sha256: "fixture-script"},
+    ];
+    const {page} = await workshop(t, {files, unitNames: {armllt: "Sentry", armrad: "Radar Tower"}});
+    const comparison = input => input.locator("xpath=following-sibling::*[1]");
+    await nav(page, "Defense").click();
+    const radius = page.getByRole("spinbutton", {name: "Nearby search radius (elmos)", exact: true});
+    assert.equal(await radius.count(), 0);
+    await page.getByRole("combobox", {name: "Count completions"}).selectOption("nearby");
+    await radius.fill("1040");
+    await comparison(radius).filter({hasText: /Smaller than the diameter of an Armada nuke blast/}).waitFor();
+    await page.getByText("Add completed building", {exact: true}).click();
+    const offset = page.getByRole("spinbutton", {name: "Offset distance (elmos)", exact: true});
+    await comparison(offset).filter({hasText: /Juggernaut .*80 elmos/}).waitFor();
+    await nav(page, "All files").click();
+    await page.getByRole("combobox", {name: "Profile file"}).selectOption("script/main.as");
+    const guard = page.getByRole("spinbutton", {name: "Guard radius", exact: true});
+    await comparison(guard).filter({hasText: /Armada Commander's build range .*145 elmos/}).waitFor();
+    await guard.fill("615");
+    await comparison(guard).filter({hasText: /Overwatch's weapon range .*615 elmos/}).waitFor();
+    assert.equal(await comparison(page.getByRole("spinbutton", {name: "waitSeconds", exact: true})).count(), 0);
 });
 
 test("first-run lookup error is announced inside its dialog", async t => {
@@ -276,6 +445,73 @@ test("keyboard opening edits preserve focus and save to the fixture profile", as
     assert.equal(saved?.profile, "hard");
     assert.equal(saved.files[0].sha256, "fixture-original");
     assert.match(saved.files[0].text, /RT::SCOUT, 2\), SO\(RT::BUILDER\)/);
+});
+
+test("opening rows reorder by grip or keyboard and save the resulting sequence", async t => {
+    const source = commander.replace("SQueue(1.0f, {SO(RT::BUILDER, 1)})",
+        "SQueue(1.0f, {SO(RT::BUILDER, 1), SO(RT::SCOUT, 2), SO(RT::RAIDER, 3)}), SQueue(2.0f, {SO(RT::BUILDER)})")
+        .replace("SO(RT::SCOUT, 2)})", "SO(RT::SCOUT, 2), /* Keep with this step */ SO(RT::RAIDER), SO(RT::BUILDER)})");
+    const {page, requests} = await workshop(t, {files: [{path: openingPath, text: source, sha256: "original"}]});
+    await page.setViewportSize({width: 1280, height: 1100});
+    await nav(page, "Opening").press("Enter");
+    const queues = page.locator(".opening-queue");
+    const steps = queues.first().locator(".opening-step");
+    const roles = steps.locator("select");
+    const values = () => roles.evaluateAll(nodes => nodes.map(node => node.value));
+    await dragBelow(page, steps.first().locator("[draggable=true]"), steps.last());
+    assert.deepEqual(await values(), ["SCOUT", "RAIDER", "BUILDER"]);
+    await steps.last().getByRole("button", {name: "Move step at position 3 up", exact: true}).press("Enter");
+    assert.deepEqual(await values(), ["SCOUT", "BUILDER", "RAIDER"]);
+    await dragBelow(page, queues.first().locator(".opening-queue-header [draggable=true]"), queues.last());
+    assert.equal(await queues.last().getByRole("spinbutton", {name: "Relative weight"}).inputValue(), "1.0");
+    await page.getByRole("combobox", {name: "Factory", exact: true}).selectOption("corlab");
+    assert.equal(await queues.first().getByRole("button", {name: "Remove queue at position 1"}).isDisabled(), true);
+    await dragBelow(page, steps.first().locator("[draggable=true]"), steps.last());
+    await page.getByText("Cannot reorder entries with adjacent comments safely", {exact: false}).waitFor();
+    assert.deepEqual(await values(), ["SCOUT", "RAIDER", "BUILDER"]);
+    await steps.last().getByRole("button", {name: "Remove step at position 3"}).press("Enter");
+    assert.deepEqual(await values(), ["SCOUT", "RAIDER"]);
+    await page.getByRole("button", {name: "Save changes", exact: true}).press("Enter");
+    await page.getByText("Profile changes saved.", {exact: false}).waitFor();
+    const saved = requests.find(request => request.pathname === "/api/save").data.files[0].text;
+    assert.match(saved, /SQueue\(2\.0f, \{SO\(RT::BUILDER\)\}\), SQueue\(1\.0f, \{SO\(RT::SCOUT, 2\), SO\(RT::BUILDER, 1\), SO\(RT::RAIDER, 3\)\}\)/);
+    assert.match(saved, /SO\(RT::SCOUT, 2\), \/\* Keep with this step \*\/ SO\(RT::RAIDER\)\s*\}/);
+});
+
+test("startup and preview layer orders use the shared row controls", async t => {
+    const files = [
+        {path: "script/init.as", text: 'namespace Init { SInitInfo AiInit() { SInitInfo data; @data.profile = @(array<string> = {"build_chain", "build_chain_leg", "economy"}); return data; }}', sha256: "init"},
+        {path: "config/build_chain.json", text: '{"porcupine":{"land":[0,1,2],"unit":{"armada":["armllt","armhlt","armguard"]}}}', sha256: "base"},
+        {path: "config/build_chain_leg.json", text: "{}", sha256: "leg"},
+        {path: "config/economy.json", text: "{}", sha256: "economy"}
+    ];
+    const {page, requests} = await workshop(t, {files});
+    await page.setViewportSize({width: 1280, height: 1100});
+    await page.getByText("Startup configuration layers (script/init.as)", {exact: true}).click();
+    const startup = page.locator("#startup-layers-base");
+    await dragBelow(page, startup.locator("[draggable=true]").first(), startup.locator("li").last());
+    const layers = startup.locator(".grow");
+    assert.deepEqual(await layers.allTextContents(), [
+        "build_chain_leg (config/build_chain_leg.json)", "economy (config/economy.json)", "build_chain (config/build_chain.json)"
+    ]);
+    assert.equal(await isFocused(startup.getByRole("button", {name: "Move build_chain at position 3 up"})), true);
+    await nav(page, "Defense").click();
+    await page.getByRole("button", {name: "Preview combined layers"}).click();
+    const dialog = page.getByRole("dialog");
+    const preview = dialog.locator(".layer-order");
+    await dialog.getByRole("combobox", {name: "Configuration file to add"}).selectOption("config/build_chain_leg.json");
+    await dialog.getByRole("button", {name: "Add file", exact: true}).click();
+    const original = await preview.locator(".grow").allTextContents();
+    const up = preview.getByRole("button", {name: `Move ${original[1]} at position 2 up`, exact: true});
+    await up.press("Enter");
+    assert.deepEqual(await preview.locator(".grow").allTextContents(), [original[1], original[0], ...original.slice(2)]);
+    await page.keyboard.press("Escape");
+    await page.getByRole("button", {name: "Move defense at position 3 up", exact: true}).press("Enter");
+    await page.getByRole("button", {name: "Save changes", exact: true}).press("Enter");
+    await page.getByText("Profile changes saved.", {exact: false}).waitFor();
+    const saved = requests.find(request => request.pathname === "/api/save").data.files;
+    assert.match(saved.find(file => file.path === "script/init.as").text, /"build_chain_leg",\s*"economy",\s*"build_chain"/);
+    assert.deepEqual(JSON.parse(saved.find(file => file.path === "config/build_chain.json").text).porcupine.land, [0, 2, 1]);
 });
 
 test("adding and removing a roster slot leaves focus with the team", async t => {

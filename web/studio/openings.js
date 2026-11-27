@@ -305,32 +305,32 @@
       parent.appendChild(wrap);
     }
 
-    function remove(t, items, index) {
+    function remove(t, items, index, focusSelector) {
       const item = items[index];
       const changes = [{ start: t[item.first].start, end: t[item.last].end, text: "" }];
       const comma = item.after !== null ? item.after : item.before;
       if (comma !== null) changes.push({ start: t[comma].start, end: t[comma].end, text: "" });
-      patch(changes);
+      patch(changes, focusSelector);
     }
 
     function hasComments(start, end) {
       return /\/\/|\/\*/.test(text.slice(start, end));
     }
 
-    function move(t, items, index, direction) {
-      const a = items[index];
-      const b = items[index + direction];
-      if (!b) return;
-      const first = direction > 0 ? a : b;
-      const last = direction > 0 ? b : a;
-      if (hasComments(t[first.last].end, t[last.first].start)) {
-        notice("Cannot reorder across comments safely; use the source view.");
+    function move(t, open, items, source, destination, focusSelector) {
+      const first = Math.min(source, destination);
+      const last = Math.max(source, destination);
+      const range = items.slice(first, last + 1);
+      if (range.some((_, offset) => hasLeadingComment(t, open, items, first + offset))) {
+        notice("Cannot reorder entries with adjacent comments safely; use the source view.");
         return;
       }
-      patch([
-        { start: t[a.first].start, end: t[a.last].end, text: text.slice(t[b.first].start, t[b.last].end) },
-        { start: t[b.first].start, end: t[b.last].end, text: text.slice(t[a.first].start, t[a.last].end) }
-      ]);
+      const reordered = window.StudioEditors.moveItem(range, source - first, destination - first);
+      patch(range.map((item, index) => ({
+        start: t[item.first].start,
+        end: t[item.last].end,
+        text: text.slice(t[reordered[index].first].start, t[reordered[index].last].end)
+      })), focusSelector);
     }
 
     function hasLeadingComment(t, open, items, index) {
@@ -396,20 +396,41 @@
       if (factory && factory.error) {
         notice("This factory is read-only: " + factory.error + " Its source is preserved; use the source view.");
       } else if (factory) {
+        const helper = window.StudioEditors;
         const weights = [], hints = [];
         function refreshShares() {
-          const helper = window.StudioEditors;
           const shares = helper.weightShares(weights.map(function (input) { return input.valueAsNumber; }));
           hints.forEach(function (hint, index) { hint.textContent = helper.weightPercent(shares[index]); });
         }
+        const queues = element("div", "opening-queues");
+        const queueItems = factory.queues.map(queue => queue.item);
+        const queueSelector = index => `.opening-queues > .opening-queue:nth-child(${index + 1})`;
+        const weightSelector = index => `${queueSelector(index)} .opening-queue-header input`;
+        const queueControls = helper.orderedRowControls(queues, {
+          count: queueItems.length,
+          disabled: !canChange,
+          canRemove: queueItems.length > 1,
+          tips: {up: openingTips["Move queue up"], down: openingTips["Move queue down"], remove: openingTips["Remove queue"]},
+          move: (source, destination) => move(t, factory.open, queueItems, source, destination, weightSelector(destination)),
+          remove: index => {
+            const item = queueItems[index];
+            if (hasLeadingComment(t, factory.open, queueItems, index) ||
+                hasComments(t[item.first].start, t[item.last].end)) {
+              notice("Cannot remove a queue with attached comments; use the source view.");
+              return;
+            }
+            remove(t, queueItems, index, weightSelector(Math.min(index, queueItems.length - 2)));
+          }
+        });
         factory.queues.forEach(function (queue, qi) {
           const panel = element("section", "panel opening-queue");
+          const top = element("div", "row opening-queue-header");
+          top.appendChild(queueControls(panel, qi, "queue at position " + (qi + 1)));
           const heading = element("h3", "", "Queue " + (qi + 1));
           const hint = element("span", "weight-share opening-weight-share");
           hint.id = "opening-share-" + qi;
           heading.appendChild(hint);
-          panel.appendChild(heading);
-          const top = element("div", "row");
+          top.appendChild(heading);
           const weight = element("input");
           weight.type = "number"; weight.min = "0"; weight.step = "any";
           const originalWeight = queue.weight.value.replace(/[fF]$/, "").replace(/\.(?=[eE]|$)/, ".0");
@@ -432,30 +453,30 @@
               text: (/^\d+$/.test(value) ? value + ".0" : value) + "f" }]);
           });
           field(top, "Relative weight", weight);
-          function moveQueue(direction) {
-            const items = factory.queues.map(function (q) { return q.item; });
-            if (hasLeadingComment(t, factory.open, items, qi) ||
-                hasLeadingComment(t, factory.open, items, qi + direction)) {
-              notice("Cannot reorder queues with adjacent comments safely; use the source view.");
-              return;
-            }
-            move(t, items, qi, direction);
-          }
-          button(top, "Move queue up", function () { moveQueue(-1); }, qi === 0);
-          button(top, "Move queue down", function () { moveQueue(1); }, qi === factory.queues.length - 1);
-          button(top, "Remove queue", function () {
-            const items = factory.queues.map(function (q) { return q.item; });
-            if (hasLeadingComment(t, factory.open, items, qi) ||
-                hasComments(t[queue.item.first].start, t[queue.item.last].end)) {
-              notice("Cannot remove a queue with attached comments; use the source view.");
-              return;
-            }
-            remove(t, items, qi);
-          }, factory.queues.length === 1);
           panel.appendChild(top);
           const steps = element("ol", "opening-steps");
+          const stepItems = queue.steps.map(step => step.item);
+          const roleSelector = index => `${queueSelector(qi)} .opening-step:nth-child(${index + 1}) select`;
+          const addSelector = `${queueSelector(qi)} .opening-add-step`;
+          const stepControls = helper.orderedRowControls(steps, {
+            count: stepItems.length,
+            disabled: !canChange,
+            tips: {up: openingTips["Move step up"], down: openingTips["Move step down"], remove: openingTips["Remove step"]},
+            move: (source, destination) => move(t, queue.open, stepItems, source, destination, roleSelector(destination)),
+            remove: index => {
+              const item = stepItems[index];
+              if (hasLeadingComment(t, queue.open, stepItems, index) ||
+                  hasComments(t[item.first].start, t[item.last].end)) {
+                notice("Cannot remove a step with attached comments; use the source view.");
+                return;
+              }
+              remove(t, stepItems, index, stepItems.length > 1
+                ? roleSelector(Math.min(index, stepItems.length - 2)) : addSelector);
+            }
+          });
           queue.steps.forEach(function (step, si) {
             const row = element("li", "row opening-step");
+            row.appendChild(stepControls(row, si, "step at position " + (si + 1)));
             const role = element("select");
             const choices = roles.indexOf(step.role.value) < 0 ? [step.role.value].concat(roles) : roles;
             choices.forEach(function (name) {
@@ -483,35 +504,17 @@
               else if (Number(value) !== 1) patch([{ start: step.role.end, end: step.role.end, text: ", " + value }]);
             });
             field(row, "Count", count);
-            function moveStep(direction) {
-              const items = queue.steps.map(function (s) { return s.item; });
-              if (hasLeadingComment(t, queue.open, items, si) ||
-                  hasLeadingComment(t, queue.open, items, si + direction)) {
-                notice("Cannot reorder steps with adjacent comments safely; use the source view.");
-                return;
-              }
-              move(t, items, si, direction);
-            }
-            button(row, "Move step up", function () { moveStep(-1); }, si === 0);
-            button(row, "Move step down", function () { moveStep(1); }, si === queue.steps.length - 1);
-            button(row, "Remove step", function () {
-              const items = queue.steps.map(function (s) { return s.item; });
-              if (hasLeadingComment(t, queue.open, items, si) ||
-                  hasComments(t[step.item.first].start, t[step.item.last].end)) {
-                notice("Cannot remove a step with attached comments; use the source view.");
-                return;
-              }
-              remove(t, items, si);
-            });
             steps.appendChild(row);
           });
           panel.appendChild(steps);
-          button(panel, "Add step", function () {
-          const addedCount = `.opening-queue:nth-of-type(${qi + 1}) .opening-step:last-child input`;
-          add(t, queue.open, queue.steps.map(function (s) { return s.item; }), "SO(RT::BUILDER)", " ", addedCount);
+          const addStep = button(panel, "Add step", function () {
+            const addedCount = `${queueSelector(qi)} .opening-step:last-child input`;
+            add(t, queue.open, stepItems, "SO(RT::BUILDER)", " ", addedCount);
           });
-          container.appendChild(panel);
+          addStep.classList.add("opening-add-step");
+          queues.appendChild(panel);
         });
+        container.appendChild(queues);
         refreshShares();
         button(container, "Add queue", function () {
           const newline = text.indexOf("\r\n") >= 0 ? "\r\n" : "\n";

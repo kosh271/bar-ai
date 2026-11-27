@@ -30,7 +30,7 @@ window.StudioTips = (() => {
     const multiples = new Intl.NumberFormat("en", {maximumSignificantDigits: 2});
     const liveDescriptions = new WeakMap();
 
-    function compareDistance(elmos) {
+    function compareDistance(elmos, {signed = false} = {}) {
         if (!Number.isFinite(elmos)) return "";
         const distance = Math.abs(elmos);
         if (!distance) return "No distance (0 elmos).";
@@ -47,7 +47,8 @@ window.StudioTips = (() => {
         else if (ratio <= 1.2) comparison = `About ${name}`;
         else if (ratio < 1.8) comparison = `Larger than ${name}`;
         else comparison = `About ${multiples.format(ratio)} times ${name}`;
-        return `${comparison} (${quantities.format(distance)} elmos).`;
+        const sign = signed && elmos < 0 ? "−" : "";
+        return `${comparison} (${sign}${quantities.format(distance)} elmos).`;
     }
 
     function description(control) {
@@ -68,8 +69,32 @@ window.StudioTips = (() => {
         return control;
     }
 
-    function distance(control, factor = 1) {
-        return dynamic(control, () => compareDistance(control.valueAsNumber * factor));
+    function distance(control, factor = 1, {disabledWhenNegative = false, wholeUnits = false} = {}) {
+        const group = control.ownerDocument.createElement("span");
+        group.className = "distance-control";
+        const readout = control.ownerDocument.createElement("span");
+        readout.className = "distance-readout";
+        // The input announces the readout as its description, including inside implicit labels.
+        readout.setAttribute("aria-hidden", "true");
+        if (control.parentNode) control.replaceWith(group);
+        group.append(control, readout);
+        function update() {
+            const value = control.valueAsNumber;
+            let text = "";
+            if (control.validity.valid && Number.isFinite(value)) {
+                const elmos = (wholeUnits ? Math.trunc(value) : value) * factor;
+                text = disabledWhenNegative && value < 0 ? "Distance limit disabled." : compareDistance(elmos, {signed: true});
+            }
+            readout.textContent = text;
+            readout.hidden = !text;
+            const help = [control.dataset.tooltip, text].filter(Boolean).join(" ");
+            if (help) control.setAttribute("aria-description", help);
+            else control.removeAttribute("aria-description");
+        }
+        control.addEventListener("input", update);
+        control.addEventListener("change", update);
+        update();
+        return group;
     }
 
     const workspace = {

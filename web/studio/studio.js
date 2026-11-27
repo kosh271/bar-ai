@@ -85,6 +85,15 @@ function distanceFactor(path) {
         /^build_chain\/[^/]+\/[^/]+\/hub\/\d+\/\d+\/offset(?:\/[^/]+)?$/.test(key)) return 1;
     return 0;
 }
+function configDistanceInput(control, node) {
+    const factor = node.kind === "number" && distanceFactor(node.path);
+    if (!factor) return control;
+    const section = node.path[0];
+    return StudioTips.distance(control, factor, {
+        disabledWhenNegative: section === "commander" && node.path.at(-2) === "task_rad" && node.path.at(-1) === 0,
+        wholeUnits: section === "building" || section === "terrain"
+    });
+}
 function mapSizeComparison({width, height} = {}) {
     if (!(width > 0 && height > 0)) return "";
     const across = StudioTips.compareDistance(width);
@@ -146,6 +155,7 @@ function status() {
     $("compare-profiles").disabled = state.saving || !state.profile;
     $("project-history").disabled = state.saving || !state.project;
     $("manage-project").disabled = state.saving;
+    $("dialog-close").disabled = state.saving && $("dialog-content").firstElementChild?.classList.contains("workspace-manager");
 }
 function assign(file, text, record = true) {
     if (text === file.text) return;
@@ -272,19 +282,26 @@ async function refreshState(project, profile) {
     await loadInstallStatus();
 }
 let profileRequest = 0;
-async function loadProfile() {
+async function loadProfile(nextProfile) {
     const request = ++profileRequest;
-    const {project, profile} = state;
-    state.files = []; state.history = [];
-    const current = () => request === profileRequest && state.project === project && state.profile === profile;
-    if (project && profile) {
-        const result = await api(`/api/profile?project=${encodeURIComponent(project)}&profile=${encodeURIComponent(profile)}`);
-        if (!current()) return;
-        state.files = result.files.map(f => ({...f, original: f.text}));
+    const {project, profile: previous} = state;
+    if (nextProfile === undefined) {
+        nextProfile = previous;
+        state.files = []; state.history = [];
     }
+    let files = [];
+    if (project && nextProfile) {
+        const query = new URLSearchParams({project, profile: nextProfile});
+        const result = await api(`/api/profile?${query}`);
+        files = result.files.map(f => ({...f, original: f.text}));
+    }
+    if (request !== profileRequest || state.project !== project || state.profile !== previous) return;
+    state.profile = nextProfile;
+    $("profile").value = nextProfile;
+    state.files = files; state.history = [];
     await refreshBaseline();
-    if (!current()) return;
-    rememberPreference({workspace: {project, profile}});
+    if (request !== profileRequest || state.project !== project || state.profile !== nextProfile) return;
+    rememberPreference({workspace: {project, profile: nextProfile}});
     status(); render();
 }
 async function refreshBaseline() {
@@ -453,23 +470,30 @@ function layerPreview(initial, placement = false) {
         }));
         box.insertBefore(example, content);
     }
-    function draw() {
+    function draw(focusIndex) {
         content.replaceChildren();
         const list = element("ol", "layer-order");
+        const editors = window.StudioEditors;
+        const rowControls = editors.orderedRowControls(list, {
+            count: order.length,
+            move: (source, destination) => {
+                const next = editors.moveItem(order, source, destination);
+                order.splice(0, order.length, ...next);
+                draw(destination);
+            },
+            remove: index => {
+                order.splice(index, 1);
+                draw(Math.min(index, order.length - 1));
+            },
+            tips: {
+                up: "Load this file earlier in the preview. A file after it can override its values.",
+                down: "Load this file later in the preview so it can override earlier values.",
+                remove: "Exclude this file from the preview. The AI's actual startup files stay the same."
+            }
+        });
         order.forEach((path, index) => {
             const row = element("li", "layer-order-item");
-            row.append(element("span", "grow", path));
-            const up = button("Move up", () => { [order[index - 1], order[index]] = [order[index], order[index - 1]]; draw(); });
-            const down = button("Move down", () => { [order[index + 1], order[index]] = [order[index], order[index + 1]]; draw(); });
-            up.disabled = index === 0; down.disabled = index === order.length - 1;
-            const remove = button("Remove", () => {order.splice(index, 1); draw();});
-            up.setAttribute("aria-label", `Move ${path} at position ${index + 1} up`);
-            down.setAttribute("aria-label", `Move ${path} at position ${index + 1} down`);
-            remove.setAttribute("aria-label", `Remove ${path} at position ${index + 1}`);
-            describeControl(up, "Load this file earlier in the preview. A file after it can override its values.");
-            describeControl(down, "Load this file later in the preview so it can override earlier values.");
-            describeControl(remove, "Exclude this file from the preview. The AI's actual startup files stay the same.");
-            row.append(up, down, remove);
+            row.append(rowControls(row, index, `${path} at position ${index + 1}`), element("span", "grow", path));
             list.append(row);
         });
         const picker = element("select");
@@ -479,6 +503,10 @@ function layerPreview(initial, placement = false) {
         const row = element("div", "row");
         row.append(picker, button(placement ? "Add settings file" : "Add file", () => {if (picker.value) {order.push(picker.value); draw();}}));
         content.append(element("h3", "", placement ? "Settings order" : "Preview load order"), list, row);
+        if (focusIndex !== undefined) {
+            const control = list.children[focusIndex]?.querySelector("button:not(:disabled)") || picker;
+            control.focus({preventScroll: true});
+        }
         if (!order.length) { content.append(notice("Add a file to see the preview.")); return; }
         try {
             const preview = C.previewLayers(order.map(path => files.find(file => file.path === path)));
@@ -584,12 +612,7 @@ function fieldInput(file, node, aria, callback, {preserveNumberText = false, hel
             else input.value = current.kind === "number" ? rawNumber(current) : current.value;
         }
     });
-    describeControl(input, help || configValueTip(file, node));
-    if (node.kind === "number") {
-        const factor = distanceFactor(node.path);
-        if (factor) StudioTips.distance(input, factor);
-    }
-    return input;
+    return describeControl(input, help || configValueTip(file, node));
 }
 function configValueTip(file, node) {
     const known = {
@@ -658,7 +681,7 @@ function treeNode(file, node, title, depth = 0, onChange = null, describe = null
             input.addEventListener("input", () => onInput(node.path, input.valueAsNumber));
         }
         const id = "field-" + Math.random().toString(36).slice(2);
-        input.id = id; label.htmlFor = id; row.append(label, input);
+        input.id = id; label.htmlFor = id; row.append(label, configDistanceInput(input, node));
         if (describe && info && info.valueDescription !== undefined) {
             const valueDescription = element("div", "muted");
             const updateDescription = () => {
@@ -1054,41 +1077,79 @@ function production(target, selected) {
     panel.append(row);
     const fac = C.at(root, ["factory", state.factory]), units = C.at(fac, ["unit"]), group = C.at(fac, [state.situation]);
     const thresholds = C.at(fac, ["income_tier"]);
+    const scores = new Map();
     if (thresholds?.kind === "array") {
         panel.append(element("h3", "", "Income thresholds"),
             element("p", "muted", "In BARb, the factory uses these cutoffs to choose which tier of production weights applies. Tier 0 is the starting tier."),
             element("p", "income-formula", "Income score = min(average metal income, average energy income) × economy factor"),
             element("p", "muted", "BARb averages recent income rates per game second, including received metal and BAR's energy overdrive adjustment. The economy factor is 1 in a one-player team and increases by economy.eps_step per additional teammate (0.25 by default). For example, 12 metal/s and 30 energy/s give a score of 12 in a one-player team or 15 with one teammate at the default factor."));
+        for (const {key, node} of thresholds.children) {
+            if (node.kind === "number") scores.set(key + 1, node);
+        }
+    }
+    const scoreLabel = tier => `Minimum score for Tier ${tier}`;
+    function scoreInput(tier, node) {
+        return fieldInput(file, node, scoreLabel(tier), null, {
+            help: "Set the minimum income score for these production weights. A higher cutoff requires a stronger economy before this tier can apply."
+        });
+    }
+    function appendRemainingScores() {
+        if (!scores.size) return;
         const inputs = element("div", "row");
-        for (const item of thresholds.children) {
-            if (item.node.kind !== "number") continue;
-            const label = element("label", "field", `Minimum score for Tier ${item.key + 1}`);
-            label.append(fieldInput(file, item.node, `${state.factory} tier ${item.key + 1} income`, null, {
-                help: "Set the minimum income score for these production weights. A higher cutoff requires a stronger economy before this tier can apply."
-            })); inputs.append(label);
+        for (const [tier, node] of scores) {
+            const label = element("label", "field", scoreLabel(tier));
+            label.append(scoreInput(tier, node));
+            inputs.append(label);
         }
         panel.append(inputs);
     }
     panel.append(element("h3", "", "Production preferences"));
     if (!units || units.kind !== "array" || !group || group.kind !== "object") {
+        appendRemainingScores();
         panel.append(notice("This situation or unit list is not present in this layer. Inspect other layers or All files.", true));
         target.append(panel); return;
     }
     const tiers = group.children.filter(e => /^tier\d+$/.test(e.key) && e.node.kind === "array")
         .sort((a, b) => Number(a.key.slice(4)) - Number(b.key.slice(4)));
     if (!tiers.length || tiers.some(e => e.node.children.length !== units.children.length)) {
+        appendRemainingScores();
         panel.append(notice("The tier lists are missing or do not align with the unit list. Use All files to inspect them.", true));
         target.append(panel); return;
     }
-    const wrap = element("div", "table-wrap"), table = element("table"), head = element("tr");
+    const wrap = element("div", "table-wrap"), table = element("table");
+    const header = element("thead"), head = element("tr"), body = element("tbody");
     const weightColumns = tiers.map(() => []);
     function refreshShares(column) {
         const shares = window.StudioEditors.weightShares(column.map(({input}) => input.valueAsNumber));
         column.forEach(({hint}, index) => { hint.textContent = window.StudioEditors.weightPercent(shares[index]); });
     }
     head.append(element("th", "", "Unit ID"));
-    for (const tier of tiers) head.append(element("th", "", `Tier ${tier.key.slice(4)}`));
-    head.append(element("th", "", "")); table.append(head);
+    const tierNumbers = tiers.map(({key}) => Number(key.slice(4)));
+    for (const tier of tierNumbers) {
+        const heading = element("th", "", `Tier ${tier}`);
+        heading.scope = "col";
+        head.append(heading);
+    }
+    head.append(element("th", "", ""));
+    header.append(head);
+    if (tierNumbers.some(tier => scores.has(tier))) {
+        const cutoffs = element("tr"), label = element("th", "", "Minimum score");
+        label.scope = "row";
+        cutoffs.append(label);
+        for (const tier of tierNumbers) {
+            const cell = element("td"), node = scores.get(tier);
+            if (node) {
+                const field = element("div", "weight");
+                field.append(scoreInput(tier, node));
+                cell.append(field);
+                scores.delete(tier);
+            } else if (tier === 0) cell.append(element("span", "muted", "Starting tier"));
+            cutoffs.append(cell);
+        }
+        cutoffs.append(element("td"));
+        body.append(cutoffs);
+    }
+    table.append(header, body);
     units.children.forEach((unit, i) => {
         const tr = element("tr"), name = element("td", "unit-name", unit.node.value);
         name.prepend(unitIcon(unit.node.value));
@@ -1123,10 +1184,11 @@ function production(target, selected) {
             try { assign(file, C.changeFactoryUnit(file.text, state.factory, "", i)); render(); }
             catch (error) { message(errorText(error), true); }
         }, "action", "Remove this unit and its weights from every tier for this factory in the selected file. Other settings or layers can still request it."));
-        tr.append(td); table.append(tr);
+        tr.append(td); body.append(tr);
     });
     weightColumns.forEach(refreshShares);
     wrap.append(table); panel.append(wrap);
+    appendRemainingScores();
     const factoryEntry = catalogUnit(state.factory);
     if (state.catalog && !factoryEntry) panel.append(notice("This factory was not found in the catalog; its build options are unknown.", true));
     else if (state.catalog && factoryEntry.builds === null) panel.append(notice("This factory's catalog build options could not be read.", true));
@@ -1238,7 +1300,9 @@ function economyView(panel, file, root) {
     for (const item of found) {
         const row = element("div", "tree-field"), label = element("label");
         label.append(element("div", "", item.label), element("div", "muted", item.help));
-        row.append(label, fieldInput(file, item.node, item.label, null, {help: StudioTips.field(item.label) || item.help})); panel.append(row);
+        const input = fieldInput(file, item.node, item.label, null, {help: StudioTips.field(item.label) || item.help});
+        row.append(label, configDistanceInput(input, item.node));
+        panel.append(row);
     }
     panel.append(notice("Generator selection differs between BARb versions. A setting being present does not guarantee that the selected DLL uses it."));
 }
@@ -1618,35 +1682,26 @@ function clusterDefenseView(panel, file, root) {
     head.append(header);
     table.append(head, body); wrap.append(table);
 
-    const dragHandle = window.StudioEditors.draggableBuildOrder(body, (source, destination) => {
-        edit(source, {moveTo: destination}, `cluster-defense-slot-${destination}`);
+    const rowControls = window.StudioEditors.orderedRowControls(body, {
+        count: sequence.children.length,
+        move: (source, destination) => edit(source, {moveTo: destination}, `cluster-defense-slot-${destination}`),
+        remove: index => edit(index, null, index < sequence.children.length - 1
+            ? `cluster-defense-slot-${index}` : "cluster-defense-add"),
+        tips: {
+            up: "Move this defense earlier so the AI considers it sooner. This may move it into the preventive slots.",
+            down: "Move this defense later so the AI considers it later. This may move it out of the preventive slots.",
+            remove: "Remove this entry from the build order. Other entries may move into the preventive slots."
+        }
     });
 
     for (const {key: index, node} of sequence.children) {
         const row = element("tr"), order = element("td", "cluster-defense-order", String(index + 1));
         const slot = element("td"), actions = element("td", "cluster-defense-actions");
-        const buttons = element("div", "cluster-defense-row-controls");
         const pickerId = `cluster-defense-slot-${index}`;
         slot.append(defenseSlotPicker(`Defense slot at position ${index + 1}`, choices, node.value,
             value => edit(index, value, pickerId), {id: pickerId}));
 
-        buttons.append(dragHandle(row));
-        for (const [icon, label, action, next] of [
-            ["↑", "Move up", "up", index - 1], ["↓", "Move down", "down", index + 1], ["×", "Remove", null, index]
-        ]) {
-            const description = `${label} defense at position ${index + 1}`;
-            const control = button(icon, () => edit(index, action,
-                next < sequence.children.length - (action === null ? 1 : 0) ? `cluster-defense-slot-${next}` : "cluster-defense-add"),
-                "cluster-defense-row-button");
-            control.setAttribute("aria-label", description);
-            describeControl(control, {
-                up: "Move this defense earlier so the AI considers it sooner. This may move it into the preventive slots.",
-                down: "Move this defense later so the AI considers it later. This may move it out of the preventive slots."
-            }[action] || "Remove this entry from the build order. Other entries may move into the preventive slots.");
-            control.disabled = next < 0 || (action === "down" && next >= sequence.children.length);
-            buttons.append(control);
-        }
-        actions.append(buttons);
+        actions.append(rowControls(row, index, `defense at position ${index + 1}`));
         row.append(actions, order, slot);
         body.append(row);
     }
@@ -2347,39 +2402,40 @@ function initLayersView(panel) {
         .map(path => path.slice("config/".length, -".json".length))
         .sort();
 
-    function saveModel(next) {
+    function saveModel(next, listId, focusIndex) {
         try {
             assign(model.file, S.writeInitLayers(state.files, next));
             message("");
             render();
+            const list = $(listId);
+            const details = list?.closest("details");
+            if (details) details.open = true;
+            const row = list?.children[focusIndex];
+            (row?.querySelector("button:not(:disabled)") || $(`${listId}-add`))?.focus({preventScroll: true});
         } catch (error) { message(errorText(error), true); }
     }
 
-    function layerListSection(title, description, items, allowEmpty, onUpdate) {
+    function layerListSection(listId, title, description, items, allowEmpty, onUpdate) {
         panel.append(element("h3", "", title), element("p", "muted", description));
         const list = element("ol", "layer-order");
+        list.id = listId;
         if (!items.length) panel.append(element("p", "muted", "No layers in this branch."));
+        const editors = window.StudioEditors;
+        const rowControls = editors.orderedRowControls(list, {
+            count: items.length,
+            canRemove: allowEmpty || items.length > 1,
+            move: (source, destination) => onUpdate(editors.moveItem(items, source, destination), destination),
+            remove: index => onUpdate(items.filter((_, i) => i !== index), Math.min(index, items.length - 2)),
+            tips: {
+                up: "Load this file earlier at startup, giving files after it a chance to override its values.",
+                down: "Load this file later at startup so it can override settings from earlier files.",
+                remove: "Take this file out of this startup list. The file remains in the profile and other branches may still load it."
+            }
+        });
         items.forEach((name, index) => {
             const row = element("li", "layer-order-item");
-            row.append(element("span", "grow", `${name} (config/${name}.json)`));
-            const up = button("Move up", () => {
-                const next = [...items];
-                [next[index - 1], next[index]] = [next[index], next[index - 1]];
-                onUpdate(next);
-            });
-            const down = button("Move down", () => {
-                const next = [...items];
-                [next[index + 1], next[index]] = [next[index], next[index + 1]];
-                onUpdate(next);
-            });
-            const remove = button("Remove", () => onUpdate(items.filter((_, i) => i !== index)));
-            describeControl(up, "Load this file earlier at startup, giving files after it a chance to override its values.");
-            describeControl(down, "Load this file later at startup so it can override settings from earlier files.");
-            describeControl(remove, "Take this file out of this startup list. The file remains in the profile and other branches may still load it.");
-            up.disabled = index === 0;
-            down.disabled = index === items.length - 1;
-            remove.disabled = !allowEmpty && items.length <= 1;
-            row.append(up, down, remove);
+            row.append(rowControls(row, index, `${name} at position ${index + 1}`),
+                element("span", "grow", `${name} (config/${name}.json)`));
             list.append(row);
         });
         panel.append(list);
@@ -2387,31 +2443,36 @@ function initLayersView(panel) {
         if (candidates.length) {
             const row = element("div", "row");
             const picker = element("select");
+            picker.id = `${listId}-add`;
             picker.setAttribute("aria-label", `Layer to add to ${title}`);
             describeControl(picker, "Choose a settings file to load at the end of this startup list.");
             selectOptions(picker, candidates.map(name => [name, `config/${name}.json`]), candidates[0]);
-            row.append(picker, button("Add layer", () => onUpdate([...items, picker.value])));
+            row.append(picker, button("Add layer", () => onUpdate([...items, picker.value], items.length)));
             panel.append(row);
         }
     }
 
+    const baseListId = "startup-layers-base";
     layerListSection(
+        baseListId,
         "Base configuration layers",
         "Loaded in order at startup. Later layers override earlier values.",
         model.base,
         false,
-        nextBase => saveModel({base: nextBase, branches: model.branches})
+        (nextBase, index) => saveModel({base: nextBase, branches: model.branches}, baseListId, index)
     );
-    for (const branch of model.branches) {
+    for (const [branchIndex, branch] of model.branches.entries()) {
+        const listId = `startup-layers-branch-${branchIndex}`;
         layerListSection(
+            listId,
             `Conditional branch · ${branch.label}`,
             `Appended when game option "${branch.option}" is enabled.`,
             branch.layers,
             true,
-            nextLayers => saveModel({
+            (nextLayers, index) => saveModel({
                 base: model.base,
                 branches: model.branches.map(item => item.option === branch.option ? {...item, layers: nextLayers} : item)
-            })
+            }, listId, index)
         );
     }
     panel.append(element("p", "muted", "Startup script: " + model.file.path));
@@ -2494,7 +2555,6 @@ function advanced(target) {
                         else if (item.type === "uint") input.min = "0";
                         if (item.meta?.max !== undefined) input.max = String(item.meta.max);
                         input.value = item.value;
-                        if (/^elmos?$/i.test(item.unit || item.meta?.unit || "")) StudioTips.distance(input);
                     }
                     input.addEventListener("change", () => {
                         try {
@@ -2517,7 +2577,8 @@ function advanced(target) {
                             } catch (_) { /* Keep current input when script has syntax errors. */ }
                         }
                     });
-                    row.append(label, input);
+                    const inElmos = input.type === "number" && /^elmos?$/i.test(item.unit || item.meta?.unit || "");
+                    row.append(label, inElmos ? StudioTips.distance(input) : input);
                     body.append(row);
                 }
                 details.append(body);
@@ -4460,76 +4521,195 @@ function mergeProfiles(project, profile) {
     showDialog("Merge profiles", box);
 }
 function manageProject() {
-    const project = selectedProject(), profile = project?.profiles.find(entry => entry.key === state.profile);
-    const box = element("div"), projectImportFeedback = workspaceFeedback(), archive = element("input");
-    if (state.projectIssues.length) box.append(projectInventoryIssues());
+    const project = selectedProject();
+    const box = element("div", "workspace-manager"), projectImportFeedback = workspaceFeedback(), archive = element("input");
     archive.type = "file"; archive.accept = ".zip,application/zip";
     describeControl(archive, "Choose a Studio project ZIP to import. The archive can include several profiles.");
     const archiveLabel = element("label", "field", "Project ZIP");
     archiveLabel.append(archive);
 
-    async function mutate(event, submit, success, feedback) {
+    async function mutate(event, submit, success, feedback, apply) {
         const control = event.currentTarget;
-        if (state.saving || !confirmDiscard()) return;
+        if (state.saving || (!apply && !confirmDiscard())) return;
         state.saving = true; status(); control.disabled = true;
         let submitted = false;
         try {
             const result = await submit();
-            submitted = true;
-            await openUpdatedWorkspace(result, success, feedback);
-        } catch (error) { showWorkspaceFeedback(feedback, errorText(error)); }
+            if (apply) {
+                apply();
+                if (feedback.isConnected && $("dialog").open) showWorkspaceFeedback(feedback, success);
+                else message(success);
+            } else {
+                submitted = true;
+                await openUpdatedWorkspace(result, success, feedback);
+            }
+        } catch (error) {
+            if (feedback.isConnected && $("dialog").open) showWorkspaceFeedback(feedback, errorText(error));
+            else message(errorText(error), true);
+        }
         finally { state.saving = false; status(); control.disabled = submitted; }
     }
-    const change = (event, action, fields, success, feedback) => mutate(event, () => api("/api/project/manage", {
-        project: project.key, profile: profile?.key, action, ...fields
-    }), success, feedback);
+    const change = (event, action, fields, success, feedback, apply) => mutate(event, () => api("/api/project/manage", {
+        project: project.key, action, ...fields
+    }), success, feedback, apply);
+    const byName = (a, b) => a.name.localeCompare(b.name, undefined, {sensitivity: "base"});
+    function disclosure(title, ...children) {
+        const details = element("details", "workspace-manager-disclosure");
+        const body = element("div", "tree-body");
+        body.append(...children);
+        details.append(element("summary", "", title), body);
+        return details;
+    }
+    function exportZip(label, url, filename, success, feedback) {
+        return button(label, async event => {
+            const control = event.currentTarget;
+            control.disabled = true;
+            try {
+                await downloadArchive(url, filename);
+                showWorkspaceFeedback(feedback, success);
+            } catch (error) {
+                showWorkspaceFeedback(feedback, `Could not export ${filename}. ${errorText(error)}`);
+            }
+            finally { control.disabled = false; }
+        }, "button");
+    }
     if (project) {
+        const top = element("div", "workspace-manager-header");
+        const projectHeading = element("h3", "", project.name);
+        top.append(projectHeading,
+            button("New profile from BAR", () => { if (!state.saving) createProject(project.key); }, "button"));
+        const list = element("div", "workspace-profile-list");
+        list.setAttribute("role", "group");
+        list.setAttribute("aria-label", "Profiles");
+        const editor = element("section", "workspace-profile-editor");
+        editor.setAttribute("aria-labelledby", "managed-profile-heading");
+        const profiles = element("div", "workspace-profiles");
+        const profileFeedback = workspaceFeedback();
+        profiles.append(list, editor);
+        let managedKey = state.profile || project.profiles[0]?.key;
+
+        function showProfile() {
+            const profile = project.profiles.find(item => item.key === managedKey);
+            if (!profile) {
+                profiles.hidden = true;
+                return;
+            }
+            const isDefault = project.default_profile.toLowerCase() === profile.key.toLowerCase();
+            const isOpen = state.profile === profile.key;
+            const heading = element("h3", "", profile.name);
+            heading.id = "managed-profile-heading";
+            const [profileLabel, profileName] = textInput("Profile display name", profile.name);
+            const rename = button("Rename profile", event => {
+                const name = profileName.value.trim();
+                change(event, "rename_profile", {profile: profile.key, name}, "Profile renamed.", profileFeedback, () => {
+                    profile.name = name;
+                    project.profiles.sort(byName);
+                    updateProfiles();
+                });
+            }, "button");
+            rename.disabled = true;
+            profileName.addEventListener("input", () => {
+                const name = profileName.value.trim();
+                rename.disabled = !name || name === profile.name;
+            });
+            const open = button("Open in editor", async event => {
+                if (state.saving || !confirmDiscard()) return;
+                const control = event.currentTarget;
+                state.saving = true; status(); control.disabled = true;
+                try {
+                    await loadProfile(profile.key);
+                    if (box.isConnected) $("dialog").close();
+                    message("");
+                } catch (error) { showWorkspaceFeedback(profileFeedback, errorText(error)); }
+                finally { state.saving = false; status(); control.disabled = false; }
+            }, "button primary");
+            const setDefault = button("Make default", event => change(event, "set_default", {profile: profile.key},
+                "Default profile updated. Install the AI to apply its new default in BAR.", profileFeedback, () => {
+                    project.default_profile = profile.key;
+                    updateProfiles();
+                }), "button");
+            setDefault.disabled = isDefault;
+            const remove = button("Delete profile", event => {
+                const next = isOpen ? " Studio will open the default profile." : "";
+                if (state.saving || !confirm(`Permanently delete the ${profile.name} profile?${next}`)) return;
+                change(event, "delete_profile", {profile: profile.key, confirm: true}, "Profile deleted.", profileFeedback, isOpen ? null : () => {
+                    project.profiles = project.profiles.filter(item => item.key !== profile.key);
+                    managedKey = state.profile;
+                    updateProfiles();
+                });
+            }, "button subtle workspace-manager-danger");
+            remove.disabled = isDefault || project.profiles.length <= 1;
+            const query = new URLSearchParams({project: project.key, profile: profile.key});
+            const actions = element("div", "workspace-manager-actions");
+            if (!isOpen) actions.append(open);
+            actions.append(setDefault, exportZip("Export profile ZIP", `/api/profile/export?${query}`,
+                profile.key + ".profile.zip", `Exported the saved ${profile.name} profile.`, profileFeedback),
+                button("Merge profiles", () => { if (!state.saving) mergeProfiles(project, profile); }, "button"));
+            const nameRow = element("div", "workspace-manager-name");
+            nameRow.append(profileLabel, rename);
+            const deletion = element("div", "workspace-manager-delete");
+            deletion.append(remove);
+            if (remove.disabled) deletion.append(element("span", "muted", project.profiles.length <= 1
+                ? "A project must keep at least one profile." : "Choose another default before deleting this profile."));
+            editor.replaceChildren(heading, nameRow, actions, deletion);
+        }
+        function renderList() {
+            const counts = new Map();
+            for (const {name} of project.profiles) counts.set(name, (counts.get(name) || 0) + 1);
+            const choices = project.profiles.map(profile => {
+                const choice = button(profile.name, () => {
+                    if (state.saving || managedKey === profile.key) return;
+                    managedKey = profile.key;
+                    for (const item of list.children) item.setAttribute("aria-pressed", String(item === choice));
+                    profileFeedback.textContent = "";
+                    showProfile();
+                }, "workspace-profile-choice");
+                choice.textContent = "";
+                choice.append(element("span", "workspace-profile-name", profile.name));
+                if (counts.get(profile.name) > 1) choice.append(element("span", "path", profile.key));
+                const badges = element("span", "workspace-profile-badges");
+                if (profile.key === state.profile) badges.append(element("span", "tag", "Open"));
+                if (profile.key.toLowerCase() === project.default_profile.toLowerCase()) badges.append(element("span", "tag", "Default"));
+                if (badges.childElementCount) choice.append(badges);
+                choice.setAttribute("aria-pressed", String(profile.key === managedKey));
+                return choice;
+            });
+            list.replaceChildren(...choices);
+        }
+        function updateProfiles() {
+            selectOptions($("profile"), project.profiles.map(item => [item.key, item.name]), state.profile);
+            renderList();
+            showProfile();
+            if (box.isConnected && $("dialog").open) list.querySelector('[aria-pressed="true"]')?.focus({preventScroll: true});
+            void loadInstallStatus();
+        }
+        renderList();
+        showProfile();
+        box.append(top, profiles, profileFeedback);
+
         const [projectLabel, projectName] = textInput("Project display name", project.name);
         const projectFeedback = workspaceFeedback();
-        box.append(element("h3", "", "Project"), projectLabel,
-            button("Rename project", event => change(event, "rename_project", {name: projectName.value}, "Project renamed.", projectFeedback)),
-            button("Export project ZIP", async event => {
-                const control = event.currentTarget;
-                control.disabled = true;
-                try {
-                    await downloadArchive(`/api/project/export?project=${encodeURIComponent(project.key)}`, project.key + ".zip");
-                    showWorkspaceFeedback(projectFeedback, "Project ZIP exported.");
-                } catch (error) { showWorkspaceFeedback(projectFeedback, errorText(error)); }
-                finally { control.disabled = false; }
-            }),
-            button("Delete project", event => {
-                if (confirm(`Permanently delete ${project.name}, its profiles, and its checkpoint history?`)) {
-                    change(event, "delete_project", {confirm: true}, "Project deleted.", projectFeedback);
-                }
-            }), projectFeedback);
-        box.append(element("h3", "", "Profiles"), button("New profile from BAR", () => createProject(project.key)));
-        if (profile) {
-            const isDefault = project.default_profile === profile.key;
-            const [profileLabel, profileName] = textInput("Profile display name", profile.name);
-            const profileFeedback = workspaceFeedback();
-            const setDefault = button("Make default", event => change(event, "set_default", {},
-                "Default profile updated. Install the AI to apply its new default in BAR.", profileFeedback));
-            const remove = button("Delete profile", event => {
-                if (confirm(`Delete the ${profile.name} profile?`)) change(event, "delete_profile", {confirm: true}, "Profile deleted.", profileFeedback);
+        const projectActions = element("div", "workspace-manager-actions");
+        const renameProject = button("Rename project", event => {
+            const name = projectName.value.trim();
+            change(event, "rename_project", {name}, "Project renamed.", projectFeedback, () => {
+                project.name = projectHeading.textContent = projectName.value = name;
+                state.projects.sort(byName);
+                selectOptions($("project"), state.projects.map(item => [item.key, item.name]), state.project);
+                render();
+                void loadInstallStatus();
             });
-            setDefault.disabled = isDefault;
-            remove.disabled = isDefault || project.profiles.length === 1;
-            box.append(profileLabel,
-                button("Rename profile", event => change(event, "rename_profile", {name: profileName.value}, "Profile renamed.", profileFeedback)),
-                setDefault, remove,
-                button("Export profile ZIP", async event => {
-                    const control = event.currentTarget;
-                    control.disabled = true;
-                    try {
-                        const query = new URLSearchParams({project: project.key, profile: profile.key});
-                        await downloadArchive(`/api/profile/export?${query}`, profile.key + ".profile.zip");
-                        showWorkspaceFeedback(profileFeedback, "Saved profile exported.");
-                    } catch (error) { showWorkspaceFeedback(profileFeedback, errorText(error)); }
-                    finally { control.disabled = false; }
-                }),
-                button("Merge profiles", () => mergeProfiles(project, profile)), profileFeedback);
-            if (isDefault) box.append(element("p", "muted", "This is the default profile. Select a different default before deleting it."));
-        }
+        }, "button");
+        projectActions.append(renameProject,
+            exportZip("Export project ZIP", `/api/project/export?project=${encodeURIComponent(project.key)}`,
+                project.key + ".zip", "Project ZIP exported.", projectFeedback));
+        const deleteProject = button("Delete project", event => {
+            if (!state.saving && confirm(`Permanently delete ${project.name}, its profiles, and its checkpoint history?`)) {
+                change(event, "delete_project", {confirm: true}, "Project deleted.", projectFeedback);
+            }
+        }, "button subtle workspace-manager-danger");
+        const projectDeletion = element("div", "workspace-manager-delete");
+        projectDeletion.append(deleteProject);
         const profileArchive = element("input");
         profileArchive.type = "file"; profileArchive.accept = ".zip,application/zip";
         describeControl(profileArchive, "Choose a Studio profile ZIP to import into this project. The archive supplies the new profile's files.");
@@ -4554,13 +4734,17 @@ function manageProject() {
             mutate(event, async () => (await projectArchiveRequest(`/api/profile/import?${query}`, profileArchive.files[0])).json(),
                 "Profile imported.", profileImportFeedback);
         });
-        box.append(element("h3", "", "Import a profile"), profileArchiveLabel, nameLabel, importProfile, profileImportFeedback);
+        box.append(disclosure("Import a profile", profileArchiveLabel, nameLabel, importProfile, profileImportFeedback),
+            disclosure("Project settings", projectLabel, projectActions, projectDeletion, projectFeedback));
     }
-    box.append(element("h3", "", "Import a project"), archiveLabel, button("Import ZIP", event => {
+    const importProject = disclosure("Import a project", archiveLabel, button("Import project ZIP", event => {
         if (!archive.files.length) { showWorkspaceFeedback(projectImportFeedback, "Choose a project ZIP."); return; }
         mutate(event, async () => (await projectArchiveRequest("/api/project/import", archive.files[0])).json(),
             "Project imported with a fresh baseline checkpoint.", projectImportFeedback);
     }), projectImportFeedback);
+    importProject.open = !project;
+    box.append(importProject);
+    if (state.projectIssues.length) box.append(projectInventoryIssues());
     showDialog("Manage projects and profiles", box);
 }
 function manageAIs(target) {
@@ -4830,6 +5014,9 @@ async function manageSelectedAI(remove, feedback, installButton, removeButton, r
     }
 }
 $("dialog-close").addEventListener("click", () => $("dialog").close());
+$("dialog").addEventListener("cancel", event => {
+    if ($("dialog-close").disabled) event.preventDefault();
+});
 $("new-project").addEventListener("click", () => createProject());
 $("manage-project").addEventListener("click", manageProject);
 $("clone").addEventListener("click", cloneProfile);

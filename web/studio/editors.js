@@ -43,7 +43,14 @@ window.StudioEditors = (() => {
         return search;
     }
 
-    function draggableBuildOrder(body, move) {
+    function moveItem(items, source, destination) {
+        const result = items.slice();
+        const [item] = result.splice(source, 1);
+        result.splice(destination, 0, item);
+        return result;
+    }
+
+    function orderedRowControls(body, {count, move, remove, disabled = false, canRemove = true, tips = {}}) {
         let draggedRow, markedRow;
         function clearDropMarker() {
             markedRow?.removeAttribute("data-drop-edge");
@@ -55,12 +62,13 @@ window.StudioEditors = (() => {
             draggedRow = null;
         }
         function dropLocation(event) {
-            const row = event.target.closest("tr");
-            if (!row || row.parentElement !== body) return null;
+            let row = event.target;
+            while (row && row.parentElement !== body) row = row.parentElement;
+            if (!row?.classList.contains("build-order-row")) return null;
             const bounds = row.getBoundingClientRect();
             const after = event.clientY >= bounds.top + bounds.height / 2;
-            const source = draggedRow.sectionRowIndex;
-            const boundary = row.sectionRowIndex + Number(after);
+            const source = Array.prototype.indexOf.call(body.children, draggedRow);
+            const boundary = Array.prototype.indexOf.call(body.children, row) + Number(after);
             const destination = boundary > source ? boundary - 1 : boundary;
             return {row, after, source, destination};
         }
@@ -88,12 +96,16 @@ window.StudioEditors = (() => {
             }
         });
 
-        return row => {
+        return (row, index, label) => {
             row.classList.add("build-order-row");
+            const controls = document.createElement("div");
+            controls.className = "build-order-controls";
             const handle = document.createElement("span");
             handle.className = "build-order-drag-handle";
-            handle.draggable = true;
-            window.StudioTips?.set(handle, "Drag this defense earlier or later in the build order. Use the arrow buttons to do the same with a keyboard.");
+            handle.draggable = !disabled && count > 1;
+            if (handle.draggable) {
+                window.StudioTips?.set(handle, "Drag to reorder. Use the arrow buttons to do the same with a keyboard.");
+            }
             handle.setAttribute("aria-hidden", "true");
             handle.addEventListener("dragstart", event => {
                 draggedRow = row;
@@ -104,7 +116,24 @@ window.StudioEditors = (() => {
                 row.classList.add("dragging");
             });
             handle.addEventListener("dragend", finishDrag);
-            return handle;
+            controls.append(handle);
+
+            for (const [action, icon, name, handler, unavailable] of [
+                ["up", "↑", `Move ${label} up`, () => move(index, index - 1), index === 0],
+                ["down", "↓", `Move ${label} down`, () => move(index, index + 1), index === count - 1],
+                ["remove", "×", `Remove ${label}`, () => remove(index), !canRemove]
+            ]) {
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = "build-order-button";
+                button.textContent = icon;
+                button.setAttribute("aria-label", name);
+                button.disabled = disabled || unavailable;
+                button.addEventListener("click", handler);
+                window.StudioTips?.set(button, tips[action] || name);
+                controls.append(button);
+            }
+            return controls;
         };
     }
 
@@ -213,5 +242,5 @@ window.StudioEditors = (() => {
         return visible;
     }
 
-    return {weightShares, weightPercent, placementGeometry, filterUnits, unitSearchInput, draggableBuildOrder, compareFiles, lineDiff};
+    return {weightShares, weightPercent, placementGeometry, filterUnits, unitSearchInput, moveItem, orderedRowControls, compareFiles, lineDiff};
 })();
