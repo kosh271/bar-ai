@@ -238,6 +238,82 @@
 .game-result-time .muted { font-family: var(--font); }
 .experiment-game-results :is(th, td):is(:nth-child(4), :nth-child(5)) { text-align: right; }
 
+.experiment-matchups > :is(p, h4) { margin: 0 12px 10px; }
+.experiment-matrix-view {
+    margin: 0 12px 12px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+}
+.experiment-matrix-top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px 10px;
+    padding: 7px 9px;
+    background: var(--panel);
+    border-radius: 6px 6px 0 0;
+    border-bottom: 1px solid var(--line);
+}
+.experiment-matrix-top h4 { margin: 0; }
+.matrix-opponent-columns:not([hidden]) {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+    min-width: 0;
+    color: var(--muted);
+    font-size: 12px;
+}
+.matrix-opponent-columns select { padding: 4px 6px; }
+.experiment-matrix-scroll {
+    max-height: 28rem;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+    border-radius: 0 0 6px 6px;
+}
+.experiment-matrix {
+    width: 100%;
+    table-layout: fixed;
+    border-collapse: separate;
+    border-spacing: 0;
+}
+.experiment-matrix .matrix-row-labels { width: var(--matrix-row-label-width); }
+.experiment-matrix :is(th, td) {
+    padding: 4px;
+    border-bottom: 1px solid var(--line);
+    border-right: 1px solid var(--line);
+    text-align: center;
+    overflow-wrap: anywhere;
+}
+.experiment-matrix thead {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+.experiment-matrix :is(th, .matrix-corner) {
+    background: var(--panel2);
+    color: var(--text);
+    font-size: 11px;
+    text-transform: none;
+    letter-spacing: normal;
+    line-height: 1.2;
+}
+.experiment-matrix .matrix-corner { color: var(--muted); font-size: 10px; }
+.matrix-corner span { display: block; }
+.matrix-axis-opponent { text-align: right; }
+.matrix-axis-side { margin-top: 3px; color: var(--text); text-align: left; }
+.experiment-matrix .matrix-heading-level-2 { background: var(--panel); }
+.experiment-matrix tbody th { padding-inline: 2px; }
+.experiment-matrix th[data-faction="armada"] { color: light-dark(#21579a, #a4ccf5); }
+.experiment-matrix th[data-faction="cortex"] { color: light-dark(#a02d2e, #efa8a5); }
+.experiment-matrix th[data-faction="legion"] { color: light-dark(#336721, #b2e77e); }
+.experiment-matrix td { font-size: 12px; font-variant-numeric: tabular-nums; line-height: 1.3; }
+.experiment-matrix td > div { font-size: 10px; }
+.experiment-matrix .more-wins { background: color-mix(in srgb, var(--mint) 13%, var(--panel)); }
+.experiment-matrix .more-losses { background: color-mix(in srgb, var(--red) 13%, var(--panel)); }
+
 .defense-slot-picker {
     --armada: #a4ccf5;
     --cortex: #efa8a5;

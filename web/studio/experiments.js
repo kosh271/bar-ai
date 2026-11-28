@@ -74,8 +74,9 @@ function tournamentProfiles(choices, savedPlayers, changed) {
     return [details, selected];
 }
 
+const experimentFactions = ["Armada", "Cortex", "Legion"];
 const tournamentFactionOptions = [
-    ["Armada", "Armada (fixed)"], ["Cortex", "Cortex (fixed)"], ["Legion", "Legion (fixed)"],
+    ...experimentFactions.map(faction => [faction, `${faction} (fixed)`]),
     ["Rotate", "Rotate"], ["Random", "Random"],
 ];
 
@@ -514,7 +515,279 @@ function experimentForm(content) {
     return form;
 }
 
-function experimentResults(experiment, openSections = null) {
+function experimentComparisons(experiment) {
+    const [ai, faction, pairing] = ["AI vs. AI", "Faction vs. faction", "AI + faction vs. AI + faction"]
+        .map(title => ({title, headings: new Map(), records: new Map()}));
+    const sides = ["side1", "side2"];
+    const schedule = new Map();
+    const players = new Map();
+    for (const planned of experiment.schedule || []) {
+        schedule.set(planned.index, planned.players);
+        for (const player of planned.players) {
+            players.set(planned[sides[player.ally]], player);
+        }
+    }
+    const rankLabels = new Map((experiment.rankings || []).map(row => [row.id, row.label]));
+    const labelFaction = label => label?.includes(" · ") ? label.split(" · ").at(-1) : undefined;
+    const profiles = new Map();
+    const profileKeys = new Map();
+    function registerProfile(id, label = id) {
+        if (profileKeys.has(id)) return;
+        const player = players.get(id);
+        const key = player?.short_name
+            ? JSON.stringify([player.short_name, player.version, player.profile]) : id;
+        profileKeys.set(id, key);
+        if (profiles.has(key)) return;
+        const parts = label.split(" · ");
+        if (parts.length > 1 && tournamentFactionOptions.some(([value]) => value === parts.at(-1))) parts.pop();
+        const text = parts.join(" · ");
+        const sweepVariant = experiment.mode === "sweep" && id !== "baseline";
+        const profile = sweepVariant ? text : parts.length > 1 ? parts.pop() : "";
+        const name = sweepVariant ? experiment.sweep?.project || "Sweep candidates" : parts.join(" · ");
+        const group = player?.short_name ? JSON.stringify([player.short_name, player.version]) : name;
+        const identity = player?.short_name ? `${player.short_name} / ${player.version}` : id;
+        profiles.set(key, {group, name, profile, identity});
+    }
+    const games = (experiment.games || []).filter(game =>
+        game.outcome !== "cancelled" && sides.every(side => game[side]));
+    for (const [id, label] of rankLabels) registerProfile(id, label);
+    for (const game of games) {
+        for (const [index, side] of sides.entries()) {
+            registerProfile(game[side], game.side_labels?.[index]);
+        }
+    }
+    const profileCounts = new Map();
+    const groupsByName = new Map();
+    for (const {profile, name, group} of profiles.values()) {
+        const pair = JSON.stringify([group, profile]);
+        profileCounts.set(pair, (profileCounts.get(pair) || 0) + 1);
+        if (!groupsByName.has(name)) groupsByName.set(name, new Set());
+        groupsByName.get(name).add(group);
+    }
+    for (const [key, {name, group, profile, identity}] of profiles) {
+        const distinguishAI = groupsByName.get(name).size > 1;
+        const distinguishProfile = profileCounts.get(JSON.stringify([group, profile])) > 1;
+        ai.headings.set(key, [
+            {key: group, label: distinguishAI ? `${name} (${identity})` : name},
+            {key, label: distinguishProfile ? `${profile} (${identity})` : profile},
+        ]);
+    }
+
+    function record(matrix, keys, outcome) {
+        if (keys.includes(undefined) || (outcome !== "draw" && !sides.includes(outcome))) return;
+        for (const [index, row] of keys.entries()) {
+            const column = keys[1 - index];
+            const key = JSON.stringify([row, column]);
+            const stats = matrix.records.get(key) || {wins: 0, losses: 0, draws: 0, games: 0};
+            stats.games++;
+            matrix.records.set(key, stats);
+            if (row === column) break;
+            const result = outcome === "draw" ? "draws" : outcome === sides[index] ? "wins" : "losses";
+            stats[result]++;
+        }
+    }
+    for (const game of games) {
+        const planned = schedule.get(game.index);
+        const matchProfiles = sides.map(side => profileKeys.get(game[side]));
+        const factions = sides.map((side, index) => [
+            game.factions?.[index], planned?.find(player => player.ally === index)?.faction,
+            labelFaction(game.side_labels?.[index]), labelFaction(rankLabels.get(game[side])),
+        ].find(value => experimentFactions.includes(value)));
+        const pairings = factions.map((name, index) => {
+            if (!name) return undefined;
+            faction.headings.set(name, [{key: name, label: name, faction: name}]);
+            const profile = matchProfiles[index];
+            const key = JSON.stringify([profile, name]);
+            pairing.headings.set(key, [...ai.headings.get(profile), {key, label: name, faction: name}]);
+            return key;
+        });
+        record(ai, matchProfiles, game.outcome);
+        record(faction, factions, game.outcome);
+        record(pairing, pairings, game.outcome);
+    }
+    return [ai, faction, pairing];
+}
+
+let experimentMatrixId = 0;
+
+function experimentMatrixSpans(entries, prefix) {
+    const levels = entries[0].path.map(() => []);
+    const paths = entries.map(({path}, index) => path.map((heading, level) => {
+        const spans = levels[level];
+        const prior = spans.at(-1);
+        if (prior?.key === heading.key) {
+            prior.span++;
+            return prior;
+        }
+        const span = {...heading, index, span: 1, id: `${prefix}-${level}-${index}`};
+        spans.push(span);
+        return span;
+    }));
+    return {levels, paths};
+}
+
+function experimentMatrixTable(records, rows, columns, prefix) {
+    const table = element("table", "experiment-matrix");
+    table.setAttribute("aria-labelledby", `${prefix}-title`);
+    const depth = rows[0].path.length;
+    const rowCols = element("colgroup", "matrix-row-labels");
+    rowCols.span = depth;
+    table.append(rowCols);
+
+    const left = experimentMatrixSpans(rows, `${prefix}-row`);
+    const top = experimentMatrixSpans(columns, `${prefix}-col`);
+    function header(heading, level, axis) {
+        const cell = element("th", `matrix-heading-level-${level + 1}`, heading.label);
+        cell.id = heading.id;
+        if (heading.faction) cell.dataset.faction = heading.faction.toLowerCase();
+        if (axis === "col") cell.colSpan = heading.span;
+        else cell.rowSpan = heading.span;
+        if (level === depth - 1) cell.scope = axis;
+        return cell;
+    }
+
+    const head = table.createTHead();
+    for (const [level, spans] of top.levels.entries()) {
+        const tr = head.insertRow();
+        if (level === 0) {
+            const corner = element("td", "matrix-corner");
+            corner.colSpan = corner.rowSpan = depth;
+            corner.append(element("span", "matrix-axis-opponent", "Opponent →"),
+                element("span", "matrix-axis-side", "Win rate for ↓"));
+            tr.append(corner);
+        }
+        for (const span of spans) tr.append(header(span, level, "col"));
+    }
+    const body = table.createTBody();
+    for (const [rowIndex, row] of rows.entries()) {
+        const tr = body.insertRow();
+        const rowPath = left.paths[rowIndex];
+        for (const [level, span] of rowPath.entries()) {
+            if (span.index === rowIndex) tr.append(header(span, level, "row"));
+        }
+        for (const [columnIndex, column] of columns.entries()) {
+            const stats = records.get(JSON.stringify([row.key, column.key]));
+            const cell = tr.insertCell();
+            cell.headers = [...rowPath, ...top.paths[columnIndex]].map(span => span.id).join(" ");
+            if (!stats) {
+                cell.className = "muted";
+                cell.textContent = "—";
+            } else if (row.key === column.key) {
+                cell.className = "muted";
+                cell.textContent = `${stats.games} mirror ${stats.games === 1 ? "game" : "games"}`;
+            } else {
+                const {wins, losses, draws, games} = stats;
+                if (wins !== losses) cell.classList.add(wins > losses ? "more-wins" : "more-losses");
+                cell.append(element("strong", "", `${(100 * wins / games).toFixed(1)}%`),
+                    element("div", "muted", `${wins}–${losses}–${draws}`));
+            }
+        }
+    }
+    return table;
+}
+
+function experimentMatrixView({title, headings, records}, firstOpponent) {
+    const view = element("div", "experiment-matrix-view");
+    view.dataset.matrix = title;
+    const rows = [...headings].map(([key, path]) => ({key, path})).sort((a, b) => {
+        for (const [index, heading] of a.path.entries()) {
+            const other = b.path[index];
+            const order = heading.label.localeCompare(other.label) || heading.key.localeCompare(other.key);
+            if (order) return order;
+        }
+        return 0;
+    });
+    const depth = rows[0].path.length;
+    const prefix = `experiment-matrix-${++experimentMatrixId}`;
+    const top = element("div", "experiment-matrix-top");
+    const heading = element("h4", "", title);
+    heading.id = `${prefix}-title`;
+    const control = element("label", "matrix-opponent-columns", "Opponent columns");
+    const select = element("select");
+    select.setAttribute("aria-label", `Opponent columns for ${title}`);
+    control.hidden = true;
+    control.append(select);
+    const wrap = element("div", "experiment-matrix-scroll");
+    wrap.tabIndex = 0;
+    wrap.setAttribute("role", "region");
+    wrap.setAttribute("aria-label", title);
+    top.append(heading, control);
+    view.append(top, wrap);
+
+    let capacity = 0;
+    let pages = [];
+    function showPage(page) {
+        const columns = pages[page];
+        view.dataset.firstOpponent = columns[0].key;
+        wrap.replaceChildren(experimentMatrixTable(records, rows, columns, prefix));
+        select.value = String(page);
+    }
+    select.addEventListener("change", () => showPage(Number(select.value)));
+    const resize = new ResizeObserver(() => {
+        if (!view.isConnected) {
+            resize.disconnect();
+            return;
+        }
+        const width = wrap.clientWidth;
+        if (!width) return;
+        const rowLabelWidth = Math.min(76, Math.floor((width - 32) / depth),
+            Math.max(48, Math.floor(width / (2 * depth))));
+        wrap.style.setProperty("--matrix-row-label-width", `${rowLabelWidth}px`);
+        const fit = Math.max(1, Math.floor((width - depth * rowLabelWidth) / 50));
+        if (fit === capacity) return;
+        capacity = fit;
+        const anchor = view.dataset.firstOpponent || firstOpponent;
+        pages = [];
+        for (let start = 0; start < rows.length;) {
+            const limit = Math.min(start + fit, rows.length);
+            let end = limit;
+            // Keep a profile's factions together when the page can fit them.
+            if (depth === 3 && fit >= experimentFactions.length) {
+                while (end < rows.length && end > start && rows[end].path[1].key === rows[end - 1].path[1].key) end--;
+            }
+            if (end === start) end = limit;
+            pages.push(rows.slice(start, end));
+            start = end;
+        }
+        let first = 1;
+        select.replaceChildren(...pages.map((columns, index) => {
+            const last = first + columns.length - 1;
+            const range = first === last ? first : `${first}–${last}`;
+            const label = columns[0].path.map(heading => heading.label).filter(Boolean).join(" · ");
+            const option = element("option", "", `${range} of ${rows.length} · ${label}`);
+            option.value = String(index);
+            first = last + 1;
+            return option;
+        }));
+        control.hidden = pages.length === 1;
+        showPage(Math.max(0, pages.findIndex(columns => columns.some(column => column.key === anchor))));
+    });
+    requestAnimationFrame(() => {
+        if (view.isConnected) resize.observe(wrap);
+    });
+    return view;
+}
+
+function experimentMatchupMatrices(experiment, openSections, opponentColumns) {
+    const details = element("details", "experiment-matchups");
+    details.dataset.section = "matchups";
+    details.open = openSections?.has("matchups") ?? true;
+    const legend = element("p", "muted");
+    legend.append(element("strong", "", "Each cell shows the left side’s win rate against the opponent at the top."),
+        " The record underneath is wins–losses–draws for the left side. Green means the left side won more games, and red means the opponent did. A dash means no scored games. Timeouts, failures, and cancellations are excluded.");
+    details.append(element("summary", "", "Matchup matrices"), legend);
+    for (const [index, matrix] of experimentComparisons(experiment).entries()) {
+        if (matrix.headings.size) {
+            details.append(experimentMatrixView(matrix, opponentColumns?.get(matrix.title)));
+        } else {
+            details.append(element("h4", "", matrix.title), element("p", "muted",
+                index === 0 ? "No recorded AI profiles." : "No recorded factions."));
+        }
+    }
+    return details;
+}
+
+function experimentResults(experiment, openSections = null, opponentColumns = null) {
     const box = element("div");
     if (!experiment) return box;
     if (experiment.start_options) box.append(element("p", "muted", startingConditionsText(experiment.start_options)));
@@ -588,6 +861,7 @@ function experimentResults(experiment, openSections = null) {
     }
     const games = experiment.games || [];
     if (games.length) {
+        box.append(experimentMatchupMatrices(experiment, openSections, opponentColumns));
         const table = experimentTable(["Game", "Map", "Matchup", "Resources", "Damage dealt", "Game time", "Script errors", "Logs"]);
         table.classList.add("experiment-game-results");
         table.tHead.rows[0].cells[3].title = "Metal produced + energy produced / 60";
@@ -723,8 +997,12 @@ function updateExperimentStatus() {
     results.dataset.signature = signature;
     const sections = Array.from(results.querySelectorAll("details[data-section]"));
     const openSections = sections.length ? new Set(sections.filter(section => section.open).map(section => section.dataset.section)) : null;
-    if (openSections && !sections.some(section => section.dataset.section === "games")) openSections.add("games");
-    results.replaceChildren(...(showing ? [experimentResults(experiment, openSections)] : []));
+    for (const name of ["matchups", "games"]) {
+        if (openSections && !sections.some(section => section.dataset.section === name)) openSections.add(name);
+    }
+    const opponentColumns = new Map([...results.querySelectorAll("[data-matrix]")]
+        .map(view => [view.dataset.matrix, view.dataset.firstOpponent]));
+    results.replaceChildren(...(showing ? [experimentResults(experiment, openSections, opponentColumns)] : []));
 }
 
 function experimentStatusPanel() {

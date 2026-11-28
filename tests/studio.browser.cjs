@@ -749,3 +749,59 @@ test("a saved tournament loads its exact schedule from the paged summary", async
     await page.getByText("Engine and content fingerprints", {exact: true}).press("Enter");
     await page.getByText("fixture-engine-digest", {exact: true}).waitFor();
 });
+
+test("the saved leaderboard groups matchup headings and fits the available width", async t => {
+    const {page} = await workshop(t, {savedExperiment: {
+        id: "fixture-matchups", mode: "tournament",
+        rankings: [
+            {id: "v1", label: "Fixture AI · hard · Random"},
+            {id: "v2", label: "Other AI · easy · Rotate"},
+            {id: "v3", label: "Fixture AI · expert · Random"},
+        ],
+        games: [
+            {index: 1, side1: "v1", side2: "v2", factions: ["Armada", "Cortex"], outcome: "side1"},
+            {index: 2, side1: "v2", side2: "v1", factions: ["Cortex", "Armada"], outcome: "draw"},
+            {index: 3, side1: "v1", side2: "v2", factions: ["Cortex", "Cortex"], outcome: "side2"},
+            {index: 4, side1: "v1", side2: "v3", factions: ["Legion", "Armada"], outcome: "timeout"},
+            {index: 5, side1: "v2", side2: "v3", factions: ["Legion", "Cortex"], outcome: "timeout"},
+            {index: 6, side1: "v2", side2: "v3", factions: ["Armada", "Legion"], outcome: "timeout"},
+        ],
+    }});
+    await nav(page, "Tournaments & sweeps").press("Enter");
+    const history = page.locator("#experiment-history");
+    await history.getByRole("heading", {name: "Leaderboard"}).waitFor();
+    const ai = history.getByRole("table", {name: "AI vs. AI", exact: true});
+    const factions = history.getByRole("table", {name: "Faction vs. faction", exact: true});
+    const pairings = history.getByRole("table", {name: "AI + faction vs. AI + faction", exact: true});
+    for (const matrix of [ai, factions, pairings]) {
+        await matrix.getByText("Win rate for ↓", {exact: true}).waitFor();
+        await matrix.getByText("Opponent →", {exact: true}).waitFor();
+    }
+    const cell = (table, row, column) => table.getByRole("row")
+        .filter({has: page.getByRole("rowheader", {name: row, exact: true})}).getByRole("cell").nth(column);
+    await cell(ai, "hard", 2).getByText("33.3%", {exact: true}).waitFor();
+    await cell(ai, "hard", 2).getByText("1–1–1", {exact: true}).waitFor();
+    await cell(factions, "Armada", 1).getByText("50.0%", {exact: true}).waitFor();
+    await cell(factions, "Cortex", 1).getByText("1 mirror game", {exact: true}).waitFor();
+    const win = pairings.getByRole("cell").filter({hasText: "100.0%"});
+    assert.ok(await win.evaluate(node => node.classList.contains("more-wins")));
+    const headings = await win.evaluate(node => node.headers.split(" ").map(id => document.getElementById(id).textContent));
+    assert.deepEqual(headings, ["Other AI", "easy", "Cortex", "Fixture AI", "hard", "Cortex"]);
+    const aiHeader = pairings.locator("thead th").getByText("Fixture AI", {exact: true});
+    const rowHeader = pairings.locator("tbody th").getByText("Fixture AI", {exact: true});
+    assert.equal(await aiHeader.getAttribute("colspan"), "6");
+    assert.equal(await rowHeader.getAttribute("rowspan"), "6");
+    const wrap = history.getByRole("region", {name: "AI + faction vs. AI + faction", exact: true});
+    const fits = region => region.evaluate(node => node.scrollWidth === node.clientWidth);
+    assert.ok(await fits(wrap));
+
+    await page.setViewportSize({width: 375, height: 800});
+    const columns = history.getByRole("combobox", {name: "Opponent columns for AI + faction vs. AI + faction"});
+    await columns.waitFor();
+    await columns.selectOption({index: (await columns.locator("option").count()) - 1});
+    await pairings.locator("thead th").getByText("Other AI", {exact: true}).waitFor();
+    assert.ok(await fits(wrap));
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), 375);
+    await history.getByText("Matchup matrices", {exact: true}).press("Enter");
+    assert.equal(await pairings.isVisible(), false);
+});
